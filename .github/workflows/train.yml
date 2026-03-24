@@ -1,20 +1,12 @@
 name: LNN Train & Predict
 
 on:
-  schedule:
-    # 每天 UTC 0:00 执行 (北京时间 8:00)
-    - cron: '0 0 * * *'
-  # 允许手动触发
-  workflow_dispatch:
-    inputs:
-      epochs:
-        description: '训练轮数'
-        required: false
-        default: '50'
-      symbol:
-        description: '交易对'
-        required: false
-        default: 'BTC-USDT'
+  push:
+    branches: [main, master]
+    paths:
+      - '*.py'
+      - 'requirements.txt'
+      - '.github/workflows/train.yml'
 
 permissions:
   contents: read
