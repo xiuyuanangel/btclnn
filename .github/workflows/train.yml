@@ -1,0 +1,69 @@
+name: LNN Train & Predict
+
+on:
+  schedule:
+    # 每天 UTC 0:00 执行 (北京时间 8:00)
+    - cron: '0 0 * * *'
+  # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: '训练轮数'
+        required: false
+        default: '50'
+      symbol:
+        description: '交易对'
+        required: false
+        default: 'BTC-USDT'
+
+permissions:
+  contents: read
+
+jobs:
+  train-and-predict:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 缓存K线数据，避免每次重新获取
+      - name: Cache K-line data
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: lnn-kline-data-${{ github.run_id }}
+          restore-keys: |
+            lnn-kline-data-
+
+      # 缓存模型检查点
+      - name: Cache model checkpoint
+        uses: actions/cache@v4
+        with:
+          path: checkpoints/
+          key: lnn-model-checkpoint
+
+      - name: Fetch data and train model
+        env:
+          EPOCHS: ${{ github.event.inputs.epochs || '50' }}
+        run: python train.py
+
+      - name: Run prediction
+        run: python predict.py
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lnn-model-${{ github.run_number }}
+          path: checkpoints/
+          retention-days: 30
+          if-no-files-found: warn
