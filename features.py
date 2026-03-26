@@ -179,14 +179,18 @@ def build_dataset(df, seq_length=None):
     # 去除NaN行
     df = df.dropna(subset=SEQ_FEATURE_COLS + CONTEXT_FEATURE_COLS + ['label'])
 
-    # 构建滑动窗口
+    # 构建滑动窗口(提前提取numpy数组，避免循环中反复df.loc造成OOM)
+    feature_data = df[SEQ_FEATURE_COLS].values   # (n, 13)
+    context_data = df[CONTEXT_FEATURE_COLS].values  # (n, 6)
+    label_data = df['label'].values               # (n,)
+    n = len(df)
+
     X_seq, X_ctx, y = [], [], []
 
-    indices = df.index.tolist()
-    for i in range(seq_length, len(df) - 1):
-        seq = df.loc[indices[i - seq_length:i], SEQ_FEATURE_COLS].values
-        ctx = df.loc[indices[i], CONTEXT_FEATURE_COLS].values
-        label = df.loc[indices[i], 'label']
+    for i in range(seq_length, n - 1):
+        seq = feature_data[i - seq_length:i]
+        ctx = context_data[i]
+        label = label_data[i]
 
         if np.isnan(seq).any() or np.isnan(ctx).any():
             continue
