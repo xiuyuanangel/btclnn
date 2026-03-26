@@ -254,4 +254,8 @@ def train_model():
 
 
 if __name__ == "__main__":
-    train_model()
+    import sys
+    model = train_model()
+    if model is None:
+        logger.error("训练失败，未生成模型")
+        sys.exit(1)
