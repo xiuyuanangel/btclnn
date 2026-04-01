@@ -25,13 +25,13 @@ TIMEFRAMES = {
 }
 
 # ==================== 模型配置 ====================
-HIDDEN_SIZE = 64
-NUM_LAYERS = 2
-DROPOUT = 0.3
-LEARNING_RATE = 0.001
-BATCH_SIZE = 32
-EPOCHS = 50
-PATIENCE = 20               # 早停耐心值
+HIDDEN_SIZE = 64            # 隐藏层大小
+NUM_LAYERS = 2              # 隐藏层数量
+DROPOUT = 0.3               # 丢弃率
+LEARNING_RATE = 0.001       # 学习率
+BATCH_SIZE = 32             # 批处理大小
+EPOCHS = 500                # 训练轮数
+PATIENCE = 100              # 早停耐心值
 
 # ==================== 数据存储路径 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
