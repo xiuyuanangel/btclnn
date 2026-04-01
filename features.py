@@ -139,6 +139,9 @@ def compute_context_features(df):
 def align_tf_sequences(tf_timestamps, tf_features, target_timestamps, seq_length):
     """将单周期的特征按目标时间戳对齐, 提取滑动窗口序列
 
+    当某周期数据不足时(如1min仅7天, 而目标样本是2年前的),
+    返回全零序列而非None, 确保不影响其他周期有效样本的使用。
+
     Args:
         tf_timestamps: 该周期的Unix秒时间戳数组 (已排序)
         tf_features: 该周期的特征矩阵 (n, feature_size)
@@ -146,20 +149,24 @@ def align_tf_sequences(tf_timestamps, tf_features, target_timestamps, seq_length
         seq_length: 该周期的序列长度
 
     Returns:
-        list: 每个目标时刻的特征序列, 无效位置为None
+        np.array: (len(target_timestamps), seq_length, feature_size)
     """
-    sequences = []
-    for target_ts in target_timestamps:
-        # 二分查找: 最后一个 <= target_ts 的位置
+    feature_size = tf_features.shape[1]
+    sequences = np.zeros((len(target_timestamps), seq_length, feature_size), dtype=np.float32)
+    valid_count = 0
+
+    for i, target_ts in enumerate(target_timestamps):
         idx = np.searchsorted(tf_timestamps, target_ts, side='right') - 1
         if idx < seq_length - 1:
-            sequences.append(None)
             continue
         seq = tf_features[idx - seq_length + 1:idx + 1]
         if np.isnan(seq).any():
-            sequences.append(None)
             continue
-        sequences.append(seq)
+        sequences[i] = seq
+        valid_count += 1
+
+    logger.info(f"    有效对齐: {valid_count}/{len(target_timestamps)} "
+                f"({valid_count/len(target_timestamps)*100:.1f}%)")
     return sequences
 
 
@@ -221,7 +228,10 @@ def build_multi_tf_dataset(tf_dfs, target_df):
     # 3. 目标标签(来自10min数据)
     target_df = target_df.copy()
     target_df = compute_labels(target_df)
-    target_df = pd.concat([target_df, context], axis=1)
+    # 上下文特征直接赋值(已广播, 避免pd.concat跨index报错)
+    for col in CONTEXT_FEATURE_COLS:
+        if col in context.columns:
+            target_df[col] = context[col].iloc[0]
     target_df = target_df.dropna(subset=CONTEXT_FEATURE_COLS + ['label'])
 
     target_timestamps = target_df.index.values.astype(np.int64) // 10**9
@@ -239,27 +249,14 @@ def build_multi_tf_dataset(tf_dfs, target_df):
             tf_ts, tf_feat, target_timestamps, seq_length
         )
 
-    # 5. 过滤所有周期均有效的样本
-    valid_mask = np.ones(len(target_timestamps), dtype=bool)
-    for period in periods:
-        valid_mask &= np.array([s is not None for s in all_sequences[period]])
-
-    n_valid = valid_mask.sum()
-    if n_valid == 0:
-        logger.warning("没有有效样本!")
-        return {}, np.array([]), np.array([])
-
-    # 6. 构建最终数组
-    valid_indices = np.where(valid_mask)[0]
+    # 5. 构建最终数组(各周期零填充, 不再过滤)
     X_dict = {}
     for period in periods:
-        X_dict[period] = np.stack(
-            [all_sequences[period][i] for i in valid_indices]
-        ).astype(np.float32)
+        X_dict[period] = all_sequences[period]
         logger.info(f"  {period} 序列形状: {X_dict[period].shape}")
 
-    X_ctx = ctx_data[valid_mask].astype(np.float32)
-    y = label_data[valid_mask].astype(np.float32)
+    X_ctx = ctx_data.astype(np.float32)
+    y = label_data.astype(np.float32)
 
     if len(y) > 0:
         up_ratio = y.mean()

@@ -16,12 +16,12 @@ VAL_RATIO = 0.15            # 验证集比例
 # seq_length: 该周期输入序列长度
 # lookback_days: 该周期获取的历史天数(需满足滚动特征窗口需求)
 TIMEFRAMES = {
-    '1min':  {'seq_length': 60,  'lookback_days': 3},    # 60根×1min = 1小时微观结构
-    '5min':  {'seq_length': 72,  'lookback_days': 5},    # 72根×5min = 6小时短期趋势
-    '15min': {'seq_length': 48,  'lookback_days': 7},    # 48根×15min = 12小时中期
-    '60min': {'seq_length': 48,  'lookback_days': 10},   # 48根×60min = 2天长期
-    '4hour': {'seq_length': 42,  'lookback_days': 30},   # 42根×4hour = 7天宏观
-    '1day':  {'seq_length': 60,  'lookback_days': 90},   # 60根×1day = 60天趋势
+    '1min':  {'seq_length': 60,  'lookback_days': 7},     # 60根×1min = 1小时(仅近期, 避免数据量过大)
+    '5min':  {'seq_length': 72,  'lookback_days': 735},   # 72根×5min = 6小时短期趋势
+    '15min': {'seq_length': 48,  'lookback_days': 735},   # 48根×15min = 12小时中期
+    '60min': {'seq_length': 48,  'lookback_days': 740},   # 48根×60min = 2天长期
+    '4hour': {'seq_length': 42,  'lookback_days': 760},   # 42根×4hour = 7天宏观
+    '1day':  {'seq_length': 60,  'lookback_days': 900},   # 60根×1day = 60天趋势(需200天预热)
 }
 
 # ==================== 模型配置 ====================
