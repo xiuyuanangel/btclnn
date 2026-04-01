@@ -237,11 +237,7 @@ def build_multi_tf_dataset(tf_dfs, target_df):
     target_df = target_df.dropna(subset=CONTEXT_FEATURE_COLS + ['label'])
 
     # 直接使用'id'列作为时间戳(秒级整数), 绕开DatetimeIndex dtype差异
-    target_ids = target_df['id'].values
-    logger.info(f"  target 'id' dtype={target_ids.dtype}, "
-                f"range=[{target_ids.min()}, {target_ids.max()}], "
-                f"sample={target_ids[:3].tolist()}")
-    target_timestamps = target_ids.astype(np.int64)
+    target_timestamps = target_df['id'].values.astype(np.int64)
     label_data = target_df['label'].values
     ctx_data = target_df[CONTEXT_FEATURE_COLS].values
 

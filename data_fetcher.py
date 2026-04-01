@@ -16,6 +16,7 @@ import logging
 
 import requests
 import pandas as pd
+import numpy as np
 
 import config
 
@@ -262,7 +263,7 @@ class HuobiDataFetcher:
         agg_rules = {k: v for k, v in agg_rules.items() if k in df.columns}
 
         df_10min = df.groupby('period').agg(agg_rules).reset_index()
-        df_10min['id'] = df_10min['period'].astype(int) // 10**9
+        df_10min['id'] = df_10min['period'].astype('datetime64[s]').astype(np.int64)
         df_10min = df_10min.drop(columns=['period'])
 
         result = df_10min.to_dict('records')
