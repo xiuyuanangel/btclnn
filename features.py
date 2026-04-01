@@ -137,36 +137,38 @@ def compute_context_features(df):
 
 
 def align_tf_sequences(tf_timestamps, tf_features, target_timestamps, seq_length):
-    """将单周期的特征按目标时间戳对齐, 提取滑动窗口序列
+    """将单周期的特征按目标时间戳对齐, 提取滑动窗口序列(向量化)
 
-    当某周期数据不足时(如1min仅7天, 而目标样本是2年前的),
-    返回全零序列而非None, 确保不影响其他周期有效样本的使用。
-
-    Args:
-        tf_timestamps: 该周期的Unix秒时间戳数组 (已排序)
-        tf_features: 该周期的特征矩阵 (n, feature_size)
-        target_timestamps: 目标预测时刻的时间戳数组
-        seq_length: 该周期的序列长度
-
-    Returns:
-        np.array: (len(target_timestamps), seq_length, feature_size)
+    当某周期数据不足时, 返回全零序列。
     """
     feature_size = tf_features.shape[1]
-    sequences = np.zeros((len(target_timestamps), seq_length, feature_size), dtype=np.float32)
-    valid_count = 0
+    n_target = len(target_timestamps)
 
-    for i, target_ts in enumerate(target_timestamps):
-        idx = np.searchsorted(tf_timestamps, target_ts, side='right') - 1
-        if idx < seq_length - 1:
-            continue
+    # 诊断日志
+    if tf_timestamps.size > 0:
+        logger.info(f"    TF范围: [{tf_timestamps[0]}, {tf_timestamps[-1]}]")
+    logger.info(f"    目标范围: [{target_timestamps[0]}, {target_timestamps[-1]}]")
+
+    # 向量化: 一次性计算所有target的searchsorted
+    indices = np.searchsorted(tf_timestamps, target_timestamps, side='right') - 1
+
+    # 构建全零结果
+    sequences = np.zeros((n_target, seq_length, feature_size), dtype=np.float32)
+
+    # 批量判断有效位置: idx >= seq_length-1
+    valid = indices >= seq_length - 1
+    valid_indices = np.where(valid)[0]
+
+    # 批量提取有效序列
+    for i in valid_indices:
+        idx = indices[i]
         seq = tf_features[idx - seq_length + 1:idx + 1]
         if np.isnan(seq).any():
             continue
         sequences[i] = seq
-        valid_count += 1
 
-    logger.info(f"    有效对齐: {valid_count}/{len(target_timestamps)} "
-                f"({valid_count/len(target_timestamps)*100:.1f}%)")
+    logger.info(f"    有效对齐: {valid.sum()}/{n_target} "
+                f"({valid.sum()/n_target*100:.1f}%)")
     return sequences
 
 
