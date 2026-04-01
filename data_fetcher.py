@@ -268,6 +268,21 @@ class HuobiDataFetcher:
         self.save_cache(data_10min, "10min")
         return data_10min
 
+    def fetch_multi_timeframe(self):
+        """获取所有配置周期的K线数据
+
+        Returns:
+            dict: {period: list_of_kline_dicts} 每个周期的原始K线数据
+        """
+        timeframe_data = {}
+        for period, cfg in config.TIMEFRAMES.items():
+            lookback = cfg['lookback_days']
+            logger.info(f"获取 {period} 数据 (lookback={lookback}天)...")
+            data = self.fetch_history(period, lookback)
+            timeframe_data[period] = data
+            logger.info(f"  {period}: {len(data)} 条K线")
+        return timeframe_data
+
     def get_dataframe(self, data):
         """将字典列表转换为DataFrame"""
         if not data:

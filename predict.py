@@ -1,6 +1,6 @@
-"""液态神经网络预测脚本
+"""液态神经网络预测脚本 — 多周期融合版
 
-使用训练好的模型，基于最新K线数据预测10分钟后涨跌。
+使用训练好的多周期融合模型，基于最新K线数据预测10分钟后涨跌。
 """
 
 import os
@@ -13,18 +13,17 @@ import torch
 import config
 from data_fetcher import HuobiDataFetcher
 from features import (
+    compute_all_features, compute_context_features,
     SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
-    compute_returns, compute_volume_features, compute_price_features,
-    compute_rolling_stats, compute_rsi, compute_context_features,
 )
-from lnn_model import LiquidNeuralNetwork
+from lnn_model import MultiTimeframeLNN
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 def load_model(device):
-    """加载训练好的模型"""
+    """加载训练好的多周期融合模型"""
     if not os.path.exists(config.MODEL_PATH):
         raise FileNotFoundError(
             f"模型文件不存在: {config.MODEL_PATH}\n"
@@ -34,11 +33,12 @@ def load_model(device):
     checkpoint = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
     model_cfg = checkpoint['config']
 
-    model = LiquidNeuralNetwork(
-        seq_feature_size=model_cfg['seq_feature_size'],
+    model = MultiTimeframeLNN(
+        timeframe_configs=model_cfg['timeframe_configs'],
         context_feature_size=model_cfg['context_feature_size'],
-        hidden_size=model_cfg['hidden_size'],
-        num_layers=model_cfg['num_layers'],
+        hidden_size=model_cfg.get('hidden_size', config.HIDDEN_SIZE),
+        num_layers=model_cfg.get('num_layers', config.NUM_LAYERS),
+        dropout=model_cfg.get('dropout', config.DROPOUT),
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -46,84 +46,104 @@ def load_model(device):
 
     logger.info(
         f"模型加载成功 (Epoch {checkpoint['epoch']}, "
-        f"Val Loss: {checkpoint['val_loss']:.4f}, "
-        f"Val Acc: {checkpoint.get('val_acc', 'N/A')})"
+        f"Val Loss: {checkpoint['val_loss']:.4f})"
     )
     return model
 
 
-def prepare_latest_features(df):
-    """为最新时刻准备模型输入特征"""
-    # 计算特征
-    df = compute_returns(df)
-    df = compute_volume_features(df)
-    df = compute_price_features(df)
-    df = compute_rolling_stats(df)
-    df = compute_rsi(df)
-    context = compute_context_features(df)
+def prepare_multi_tf_features(timeframe_data):
+    """为最新时刻准备多周期模型输入特征
 
-    # 去除 NaN
-    df = pd.concat([df, context], axis=1)
-    df = df.dropna(subset=SEQ_FEATURE_COLS + CONTEXT_FEATURE_COLS)
+    Args:
+        timeframe_data: dict of {period: list_of_kline_dicts}
 
-    if len(df) < config.SEQ_LENGTH + 1:
-        raise ValueError(f"有效数据不足: 需要 {config.SEQ_LENGTH + 1}, 实际 {len(df)}")
+    Returns:
+        tf_seqs: dict of {period: np.array (1, seq_length, feature_size)}
+        ctx: np.array (1, context_size)
+        target_df: DataFrame (用于获取当前价格和时间)
+    """
+    fetcher = HuobiDataFetcher()
+    periods = list(config.TIMEFRAMES.keys())
 
-    # 提取最新窗口
-    seq = df[SEQ_FEATURE_COLS].iloc[-config.SEQ_LENGTH:].values.astype(np.float32)
-    ctx = df[CONTEXT_FEATURE_COLS].iloc[-1].values.astype(np.float32)
+    # 各周期计算特征
+    tf_dfs = {}
+    for period in periods:
+        df = fetcher.get_dataframe(timeframe_data[period])
+        df = compute_all_features(df)
+        df = df.dropna(subset=SEQ_FEATURE_COLS)
+        tf_dfs[period] = df
 
-    return seq, ctx, df
+    # 上下文特征(来自4hour)
+    ctx_df = compute_context_features(tf_dfs['4hour'])
+    ctx = ctx_df[CONTEXT_FEATURE_COLS].values[-1:].astype(np.float32)
+
+    # 目标时间点: 当前时刻
+    now_ts = int(pd.Timestamp.now().timestamp())
+    target_ts = np.array([now_ts])
+
+    # 各周期提取最新序列
+    tf_seqs = {}
+    for period in periods:
+        seq_length = config.TIMEFRAMES[period]['seq_length']
+        df = tf_dfs[period]
+        tf_ts = df.index.values.astype(np.int64) // 10**9
+        tf_feat = df[SEQ_FEATURE_COLS].values
+
+        idx = np.searchsorted(tf_ts, now_ts, side='right') - 1
+        if idx < seq_length - 1:
+            raise ValueError(f"{period} 数据不足: 需要 {seq_length} 条, 可用 {idx + 1} 条")
+
+        seq = tf_feat[idx - seq_length + 1:idx + 1]
+        if np.isnan(seq).any():
+            raise ValueError(f"{period} 序列包含 NaN")
+
+        tf_seqs[period] = seq[np.newaxis, :, :].astype(np.float32)
+
+    # 用5min数据获取当前价格(最新)
+    target_df = tf_dfs['5min']
+
+    return tf_seqs, ctx, target_df
 
 
 def predict():
-    """执行预测: 基于最新数据判断10分钟后涨跌"""
+    """执行预测: 基于多周期数据判断10分钟后涨跌"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"使用设备: {device}")
 
     # 1. 加载模型
     model = load_model(device)
 
-    # 2. 获取最新数据
-    logger.info("正在获取最新K线数据...")
+    # 2. 获取多周期数据
+    logger.info("正在获取多周期K线数据...")
     fetcher = HuobiDataFetcher()
-    data = fetcher.get_10min_data(config.LOOKBACK_DAYS)
-
-    if len(data) < config.SEQ_LENGTH + 1:
-        logger.error(f"数据不足: 需要至少 {config.SEQ_LENGTH + 1} 条")
-        return None
-
-    df = fetcher.get_dataframe(data)
+    timeframe_data = fetcher.fetch_multi_timeframe()
 
     # 3. 特征准备
     try:
-        seq, ctx, df_featured = prepare_latest_features(df)
+        tf_seqs, ctx, df_featured = prepare_multi_tf_features(timeframe_data)
     except ValueError as e:
         logger.error(str(e))
         return None
 
-    if np.isnan(seq).any() or np.isnan(ctx).any():
-        logger.error("特征数据包含 NaN")
-        return None
-
     # 4. 模型推理
-    seq_tensor = torch.FloatTensor(seq).unsqueeze(0).to(device)
-    ctx_tensor = torch.FloatTensor(ctx).unsqueeze(0).to(device)
+    tf_seqs_tensor = {p: torch.FloatTensor(v).to(device) for p, v in tf_seqs.items()}
+    ctx_tensor = torch.FloatTensor(ctx).to(device)
 
     with torch.no_grad():
-        probability = model(seq_tensor, ctx_tensor).item()
+        probability = model(tf_seqs_tensor, ctx_tensor).item()
 
     # 5. 输出结果
     direction = "涨 (UP)" if probability > 0.5 else "跌 (DOWN)"
-    confidence = abs(probability - 0.5) * 2  # 映射到 [0, 1]
+    confidence = abs(probability - 0.5) * 2
 
     current_price = df_featured['close'].iloc[-1]
     latest_time = df_featured.index[-1]
 
     print()
     print("=" * 50)
-    print(f"  液态神经网络 (LNN) 预测结果")
+    print(f"  多周期融合 LNN 预测结果")
     print("=" * 50)
+    print(f"  融合周期:   {', '.join(config.TIMEFRAMES.keys())}")
     print(f"  当前时间:   {latest_time}")
     print(f"  当前价格:   {current_price:.2f} USDT")
     print(f"  预测方向:   {direction}")

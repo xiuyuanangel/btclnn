@@ -3,7 +3,11 @@
 基于 Liquid Time-Constant Networks (LTC) 论文的核心思想:
 - 连续时间动态: dh/dt = f(h, u, t)
 - 可学习的时间常数(每个神经元独立的时间尺度)
-- 输入依赖的动态调制(网络的"液态"特性 — 动态随输入变化而改变)
+- 输入依赖的动态调制(网络的"液态"特性)
+
+多周期融合架构:
+  每个时间周期(1min/5min/15min/60min/4hour)拥有独立的LTC编码器,
+  各编码器输出拼接后经融合层产生最终预测。
 
 参考论文:
   Hasani et al., "Liquid Time-Constant Networks", 2021
@@ -21,13 +25,7 @@ class LTCCell(nn.Module):
     核心微分方程:
         dh/dt = -h / tau + W_in * u + gate(h, u) * W_rec * h
 
-    其中:
-        tau  : 可学习的时间常数(每个神经元独立，通过softplus确保正值)
-        gate : 输入依赖的门控函数 — 这是"液态"的关键:
-               网络的动态特性会根据输入数据实时调整，
-               类似液态物质在不同容器中呈现不同形态
-
-    离散化: 使用 Euler 方法, dh_new = h + dh/dt * dt (dt=1)
+    离散化: Euler方法, dh_new = h + dh/dt * dt (dt=1)
     """
 
     def __init__(self, input_size, hidden_size):
@@ -35,27 +33,16 @@ class LTCCell(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        # 可学习的时间常数 (初始化后通过softplus + 1保证为正)
         self.tau = nn.Parameter(torch.randn(hidden_size) * 0.1)
-
-        # 输入权重
         self.W_in = nn.Linear(input_size, hidden_size, bias=False)
-
-        # 循环权重
         self.W_rec = nn.Linear(hidden_size, hidden_size, bias=False)
-
-        # 输入依赖的门控网络 (液态特性的核心)
-        # 输入: 拼接 [当前输入 x, 隐藏状态 h]
-        # 输出: 0~1 之间的门控值
         self.gate_net = nn.Sequential(
             nn.Linear(input_size + hidden_size, hidden_size),
             nn.Tanh()
         )
-
         self._init_weights()
 
     def _init_weights(self):
-        """权重初始化"""
         nn.init.xavier_uniform_(self.W_in.weight, gain=0.5)
         nn.init.orthogonal_(self.W_rec.weight, gain=0.5)
         for module in self.gate_net:
@@ -65,43 +52,158 @@ class LTCCell(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def forward(self, x, h):
-        """
-        Args:
-            x: 输入 (batch, input_size)
-            h: 隐藏状态 (batch, hidden_size)
-
-        Returns:
-            h_new: 更新后的隐藏状态 (batch, hidden_size)
-        """
-        # 时间常数: softplus(tau) + 1, 保证 tau > 1
         tau = torch.nn.functional.softplus(self.tau) + 1.0
-
-        # 液态门控: 基于当前输入和隐藏状态动态调整
         gate = torch.sigmoid(self.gate_net(torch.cat([x, h], dim=-1)))
-
-        # 连续时间动态
-        # dh/dt = -h/tau + W_in*x + gate * W_rec*h
-        dhdt = (
-            -h / tau +
-            self.W_in(x) +
-            gate * self.W_rec(h)
-        )
-
-        # Euler 离散化
+        dhdt = -h / tau + self.W_in(x) + gate * self.W_rec(h)
         h_new = h + dhdt
-
         return torch.tanh(h_new)
 
 
-class LiquidNeuralNetwork(nn.Module):
-    """多层液态神经网络
+class TimeframeEncoder(nn.Module):
+    """单周期LTC编码器
+
+    将一个时间周期的序列编码为固定维度的向量表示。
+    每个周期有独立的多层LTC单元, 处理原生分辨率的数据。
+    """
+
+    def __init__(self, input_size, hidden_size, num_layers):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.cells = nn.ModuleList([
+            LTCCell(
+                input_size if i == 0 else hidden_size,
+                hidden_size,
+            )
+            for i in range(num_layers)
+        ])
+        self._init_weights()
+
+    def _init_weights(self):
+        for cell in self.cells:
+            cell._init_weights()
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, seq_len, input_size)
+
+        Returns:
+            h: (batch, hidden_size) 最终隐藏状态
+        """
+        batch_size, seq_len = x.size(0), x.size(1)
+        device = x.device
+
+        hidden = [
+            torch.zeros(batch_size, self.hidden_size, device=device)
+            for _ in range(len(self.cells))
+        ]
+
+        for t in range(seq_len):
+            inp = x[:, t, :]
+            for i, cell in enumerate(self.cells):
+                hidden[i] = cell(inp, hidden[i])
+                inp = hidden[i]
+
+        return hidden[-1]
+
+
+class MultiTimeframeLNN(nn.Module):
+    """多周期融合液态神经网络
 
     架构:
-        [输入序列 + 上下文特征] -> LTC Layer 1 -> LTC Layer 2 -> ... -> 分类头 -> 涨/跌概率
+        各周期序列 → 独立LTC编码器 → 拼接(+上下文特征) → 融合层 → 分类头 → 涨/跌概率
 
-    上下文特征(60天统计摘要)在每个时间步与序列特征拼接，
-    使模型能够同时感知短期模式和长期市场环境。
+    每个周期(1min/5min/15min/60min/4hour)有独立的编码器处理原生分辨率数据,
+    捕获从微观结构到宏观趋势的多尺度市场动态。
     """
+
+    def __init__(
+        self,
+        timeframe_configs,
+        context_feature_size,
+        hidden_size=None,
+        num_layers=None,
+        dropout=None,
+        output_size=1,
+    ):
+        """
+        Args:
+            timeframe_configs: dict of {period: {'seq_length': int, 'feature_size': int}}
+            context_feature_size: 上下文特征维度
+            hidden_size: 隐藏层大小
+            num_layers: 每个编码器的LTC层数
+            dropout: Dropout比率
+            output_size: 输出维度(默认1=二元分类)
+        """
+        super().__init__()
+        self.hidden_size = hidden_size or config.HIDDEN_SIZE
+        self.num_layers = num_layers or config.NUM_LAYERS
+        self.dropout_rate = dropout or config.DROPOUT
+
+        # 每个周期独立的LTC编码器
+        self.encoders = nn.ModuleDict({
+            period: TimeframeEncoder(
+                input_size=tf_cfg['feature_size'],
+                hidden_size=self.hidden_size,
+                num_layers=self.num_layers,
+            )
+            for period, tf_cfg in timeframe_configs.items()
+        })
+
+        num_tf = len(timeframe_configs)
+        fusion_input_size = num_tf * self.hidden_size + context_feature_size
+
+        # 融合层: 将所有编码器输出和上下文特征融合
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_input_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_rate),
+        )
+
+        # 分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.hidden_size // 2, output_size),
+            nn.Sigmoid(),
+        )
+        self._init_fusion_and_classifier()
+
+    def _init_fusion_and_classifier(self):
+        for module in self.fusion:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        for module in self.classifier:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, tf_sequences, context_features):
+        """
+        Args:
+            tf_sequences: dict of {period: (batch, seq_len, feature_size)}
+            context_features: (batch, context_size)
+
+        Returns:
+            output: (batch,) 预测涨的概率
+        """
+        encoded = []
+        for period, encoder in self.encoders.items():
+            h = encoder(tf_sequences[period])
+            encoded.append(h)
+
+        # 拼接所有编码器输出 + 上下文特征
+        fused_input = torch.cat(encoded + [context_features], dim=-1)
+        fused = self.fusion(fused_input)
+        return self.classifier(fused).squeeze(-1)
+
+
+class LiquidNeuralNetwork(nn.Module):
+    """单周期液态神经网络(兼容旧接口)"""
 
     def __init__(
         self,
@@ -118,8 +220,6 @@ class LiquidNeuralNetwork(nn.Module):
         self.dropout_rate = dropout or config.DROPOUT
 
         total_input_size = seq_feature_size + context_feature_size
-
-        # 多层 LTC 单元
         self.cells = nn.ModuleList([
             LTCCell(
                 total_input_size if i == 0 else self.hidden_size,
@@ -127,8 +227,6 @@ class LiquidNeuralNetwork(nn.Module):
             )
             for i in range(self.num_layers)
         ])
-
-        # 分类头
         self.classifier = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size // 2),
             nn.ReLU(),
@@ -146,35 +244,19 @@ class LiquidNeuralNetwork(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def forward(self, seq_features, context_features):
-        """
-        Args:
-            seq_features:      (batch, seq_len, seq_feature_size)
-            context_features:  (batch, context_feature_size)
-
-        Returns:
-            output: (batch,) 预测涨的概率
-        """
         batch_size, seq_len = seq_features.size(0), seq_features.size(1)
         device = seq_features.device
-
-        # 将上下文特征广播到每个时间步
         ctx = context_features.unsqueeze(1).expand(-1, seq_len, -1)
-        x = torch.cat([seq_features, ctx], dim=-1)  # (batch, seq_len, total_input)
-
-        # 初始化隐藏状态
+        x = torch.cat([seq_features, ctx], dim=-1)
         hidden = [
             torch.zeros(batch_size, self.hidden_size, device=device)
             for _ in range(self.num_layers)
         ]
-
-        # 逐时间步处理序列
         for t in range(seq_len):
             inp = x[:, t, :]
             for i, cell in enumerate(self.cells):
                 hidden[i] = cell(inp, hidden[i])
                 inp = hidden[i]
-
-        # 使用最终隐藏状态分类
         return self.classifier(hidden[-1]).squeeze(-1)
 
 
@@ -186,20 +268,25 @@ def count_parameters(model):
 
 
 if __name__ == "__main__":
-    from features import SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS
+    from features import SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS, TIMEFRAMES
 
-    seq_size = len(SEQ_FEATURE_COLS)
+    feat_size = len(SEQ_FEATURE_COLS)
     ctx_size = len(CONTEXT_FEATURE_COLS)
 
-    model = LiquidNeuralNetwork(seq_size, ctx_size)
+    # 多周期模型测试
+    tf_configs = {
+        p: {'seq_length': cfg['seq_length'], 'feature_size': feat_size}
+        for p, cfg in TIMEFRAMES.items()
+    }
+    model = MultiTimeframeLNN(tf_configs, ctx_size)
     total, trainable = count_parameters(model)
-    print(f"模型参数: 总计 {total:,}, 可训练 {trainable:,}")
+    print(f"多周期模型参数: 总计 {total:,}, 可训练 {trainable:,}")
 
-    # 前向传播测试
     batch_size = 4
-    seq_feat = torch.randn(batch_size, config.SEQ_LENGTH, seq_size)
+    tf_seqs = {
+        p: torch.randn(batch_size, cfg['seq_length'], feat_size)
+        for p, cfg in TIMEFRAMES.items()
+    }
     ctx_feat = torch.randn(batch_size, ctx_size)
-
-    output = model(seq_feat, ctx_feat)
-    print(f"输入: seq {seq_feat.shape}, ctx {ctx_feat.shape}")
+    output = model(tf_seqs, ctx_feat)
     print(f"输出: {output.shape}, 值: {output.detach().numpy()}")

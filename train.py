@@ -1,20 +1,21 @@
-"""液态神经网络训练脚本"""
+"""液态神经网络训练脚本 — 多周期融合版"""
 
+import os
 import time
 import logging
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
 import config
 from data_fetcher import HuobiDataFetcher
 from features import (
-    build_dataset, split_dataset,
-    SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
+    build_multi_tf_dataset, split_multi_tf_dataset,
+    MultiTimeframeDataset, SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
 )
-from lnn_model import LiquidNeuralNetwork, count_parameters
+from lnn_model import MultiTimeframeLNN, count_parameters
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,81 +28,70 @@ def train_model():
     """完整的训练流程"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"使用设备: {device}")
+    periods = list(config.TIMEFRAMES.keys())
+    logger.info(f"多周期融合: {periods}")
 
     # ==================== 1. 获取数据 ====================
     logger.info("=" * 60)
-    logger.info("步骤 1: 获取K线数据")
+    logger.info("步骤 1: 获取多周期K线数据")
     logger.info("=" * 60)
 
     fetcher = HuobiDataFetcher()
-    data = fetcher.get_10min_data(config.LOOKBACK_DAYS)
+    timeframe_data = fetcher.fetch_multi_timeframe()
 
-    min_required = config.SEQ_LENGTH * 2
-    if len(data) < min_required:
-        logger.error(f"数据不足: 需要至少 {min_required} 条, 实际 {len(data)} 条")
+    # 构建10min目标时间线(用于标签对齐)
+    data_10min = fetcher.resample_to_10min(timeframe_data['5min'])
+    target_df = fetcher.get_dataframe(data_10min)
+
+    if target_df.empty or len(target_df) < 100:
+        logger.error("目标时间线数据不足")
         return None
 
-    df = fetcher.get_dataframe(data)
-    if df.empty or len(df) < min_required:
-        logger.error("有效数据不足")
-        return None
+    # 各周期转DataFrame
+    tf_dfs = {}
+    for period, data in timeframe_data.items():
+        tf_dfs[period] = fetcher.get_dataframe(data)
 
     # ==================== 2. 构建数据集 ====================
     logger.info("=" * 60)
-    logger.info("步骤 2: 特征工程与数据集构建")
+    logger.info("步骤 2: 多周期特征工程与数据集构建")
     logger.info("=" * 60)
 
-    X_seq, X_ctx, y = build_dataset(df, config.SEQ_LENGTH)
+    X_dict, X_ctx, y = build_multi_tf_dataset(tf_dfs, target_df)
 
     if len(y) < 100:
         logger.error(f"有效样本不足: {len(y)} 个, 需要至少 100 个")
         return None
 
-    train_data, val_data, test_data = split_dataset(X_seq, X_ctx, y)
+    train_data, val_data, test_data = split_multi_tf_dataset(X_dict, X_ctx, y)
     logger.info(f"数据划分 -> 训练: {len(train_data[2])}, "
                 f"验证: {len(val_data[2])}, 测试: {len(test_data[2])}")
 
     # 创建 DataLoader
-    train_loader = DataLoader(
-        TensorDataset(
-            torch.FloatTensor(train_data[0]),
-            torch.FloatTensor(train_data[1]),
-            torch.FloatTensor(train_data[2]),
-        ),
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        TensorDataset(
-            torch.FloatTensor(val_data[0]),
-            torch.FloatTensor(val_data[1]),
-            torch.FloatTensor(val_data[2]),
-        ),
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-    )
-    test_loader = DataLoader(
-        TensorDataset(
-            torch.FloatTensor(test_data[0]),
-            torch.FloatTensor(test_data[1]),
-            torch.FloatTensor(test_data[2]),
-        ),
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-    )
+    train_dataset = MultiTimeframeDataset(train_data[0], train_data[1], train_data[2], periods)
+    val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
+    test_dataset = MultiTimeframeDataset(test_data[0], test_data[1], test_data[2], periods)
+
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
 
     # ==================== 3. 创建模型 ====================
     logger.info("=" * 60)
-    logger.info("步骤 3: 构建液态神经网络")
+    logger.info("步骤 3: 构建多周期液态神经网络")
     logger.info("=" * 60)
 
-    seq_feat_size = len(SEQ_FEATURE_COLS)
-    ctx_feat_size = len(CONTEXT_FEATURE_COLS)
+    feat_size = len(SEQ_FEATURE_COLS)
+    ctx_size = len(CONTEXT_FEATURE_COLS)
 
-    model = LiquidNeuralNetwork(
-        seq_feature_size=seq_feat_size,
-        context_feature_size=ctx_feat_size,
+    tf_configs = {
+        p: {'seq_length': cfg['seq_length'], 'feature_size': feat_size}
+        for p, cfg in config.TIMEFRAMES.items()
+    }
+
+    model = MultiTimeframeLNN(
+        timeframe_configs=tf_configs,
+        context_feature_size=ctx_size,
         hidden_size=config.HIDDEN_SIZE,
         num_layers=config.NUM_LAYERS,
         dropout=config.DROPOUT,
@@ -117,26 +107,43 @@ def train_model():
     )
     criterion = nn.BCELoss()
 
+    # 尝试加载上一轮checkpoint，继续训练
+    start_epoch = 0
     best_val_loss = float('inf')
     patience_counter = 0
 
+    if os.path.exists(config.MODEL_PATH):
+        try:
+            resume_checkpoint = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
+            model.load_state_dict(resume_checkpoint['model_state_dict'])
+            optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
+            start_epoch = resume_checkpoint.get('epoch', 0)
+            best_val_loss = resume_checkpoint.get('best_val_loss', float('inf'))
+            patience_counter = resume_checkpoint.get('patience_counter', 0)
+            logger.info(f"加载已有模型: Epoch {start_epoch}, "
+                        f"best_val_loss={best_val_loss:.4f}, patience={patience_counter}")
+        except Exception as e:
+            logger.warning(f"加载checkpoint失败，从头训练: {e}")
+
     # ==================== 5. 训练循环 ====================
     logger.info("=" * 60)
-    logger.info(f"步骤 4: 开始训练 ({config.EPOCHS} epochs)")
+    logger.info(f"步骤 4: 开始训练 ({start_epoch+1}~{config.EPOCHS} epochs)")
     logger.info("=" * 60)
 
-    for epoch in range(config.EPOCHS):
+    for epoch in range(start_epoch, config.EPOCHS):
         t0 = time.time()
 
         # --- 训练阶段 ---
         model.train()
         train_loss, train_correct, train_total = 0.0, 0, 0
 
-        for X_s, X_c, labels in train_loader:
-            X_s, X_c, labels = X_s.to(device), X_c.to(device), labels.to(device)
+        for tf_seqs, ctx, labels in train_loader:
+            tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
+            ctx = ctx.to(device)
+            labels = labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(X_s, X_c)
+            outputs = model(tf_seqs, ctx)
             loss = criterion(outputs, labels)
             loss.backward()
 
@@ -156,9 +163,11 @@ def train_model():
         val_loss, val_correct, val_total = 0.0, 0, 0
 
         with torch.no_grad():
-            for X_s, X_c, labels in val_loader:
-                X_s, X_c, labels = X_s.to(device), X_c.to(device), labels.to(device)
-                outputs = model(X_s, X_c)
+            for tf_seqs, ctx, labels in val_loader:
+                tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
+                ctx = ctx.to(device)
+                labels = labels.to(device)
+                outputs = model(tf_seqs, ctx)
                 loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * labels.size(0)
@@ -190,12 +199,14 @@ def train_model():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'val_acc': val_acc,
+                'best_val_loss': best_val_loss,
+                'patience_counter': patience_counter,
                 'config': {
-                    'seq_feature_size': seq_feat_size,
-                    'context_feature_size': ctx_feat_size,
+                    'timeframe_configs': tf_configs,
+                    'context_feature_size': ctx_size,
                     'hidden_size': config.HIDDEN_SIZE,
                     'num_layers': config.NUM_LAYERS,
-                    'seq_length': config.SEQ_LENGTH,
+                    'dropout': config.DROPOUT,
                 },
             }, config.MODEL_PATH)
             logger.info(f"  -> 保存最佳模型 (val_loss={val_loss:.4f})")
@@ -218,9 +229,11 @@ def train_model():
     all_preds, all_labels = [], []
 
     with torch.no_grad():
-        for X_s, X_c, labels in test_loader:
-            X_s, X_c, labels = X_s.to(device), X_c.to(device), labels.to(device)
-            outputs = model(X_s, X_c)
+        for tf_seqs, ctx, labels in test_loader:
+            tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
+            ctx = ctx.to(device)
+            labels = labels.to(device)
+            outputs = model(tf_seqs, ctx)
             loss = criterion(outputs, labels)
 
             test_loss += loss.item() * labels.size(0)
