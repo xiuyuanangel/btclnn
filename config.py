@@ -47,3 +47,8 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 HUOBI_BASE_URL = "https://api.hbdm.com"
 HUOBI_KLINE_ENDPOINT = "/linear-swap-ex/market/history/kline"
 API_REQUEST_INTERVAL = 0.5  # API请求间隔(秒)，避免触发限频
+
+# ==================== 通知推送配置 ====================
+# MeoW消息推送配置 (https://www.chuckfang.com/MeoW/api_doc.html)
+MEOW_NICKNAME = "修远啊"  # 设置你的MeoW昵称，为空字符串时不发送通知
+MEOW_BASE_URL = "https://api.chuckfang.com"  # API基础地址

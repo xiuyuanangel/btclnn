@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 
 import config
 from data_fetcher import HuobiDataFetcher
+from notifier import MeoWNotifier
 from features import (
     build_multi_tf_dataset, split_multi_tf_dataset,
     MultiTimeframeDataset, SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
@@ -30,6 +31,12 @@ def train_model():
     logger.info(f"使用设备: {device}")
     periods = list(config.TIMEFRAMES.keys())
     logger.info(f"多周期融合: {periods}")
+
+    # 初始化通知器
+    notifier = None
+    if config.MEOW_NICKNAME:
+        notifier = MeoWNotifier(config.MEOW_NICKNAME)
+        notifier.send_training_start(config.EPOCHS)
 
     # ==================== 1. 获取数据 ====================
     logger.info("=" * 60)
@@ -61,6 +68,8 @@ def train_model():
 
     if len(y) < 100:
         logger.error(f"有效样本不足: {len(y)} 个, 需要至少 100 个")
+        if notifier:
+            notifier.send_training_error(f"有效样本不足: {len(y)} 个, 需要至少 100 个")
         return None
 
     train_data, val_data, test_data = split_multi_tf_dataset(X_dict, X_ctx, y)
@@ -263,12 +272,34 @@ def train_model():
     logger.info(f"混淆矩阵: TP={tp} FP={fp} TN={tn} FN={fn}")
     logger.info(f"最佳模型来自 Epoch {checkpoint['epoch']}")
 
+    # 发送训练完成通知
+    if notifier:
+        notifier.send_training_complete(
+            epoch=checkpoint['epoch'],
+            val_loss=checkpoint['val_loss'],
+            val_acc=checkpoint['val_acc'],
+            test_acc=test_acc,
+            precision=precision,
+            recall=recall,
+            f1=f1
+        )
+
     return model
 
 
 if __name__ == "__main__":
     import sys
-    model = train_model()
-    if model is None:
-        logger.error("训练失败，未生成模型")
-        sys.exit(1)
+    try:
+        model = train_model()
+        if model is None:
+            logger.error("训练失败，未生成模型")
+            if config.MEOW_NICKNAME:
+                notifier = MeoWNotifier(config.MEOW_NICKNAME)
+                notifier.send_training_error("训练失败，未生成模型")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"训练过程中发生异常: {e}")
+        if config.MEOW_NICKNAME:
+            notifier = MeoWNotifier(config.MEOW_NICKNAME)
+            notifier.send_training_error(str(e))
+        raise

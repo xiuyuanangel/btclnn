@@ -12,6 +12,7 @@ import torch
 
 import config
 from data_fetcher import HuobiDataFetcher
+from notifier import MeoWNotifier
 from features import (
     compute_all_features, compute_context_features,
     SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
@@ -138,6 +139,20 @@ def predict():
 
     current_price = df_featured['close'].iloc[-1]
     latest_time = df_featured.index[-1]
+
+    # 发送通知推送
+    if config.MEOW_NICKNAME:
+        try:
+            notifier = MeoWNotifier(config.MEOW_NICKNAME)
+            notifier.send_prediction(
+                time=str(latest_time),
+                price=float(current_price),
+                direction=direction,
+                probability=probability,
+                confidence=confidence
+            )
+        except Exception as e:
+            logger.warning(f"通知推送失败: {e}")
 
     print()
     print("=" * 50)

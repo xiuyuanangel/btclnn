@@ -121,9 +121,23 @@ class HuobiDataFetcher:
 
         except requests.RequestException as e:
             logger.error(f"API请求失败: {e}")
+            # 发送数据获取错误通知
+            if config.MEOW_NICKNAME:
+                try:
+                    notifier = MeoWNotifier(config.MEOW_NICKNAME)
+                    notifier.send_data_fetch_error(f"API请求失败: {e}")
+                except:
+                    pass
             return []
         except (IndexError, KeyError, ValueError) as e:
             logger.error(f"数据解析失败: {e}")
+            # 发送数据获取错误通知
+            if config.MEOW_NICKNAME:
+                try:
+                    notifier = MeoWNotifier(config.MEOW_NICKNAME)
+                    notifier.send_data_fetch_error(f"数据解析失败: {e}")
+                except:
+                    pass
             return []
 
     def deduplicate(self, data):
