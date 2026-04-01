@@ -236,8 +236,8 @@ def build_multi_tf_dataset(tf_dfs, target_df):
             target_df[col] = context[col].iloc[0]
     target_df = target_df.dropna(subset=CONTEXT_FEATURE_COLS + ['label'])
 
-    # 统一转为秒级int64(兼容pandas不同内部存储精度)
-    target_timestamps = target_df.index.values.astype('datetime64[s]').astype(np.int64)
+    # 直接使用'id'列作为时间戳(秒级整数), 绕开DatetimeIndex dtype差异
+    target_timestamps = target_df['id'].values.astype(np.int64)
     label_data = target_df['label'].values
     ctx_data = target_df[CONTEXT_FEATURE_COLS].values
 
@@ -246,7 +246,7 @@ def build_multi_tf_dataset(tf_dfs, target_df):
     for period in periods:
         seq_length = config.TIMEFRAMES[period]['seq_length']
         df = tf_featured[period]
-        tf_ts = df.index.values.astype('datetime64[s]').astype(np.int64)
+        tf_ts = df['id'].values.astype(np.int64)
         tf_feat = df[SEQ_FEATURE_COLS].values
         all_sequences[period] = align_tf_sequences(
             tf_ts, tf_feat, target_timestamps, seq_length

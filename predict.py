@@ -87,7 +87,7 @@ def prepare_multi_tf_features(timeframe_data):
     for period in periods:
         seq_length = config.TIMEFRAMES[period]['seq_length']
         df = tf_dfs[period]
-        tf_ts = df.index.values.astype('datetime64[s]').astype(np.int64)
+        tf_ts = df['id'].values.astype(np.int64)
         tf_feat = df[SEQ_FEATURE_COLS].values
 
         idx = np.searchsorted(tf_ts, now_ts, side='right') - 1
