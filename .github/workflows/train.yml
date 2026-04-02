@@ -2,7 +2,7 @@ name: LNN Train & Predict
 
 on:
   schedule:
-    - cron: '0 18 * * *'  # 每天 UTC 02:00 (北京时间 10:00) 运行
+    - cron: '0 0,8,16 * * *'  # 每8小时运行一次(UTC 0:00, 8:00, 16:00)
   push:
     branches: [main, master]
     paths:
