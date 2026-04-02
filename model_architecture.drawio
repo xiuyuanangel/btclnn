@@ -1,0 +1,299 @@
+<mxGraphModel dx="1434" dy="780" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+  <root>
+    <mxCell id="0" />
+    <mxCell id="1" parent="0" />
+    
+    <!-- 标题 -->
+    <mxCell id="2" value="&lt;b&gt;MultiTimeframeLNN 模型架构&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=18;" vertex="1" parent="1">
+      <mxGeometry x="400" y="20" width="300" height="30" as="geometry" />
+    </mxCell>
+    
+    <!-- 输入层 - 各周期序列 -->
+    <mxCell id="3" value="1min序列&lt;br&gt;(batch, 60, 12)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+      <mxGeometry x="40" y="80" width="120" height="60" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="4" value="5min序列&lt;br&gt;(batch, 72, 12)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+      <mxGeometry x="180" y="80" width="120" height="60" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="5" value="15min序列&lt;br&gt;(batch, 48, 12)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+      <mxGeometry x="320" y="80" width="120" height="60" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="6" value="60min序列&lt;br&gt;(batch, 48, 12)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+      <mxGeometry x="460" y="80" width="120" height="60" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="7" value="4hour序列&lt;br&gt;(batch, 42, 12)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+      <mxGeometry x="600" y="80" width="120" height="60" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="8" value="1day序列&lt;br&gt;(batch, 60, 12)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+      <mxGeometry x="740" y="80" width="120" height="60" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="9" value="上下文特征&lt;br&gt;(batch, 6)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+      <mxGeometry x="880" y="80" width="120" height="60" as="geometry" />
+    </mxCell>
+    
+    <!-- LTC编码器层 -->
+    <mxCell id="10" value="&lt;b&gt;LTC编码器&lt;/b&gt;&lt;br&gt;TimeframeEncoder&lt;br&gt;2层LTCCell" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+      <mxGeometry x="40" y="180" width="120" height="70" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="11" value="&lt;b&gt;LTC编码器&lt;/b&gt;&lt;br&gt;TimeframeEncoder&lt;br&gt;2层LTCCell" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+      <mxGeometry x="180" y="180" width="120" height="70" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="12" value="&lt;b&gt;LTC编码器&lt;/b&gt;&lt;br&gt;TimeframeEncoder&lt;br&gt;2层LTCCell" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+      <mxGeometry x="320" y="180" width="120" height="70" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="13" value="&lt;b&gt;LTC编码器&lt;/b&gt;&lt;br&gt;TimeframeEncoder&lt;br&gt;2层LTCCell" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+      <mxGeometry x="460" y="180" width="120" height="70" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="14" value="&lt;b&gt;LTC编码器&lt;/b&gt;&lt;br&gt;TimeframeEncoder&lt;br&gt;2层LTCCell" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+      <mxGeometry x="600" y="180" width="120" height="70" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="15" value="&lt;b&gt;LTC编码器&lt;/b&gt;&lt;br&gt;TimeframeEncoder&lt;br&gt;2层LTCCell" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+      <mxGeometry x="740" y="180" width="120" height="70" as="geometry" />
+    </mxCell>
+    
+    <!-- 编码器输出 -->
+    <mxCell id="16" value="隐藏状态&lt;br&gt;(batch, 64)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+      <mxGeometry x="40" y="290" width="120" height="50" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="17" value="隐藏状态&lt;br&gt;(batch, 64)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+      <mxGeometry x="180" y="290" width="120" height="50" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="18" value="隐藏状态&lt;br&gt;(batch, 64)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+      <mxGeometry x="320" y="290" width="120" height="50" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="19" value="隐藏状态&lt;br&gt;(batch, 64)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+      <mxGeometry x="460" y="290" width="120" height="50" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="20" value="隐藏状态&lt;br&gt;(batch, 64)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+      <mxGeometry x="600" y="290" width="120" height="50" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="21" value="隐藏状态&lt;br&gt;(batch, 64)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+      <mxGeometry x="740" y="290" width="120" height="50" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="22" value="上下文&lt;br&gt;(batch, 6)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+      <mxGeometry x="880" y="290" width="120" height="50" as="geometry" />
+    </mxCell>
+    
+    <!-- 拼接层 -->
+    <mxCell id="23" value="&lt;b&gt;拼接层&lt;/b&gt;&lt;br&gt;Concatenate&lt;br&gt;(batch, 390)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+      <mxGeometry x="400" y="380" width="140" height="60" as="geometry" />
+    </mxCell>
+    
+    <!-- 融合层 -->
+    <mxCell id="24" value="&lt;b&gt;融合层&lt;/b&gt;&lt;br&gt;Fusion&lt;br&gt;Linear(390→64)&lt;br&gt;ReLU + Dropout(0.3)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+      <mxGeometry x="400" y="480" width="140" height="80" as="geometry" />
+    </mxCell>
+    
+    <!-- 分类头 -->
+    <mxCell id="25" value="&lt;b&gt;分类头&lt;/b&gt;&lt;br&gt;Classifier&lt;br&gt;Linear(64→32)&lt;br&gt;ReLU + Dropout&lt;br&gt;Linear(32→1)&lt;br&gt;Sigmoid" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffcccc;strokeColor=#cc0000;" vertex="1" parent="1">
+      <mxGeometry x="400" y="600" width="140" height="100" as="geometry" />
+    </mxCell>
+    
+    <!-- 输出 -->
+    <mxCell id="26" value="&lt;b&gt;输出&lt;/b&gt;&lt;br&gt;上涨概率&lt;br&gt;(batch,)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#99ff99;strokeColor=#009900;fontStyle=1" vertex="1" parent="1">
+      <mxGeometry x="400" y="740" width="140" height="50" as="geometry" />
+    </mxCell>
+    
+    <!-- 输入到编码器的连接 -->
+    <mxCell id="27" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="3" target="10">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="28" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="4" target="11">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="29" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="5" target="12">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="30" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="6" target="13">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="31" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="7" target="14">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="32" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="8" target="15">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <!-- 编码器到隐藏状态的连接 -->
+    <mxCell id="33" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="10" target="16">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="34" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="11" target="17">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="35" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="12" target="18">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="36" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="13" target="19">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="37" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="14" target="20">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="38" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="15" target="21">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <!-- 上下文直通 -->
+    <mxCell id="39" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="9" target="22">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <!-- 隐藏状态到拼接层 -->
+    <mxCell id="40" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="16" target="23">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="200" y="315" />
+          <mxPoint x="200" y="410" />
+          <mxPoint x="400" y="410" />
+        </Array>
+      </mxGeometry>
+    </mxCell>
+    
+    <mxCell id="41" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="17" target="23">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="340" y="315" />
+          <mxPoint x="340" y="410" />
+        </Array>
+      </mxGeometry>
+    </mxCell>
+    
+    <mxCell id="42" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="18" target="23">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="43" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="19" target="23">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="44" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="20" target="23">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="600" y="315" />
+          <mxPoint x="600" y="410" />
+          <mxPoint x="540" y="410" />
+        </Array>
+      </mxGeometry>
+    </mxCell>
+    
+    <mxCell id="45" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="21" target="23">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="740" y="315" />
+          <mxPoint x="740" y="410" />
+        </Array>
+      </mxGeometry>
+    </mxCell>
+    
+    <mxCell id="46" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="22" target="23">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="880" y="315" />
+          <mxPoint x="880" y="410" />
+        </Array>
+      </mxGeometry>
+    </mxCell>
+    
+    <!-- 拼接层到融合层 -->
+    <mxCell id="47" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="23" target="24">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <!-- 融合层到分类头 -->
+    <mxCell id="48" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="24" target="25">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <!-- 分类头到输出 -->
+    <mxCell id="49" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="25" target="26">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    
+    <!-- LTCCell 详细结构说明 -->
+    <mxCell id="50" value="&lt;b&gt;LTCCell 内部结构&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=14;" vertex="1" parent="1">
+      <mxGeometry x="40" y="520" width="150" height="20" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="51" value="输入 x&lt;br&gt;(batch, input_size)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="40" y="550" width="80" height="40" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="52" value="隐藏状态 h&lt;br&gt;(batch, hidden)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="140" y="550" width="80" height="40" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="53" value="时间常数 τ&lt;br&gt;(可学习)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="40" y="610" width="80" height="40" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="54" value="门控网络&lt;br&gt;Gate Net&lt;br&gt;Sigmoid" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="140" y="610" width="80" height="50" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="55" value="dh/dt = -h/τ + W_in·x + gate·W_rec·h" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=10;fontStyle=2" vertex="1" parent="1">
+      <mxGeometry x="40" y="670" width="200" height="20" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="56" value="h_new = tanh(h + dh/dt)" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=10;fontStyle=2" vertex="1" parent="1">
+      <mxGeometry x="40" y="690" width="150" height="20" as="geometry" />
+    </mxCell>
+    
+    <!-- 图例 -->
+    <mxCell id="57" value="&lt;b&gt;图例&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="920" y="520" width="80" height="20" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="58" value="输入数据" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="920" y="550" width="100" height="25" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="59" value="LTC编码器" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="920" y="585" width="100" height="25" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="60" value="隐藏状态" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="920" y="620" width="100" height="25" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="61" value="上下文特征" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="920" y="655" width="100" height="25" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="62" value="融合/分类层" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="920" y="690" width="100" height="25" as="geometry" />
+    </mxCell>
+    
+    <mxCell id="63" value="输出" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#99ff99;strokeColor=#009900;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="920" y="725" width="100" height="25" as="geometry" />
+    </mxCell>
+    
+  </root>
+</mxGraphModel>
