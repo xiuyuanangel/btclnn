@@ -46,12 +46,14 @@ jobs:
           restore-keys: |
             lnn-kline-data-
 
-      # 缓存模型检查点
+      # 缓存模型检查点(每次运行写入新key, 恢复时用前缀匹配)
       - name: Cache model checkpoint
         uses: actions/cache@v4
         with:
           path: checkpoints/
-          key: lnn-model-checkpoint
+          key: lnn-model-${{ github.run_number }}
+          restore-keys: |
+            lnn-model-
 
       - name: Fetch data and train model
         env:
