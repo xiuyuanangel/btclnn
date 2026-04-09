@@ -44,7 +44,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # ==================== 火币API配置 ====================
-HUOBI_BASE_URL = "https://api.hbdm.com"
+HUOBI_BASE_URL = "https://api.hbdm.vn"
 HUOBI_KLINE_ENDPOINT = "/linear-swap-ex/market/history/kline"
 API_REQUEST_INTERVAL = 0.5  # API请求间隔(秒)，避免触发限频
 
