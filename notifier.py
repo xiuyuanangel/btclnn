@@ -211,12 +211,13 @@ class MeoWNotifier:
 
         title = f"{emoji} BTC预测 - {trend}"
 
-        msg = f"""<b>时间:</b> {time}
-<b>当前价格:</b> {price:.2f} USDT
-<b>预测方向:</b> {direction}
-<b>上涨概率:</b> {probability*100:.2f}%
-<b>置信度:</b> {confidence*100:.2f}%
-<b>预测窗口:</b> 未来10分钟"""
+        msg = (f'<div style="font-size:40px;line-height:1.8">'
+               f'<b>时间:</b> {time}<br>'
+               f'<b>当前价格:</b> {price:.2f} USDT<br>'
+               f'<b>预测方向:</b> {direction}<br>'
+               f'<b>上涨概率:</b> {probability*100:.2f}%<br>'
+               f'<b>置信度:</b> {confidence*100:.2f}%<br>'
+               f'<b>预测窗口:</b> 未来10分钟</div>')
 
         return self.send(title, msg, msg_type="html", html_height=200)
 
@@ -258,7 +259,7 @@ class MeoWNotifier:
         if f1 is not None:
             msg_lines.append(f"<b>F1分数:</b> {f1:.4f}")
 
-        msg = "\n".join(msg_lines)
+        msg = '<div style="font-size:40px;line-height:1.8">' + "<br>".join(msg_lines) + '</div>'
         return self.send(title, msg, msg_type="html", html_height=250)
 
     def send_training_error(self, error_msg: str) -> bool:
@@ -316,15 +317,15 @@ if __name__ == "__main__":
     notifier = MeoWNotifier(test_nickname)
 
     # 测试纯文本消息
-    print("测试发送纯文本消息...")
-    result = notifier.send("测试标题", test_msg)
-    print(f"结果: {'成功' if result else '失败'}")
+    # print("测试发送纯文本消息...")
+    # result = notifier.send("测试标题", test_msg)
+    # print(f"结果: {'成功' if result else '失败'}")
 
     # 测试HTML消息
-    print("\n测试发送HTML消息...")
-    html_msg = "<b>粗体文本</b> 和 <i>斜体文本</i>"
-    result = notifier.send("HTML测试", html_msg, msg_type="html", html_height=150)
-    print(f"结果: {'成功' if result else '失败'}")
+    # print("\n测试发送HTML消息...")
+    # html_msg = "<b>粗体文本</b> 和 <i>斜体文本</i>"
+    # result = notifier.send("HTML测试", html_msg, msg_type="html", html_height=150)
+    # print(f"结果: {'成功' if result else '失败'}")
 
     # 测试预测通知
     print("\n测试发送预测通知...")

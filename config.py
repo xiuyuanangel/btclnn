@@ -31,7 +31,7 @@ DROPOUT = 0.3               # 丢弃率
 LEARNING_RATE = 0.001       # 学习率
 BATCH_SIZE = 32             # 批处理大小
 EPOCHS = 25                 # 训练轮数
-PATIENCE = 15              # 早停耐心值
+PATIENCE = 20              # 早停耐心值
 
 # ==================== 数据存储路径 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
