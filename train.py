@@ -116,33 +116,32 @@ def train_model():
     )
     criterion = nn.BCELoss()
 
-    # 尝试从GitHub Release下载最新模型(仅CI环境且本地无checkpoint时)
-    if not os.path.exists(config.MODEL_PATH):
-        gh_token = os.environ.get('GITHUB_TOKEN')
-        if gh_token:
-            try:
-                import subprocess, json as _json
-                result = subprocess.run(
-                    ['gh', 'release', 'view', '--json', 'tagName'],
-                    capture_output=True, text=True, timeout=30,
+    # 优先从GitHub Release下载最新模型(仅CI环境)
+    gh_token = os.environ.get('GITHUB_TOKEN')
+    if gh_token:
+        try:
+            import subprocess, json as _json
+            result = subprocess.run(
+                ['gh', 'release', 'view', '--json', 'tagName'],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                tag = _json.loads(result.stdout).get('tagName')
+                logger.info(f"检测到最新Release: {tag}, 正在下载模型...")
+                dl = subprocess.run(
+                    ['gh', 'release', 'download', tag,
+                     '--pattern', '*.pt', '--dir', 'checkpoints/',
+                     '--clobber'],
+                    capture_output=True, text=True, timeout=120,
                 )
-                if result.returncode == 0:
-                    tag = _json.loads(result.stdout).get('tagName')
-                    logger.info(f"检测到最新Release: {tag}, 正在下载模型...")
-                    dl = subprocess.run(
-                        ['gh', 'release', 'download', tag,
-                         '--pattern', '*.pt', '--dir', 'checkpoints/',
-                         '--clobber'],
-                        capture_output=True, text=True, timeout=120,
-                    )
-                    if dl.returncode == 0 and os.path.exists(config.MODEL_PATH):
-                        logger.info("Release模型下载成功")
-                    else:
-                        logger.warning(f"Release模型下载失败: {dl.stderr.strip()}")
+                if dl.returncode == 0 and os.path.exists(config.MODEL_PATH):
+                    logger.info("Release模型下载成功")
                 else:
-                    logger.info("未找到已有Release，从头训练")
-            except Exception as e:
-                logger.warning(f"获取Release信息失败: {e}")
+                    logger.warning(f"Release模型下载失败: {dl.stderr.strip()}")
+            else:
+                logger.info("未找到已有Release")
+        except Exception as e:
+            logger.warning(f"获取Release信息失败: {e}")
 
     # 加载已有模型权重(作为初始化, 每次固定训练25轮)
     start_epoch = 0
