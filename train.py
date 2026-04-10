@@ -144,7 +144,7 @@ def train_model():
             except Exception as e:
                 logger.warning(f"获取Release信息失败: {e}")
 
-    # 尝试加载上一轮checkpoint，继续训练
+    # 加载已有模型权重(作为初始化, 每次固定训练25轮)
     start_epoch = 0
     best_val_loss = float('inf')
     patience_counter = 0
@@ -153,15 +153,9 @@ def train_model():
         try:
             resume_checkpoint = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
             ckpt_config = resume_checkpoint.get('config', {})
-            # 检测架构是否匹配(多周期模型有timeframe_configs字段)
             if 'timeframe_configs' in ckpt_config:
                 model.load_state_dict(resume_checkpoint['model_state_dict'])
-                optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
-                start_epoch = resume_checkpoint.get('epoch', 0)
-                best_val_loss = resume_checkpoint.get('best_val_loss', float('inf'))
-                patience_counter = resume_checkpoint.get('patience_counter', 0)
-                logger.info(f"加载已有模型: Epoch {start_epoch}, "
-                            f"best_val_loss={best_val_loss:.4f}, patience={patience_counter}")
+                logger.info("加载已有模型权重作为初始化")
             else:
                 logger.info("检测到旧架构checkpoint，从头训练新模型")
         except Exception as e:
