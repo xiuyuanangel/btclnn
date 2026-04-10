@@ -16,7 +16,7 @@ permissions:
 
 concurrency:
   group: train-and-predict
-  cancel-in-progress: true   # 新任务取消正在运行的任务(适用于push触发)
+  cancel-in-progress: ${{ github.event_name == 'push' }}  # 仅push触发时取消运行中的任务，定时任务排队等待
 
 jobs:
   train-and-predict:
