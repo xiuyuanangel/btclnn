@@ -145,8 +145,8 @@ def align_tf_sequences(tf_timestamps, tf_features, target_timestamps, seq_length
     n_target = len(target_timestamps)
 
     # 诊断日志
-    if tf_timestamps.size > 0:
-        logger.info(f"    TF范围: [{tf_timestamps[0]}, {tf_timestamps[-1]}]")
+    # if tf_timestamps.size > 0:
+    #     logger.info(f"    TF范围: [{tf_timestamps[0]}, {tf_timestamps[-1]}]")
     logger.info(f"    目标范围: [{target_timestamps[0]}, {target_timestamps[-1]}]")
 
     # 向量化: 一次性计算所有target的searchsorted
