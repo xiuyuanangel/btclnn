@@ -25,11 +25,15 @@ logger = logging.getLogger(__name__)
 
 
 class HuobiDataFetcher:
-    """火币永续合约数据获取器"""
+    """火币永续合约数据获取器，支持多节点备用切换"""
 
     def __init__(self, symbol=None, base_url=None):
         self.symbol = symbol or config.SYMBOL
+        self.base_urls = config.HUOBI_BASE_URLS
         self.base_url = base_url or config.HUOBI_BASE_URL
+        self.current_url_index = 0
+        if self.base_url in self.base_urls:
+            self.current_url_index = self.base_urls.index(self.base_url)
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "LNN-Bot/1.0"
@@ -84,8 +88,18 @@ class HuobiDataFetcher:
                 })
         return normalized
 
+    def _switch_to_next_url(self):
+        """切换到下一个备用API节点"""
+        next_index = (self.current_url_index + 1) % len(self.base_urls)
+        old_url = self.base_url
+        self.base_url = self.base_urls[next_index]
+        self.current_url_index = next_index
+        logger.warning(f"API节点切换: {old_url} -> {self.base_url}")
+        return self.base_url
+
     def _fetch_kline_range(self, period, from_ts, to_ts):
         """使用 from&to 获取指定时间范围的K线数据(不传size)
+        支持多节点自动切换: 主节点失败时自动尝试备用节点
 
         Args:
             period: K线周期 (1min, 5min, 15min, 30min, 60min, 4hour, 1day)
@@ -95,51 +109,57 @@ class HuobiDataFetcher:
         Returns:
             list: K线数据列表
         """
-        url = f"{self.base_url}{config.HUOBI_KLINE_ENDPOINT}"
-        params = {
-            "contract_code": self.symbol,
-            "period": period,
-            "from": int(from_ts),
-            "to": int(to_ts),
-        }
+        max_retries = len(self.base_urls)  # 每个节点尝试一次
 
-        # print(params)
+        for attempt in range(max_retries):
+            url = f"{self.base_url}{config.HUOBI_KLINE_ENDPOINT}"
+            params = {
+                "contract_code": self.symbol,
+                "period": period,
+                "from": int(from_ts),
+                "to": int(to_ts),
+            }
 
-        try:
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            result = response.json()
+            try:
+                response = self.session.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                result = response.json()
 
-            if result.get("status") != "ok":
-                logger.error(f"API返回错误: {result}")
+                if result.get("status") != "ok":
+                    # API返回错误，尝试下一个节点
+                    logger.error(f"[{self.base_url}] API返回错误: {result.get('err_msg', result)}")
+                    if attempt < max_retries - 1:
+                        self._switch_to_next_url()
+                        continue
+                    return []
+
+                data = result.get("data", [])
+                if not data:
+                    return []
+
+                return self._normalize_kline(data)
+
+            except requests.RequestException as e:
+                logger.error(f"[{self.base_url}] API请求失败: {e}")
+                if config.MEOW_NICKNAME:
+                    try:
+                        notifier = MeoWNotifier(config.MEOW_NICKNAME)
+                        notifier.send_data_fetch_error(f"API请求失败 [{self.base_url}]: {e}")
+                    except Exception:
+                        pass
+                if attempt < max_retries - 1:
+                    self._switch_to_next_url()
+                    continue
                 return []
-
-            data = result.get("data", [])
-            if not data:
+            except (IndexError, KeyError, ValueError) as e:
+                logger.error(f"数据解析失败: {e}")
+                if config.MEOW_NICKNAME:
+                    try:
+                        notifier = MeoWNotifier(config.MEOW_NICKNAME)
+                        notifier.send_data_fetch_error(f"数据解析失败: {e}")
+                    except Exception:
+                        pass
                 return []
-
-            return self._normalize_kline(data)
-
-        except requests.RequestException as e:
-            logger.error(f"API请求失败: {e}")
-            # 发送数据获取错误通知
-            if config.MEOW_NICKNAME:
-                try:
-                    notifier = MeoWNotifier(config.MEOW_NICKNAME)
-                    notifier.send_data_fetch_error(f"API请求失败: {e}")
-                except:
-                    pass
-            return []
-        except (IndexError, KeyError, ValueError) as e:
-            logger.error(f"数据解析失败: {e}")
-            # 发送数据获取错误通知
-            if config.MEOW_NICKNAME:
-                try:
-                    notifier = MeoWNotifier(config.MEOW_NICKNAME)
-                    notifier.send_data_fetch_error(f"数据解析失败: {e}")
-                except:
-                    pass
-            return []
 
     def deduplicate(self, data):
         """基于时间戳去重"""
