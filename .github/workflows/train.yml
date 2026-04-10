@@ -11,7 +11,7 @@ on:
       - '.github/workflows/train.yml'
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 concurrency:
@@ -72,3 +72,15 @@ jobs:
           path: checkpoints/
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Create GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v$(date +%Y%m%d-%H%M)"
+          gh release create "$TAG" \
+            checkpoints/*.pt \
+            --title "Model $TAG" \
+            --notes "BTC LNN Multi-Timeframe Model (run #${{ github.run_number }})" \
+            --latest
