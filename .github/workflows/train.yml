@@ -78,9 +78,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          shopt -s nullglob
           TAG="v$(date +%Y%m%d-%H%M)"
-          gh release create "$TAG" \
-            checkpoints/*.pt \
+          files=(checkpoints/*.pth)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No checkpoint files found; skipping release."
+            exit 0
+          fi
+          gh release create "$TAG" "${files[@]}" \
             --title "Model $TAG" \
             --notes "BTC LNN Multi-Timeframe Model (run #${{ github.run_number }})" \
             --latest
