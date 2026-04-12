@@ -130,7 +130,7 @@ def train_model():
                 logger.info(f"检测到最新Release: {tag}, 正在下载模型...")
                 dl = subprocess.run(
                     ['gh', 'release', 'download', tag,
-                     '--pattern', '*.pt', '--dir', 'checkpoints/',
+                     '--pattern', '*.pth', '--dir', 'checkpoints/',
                      '--clobber'],
                     capture_output=True, text=True, timeout=120,
                 )
