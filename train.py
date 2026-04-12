@@ -142,6 +142,8 @@ def train_model():
                 logger.info("未找到已有Release")
         except Exception as e:
             logger.warning(f"获取Release信息失败: {e}")
+    else:
+        logger.info("未找到已有GITHUB_TOKEN, 忽略Release下载")
 
     # 加载已有模型权重(作为初始化, 每次固定训练25轮)
     start_epoch = 0
