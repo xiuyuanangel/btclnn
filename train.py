@@ -117,7 +117,7 @@ def train_model():
     criterion = nn.BCELoss()
 
     # 优先从GitHub Release下载最新模型(仅CI环境)
-    gh_token = os.environ.get('GITHUB_TOKEN')
+    gh_token = os.environ.get('GH_TOKEN')
     if gh_token:
         try:
             import subprocess, json as _json
