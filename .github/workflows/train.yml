@@ -58,6 +58,7 @@ jobs:
       - name: Fetch data and train model
         env:
           EPOCHS: ${{ github.event.inputs.epochs || '50' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python train.py
 
       - name: Run prediction
