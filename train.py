@@ -181,6 +181,7 @@ def train_model():
 
             optimizer.zero_grad()
             outputs = model(tf_seqs, ctx)
+            outputs = torch.clamp(outputs, 1e-6, 1.0 - 1e-6)
             loss = criterion(outputs, labels)
             loss.backward()
 
@@ -205,6 +206,7 @@ def train_model():
                 ctx = ctx.to(device)
                 labels = labels.to(device)
                 outputs = model(tf_seqs, ctx)
+                outputs = torch.clamp(outputs, 1e-6, 1.0 - 1e-6)
                 loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * labels.size(0)
@@ -271,6 +273,7 @@ def train_model():
             ctx = ctx.to(device)
             labels = labels.to(device)
             outputs = model(tf_seqs, ctx)
+            outputs = torch.clamp(outputs, 1e-6, 1.0 - 1e-6)
             loss = criterion(outputs, labels)
 
             test_loss += loss.item() * labels.size(0)

@@ -102,6 +102,7 @@ class TimeframeEncoder(nn.Module):
             inp = x[:, t, :]
             for i, cell in enumerate(self.cells):
                 hidden[i] = cell(inp, hidden[i])
+                hidden[i] = torch.clamp(hidden[i], -10, 10)
                 inp = hidden[i]
 
         return hidden[-1]
@@ -256,6 +257,7 @@ class LiquidNeuralNetwork(nn.Module):
             inp = x[:, t, :]
             for i, cell in enumerate(self.cells):
                 hidden[i] = cell(inp, hidden[i])
+                hidden[i] = torch.clamp(hidden[i], -10, 10)
                 inp = hidden[i]
         return self.classifier(hidden[-1]).squeeze(-1)
 
