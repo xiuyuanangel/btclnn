@@ -13,6 +13,7 @@ import json
 import os
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
@@ -304,18 +305,40 @@ class HuobiDataFetcher:
         return data_10min
 
     def fetch_multi_timeframe(self):
-        """获取所有配置周期的K线数据
+        """获取所有配置周期的K线数据(多线程并发)
 
         Returns:
             dict: {period: list_of_kline_dicts} 每个周期的原始K线数据
         """
+        periods = list(config.TIMEFRAMES.items())
         timeframe_data = {}
-        for period, cfg in config.TIMEFRAMES.items():
+
+        def _fetch_one(period_cfg):
+            period, cfg = period_cfg
             lookback = cfg['lookback_days']
-            logger.info(f"获取 {period} 数据 (lookback={lookback}天)...")
+            logger.info(f"[并发] 开始获取 {period} 数据 (lookback={lookback}天)...")
             data = self.fetch_history(period, lookback)
-            timeframe_data[period] = data
-            logger.info(f"  {period}: {len(data)} 条K线")
+            logger.info(f"[并发] {period}: {len(data)} 条K线")
+            return period, data
+
+        max_workers = min(len(periods), 6)
+        logger.info(f"多线程并发获取 {len(periods)} 个周期数据 (workers={max_workers})")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_fetch_one, pc): pc[0] for pc in periods}
+            for future in as_completed(futures):
+                period = futures[future]
+                try:
+                    p, data = future.result()
+                    timeframe_data[p] = data
+                except Exception as e:
+                    logger.error(f"获取 {period} 数据异常: {e}")
+                    timeframe_data[period] = []
+
+        # 按原始顺序输出汇总日志
+        for period in config.TIMEFRAMES:
+            if period in timeframe_data:
+                logger.info(f"  {period}: {len(timeframe_data[period])} 条K线")
         return timeframe_data
 
     def get_dataframe(self, data):
