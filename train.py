@@ -26,10 +26,31 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_dataloader_workers():
+    """根据CPU核心数获取最优的DataLoader工作进程数"""
+    import multiprocessing
+    cpu_count = multiprocessing.cpu_count()
+    # 使用CPU核心数的一半，但至少为2
+    return max(2, cpu_count // 2)
+
+
 def train_model():
     """完整的训练流程"""
+    # 启用cudnn自动优化（针对固定输入尺寸的卷积/循环层）
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
+        logger.info("启用cuDNN自动优化")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"使用设备: {device}")
+    
+    # 如果使用GPU，显示GPU信息
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        logger.info(f"GPU: {gpu_name}, 显存: {gpu_memory:.2f} GB")
+    
     periods = list(config.TIMEFRAMES.keys())
     logger.info(f"多周期融合: {periods}")
 
@@ -128,7 +149,13 @@ def train_model():
         optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6,
     )
     criterion = nn.BCEWithLogitsLoss()
-
+    
+    # 混合精度训练配置（仅在GPU可用时启用）
+    use_amp = torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    if use_amp:
+        logger.info("启用自动混合精度训练(AMP)")
+    
     # 优先从GitHub Release下载最新模型(仅CI环境)
     gh_token = os.environ.get('GH_TOKEN')
     if gh_token:
@@ -188,17 +215,29 @@ def train_model():
         train_loss, train_correct, train_total = 0.0, 0, 0
 
         for tf_seqs, ctx, labels in train_loader:
-            tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
-            ctx = ctx.to(device)
-            labels = labels.to(device)
+            tf_seqs = {p: v.to(device, non_blocking=True) for p, v in tf_seqs.items()}
+            ctx = ctx.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            outputs, _ = model(tf_seqs, ctx)  # 忽略注意力权重
-            loss = criterion(outputs, labels)
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            
+            # 使用自动混合精度
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    outputs, _ = model(tf_seqs, ctx)
+                    loss = criterion(outputs, labels)
+                
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs, _ = model(tf_seqs, ctx)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
             train_loss += loss.item() * labels.size(0)
             probs = torch.sigmoid(outputs)
@@ -215,11 +254,18 @@ def train_model():
 
         with torch.no_grad():
             for tf_seqs, ctx, labels in val_loader:
-                tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
-                ctx = ctx.to(device)
-                labels = labels.to(device)
-                outputs, _ = model(tf_seqs, ctx)  # 忽略注意力权重
-                loss = criterion(outputs, labels)
+                tf_seqs = {p: v.to(device, non_blocking=True) for p, v in tf_seqs.items()}
+                ctx = ctx.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                
+                # 验证阶段也使用混合精度以加速
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        outputs, _ = model(tf_seqs, ctx)
+                        loss = criterion(outputs, labels)
+                else:
+                    outputs, _ = model(tf_seqs, ctx)
+                    loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * labels.size(0)
                 probs = torch.sigmoid(outputs)
@@ -233,12 +279,22 @@ def train_model():
 
         elapsed = time.time() - t0
         current_lr = optimizer.param_groups[0]['lr']
+        
+        # 计算训练速度
+        samples_per_sec = train_total / elapsed if elapsed > 0 else 0
+        
+        # 获取GPU内存使用情况
+        gpu_mem_info = ""
+        if torch.cuda.is_available():
+            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+            gpu_mem_info = f" | GPU: {mem_allocated:.2f}/{mem_reserved:.2f} GB"
 
         logger.info(
             f"Epoch {epoch+1:3d}/{config.EPOCHS} | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
             f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
-            f"LR: {current_lr:.6f} | {elapsed:.1f}s"
+            f"LR: {current_lr:.6f} | {samples_per_sec:.1f} samples/s | {elapsed:.1f}s{gpu_mem_info}"
         )
 
         # 保存最佳模型
