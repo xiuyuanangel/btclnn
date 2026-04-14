@@ -14,7 +14,8 @@ from data_fetcher import HuobiDataFetcher
 from notifier import MeoWNotifier
 from features import (
     build_multi_tf_dataset, split_multi_tf_dataset,
-    MultiTimeframeDataset, SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
+    MultiTimeframeDataset, FeatureNormalizer,
+    SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
 )
 from lnn_model import MultiTimeframeLNN, count_parameters
 
@@ -76,6 +77,18 @@ def train_model():
     logger.info(f"数据划分 -> 训练: {len(train_data[2])}, "
                 f"验证: {len(val_data[2])}, 测试: {len(test_data[2])}")
 
+    # 特征标准化(基于训练集统计量, 统一应用到验证/测试集)
+    normalizer = FeatureNormalizer().fit(train_data[0], train_data[1])
+    norm_path = os.path.join(config.CHECKPOINT_DIR, 'feature_normalizer.json')
+    normalizer.save(norm_path)
+    train_data = (normalizer.transform(train_data[0], train_data[1])[0],
+                  normalizer.transform(train_data[0], train_data[1])[1],
+                  train_data[2])
+    val_norm = normalizer.transform(val_data[0], val_data[1])
+    val_data = (val_norm[0], val_norm[1], val_data[2])
+    test_norm = normalizer.transform(test_data[0], test_data[1])
+    test_data = (test_norm[0], test_norm[1], test_data[2])
+
     # 创建 DataLoader
     train_dataset = MultiTimeframeDataset(train_data[0], train_data[1], train_data[2], periods)
     val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
@@ -114,7 +127,7 @@ def train_model():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6,
     )
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()
 
     # 优先从GitHub Release下载最新模型(仅CI环境)
     gh_token = os.environ.get('GH_TOKEN')
@@ -181,7 +194,6 @@ def train_model():
 
             optimizer.zero_grad()
             outputs = model(tf_seqs, ctx)
-            outputs = torch.clamp(outputs, 1e-6, 1.0 - 1e-6)
             loss = criterion(outputs, labels)
             loss.backward()
 
@@ -189,7 +201,8 @@ def train_model():
             optimizer.step()
 
             train_loss += loss.item() * labels.size(0)
-            preds = (outputs > 0.5).float()
+            probs = torch.sigmoid(outputs)
+            preds = (probs > 0.5).float()
             train_correct += (preds == labels).sum().item()
             train_total += labels.size(0)
 
@@ -206,11 +219,11 @@ def train_model():
                 ctx = ctx.to(device)
                 labels = labels.to(device)
                 outputs = model(tf_seqs, ctx)
-                outputs = torch.clamp(outputs, 1e-6, 1.0 - 1e-6)
                 loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * labels.size(0)
-                preds = (outputs > 0.5).float()
+                probs = torch.sigmoid(outputs)
+                preds = (probs > 0.5).float()
                 val_correct += (preds == labels).sum().item()
                 val_total += labels.size(0)
 
@@ -273,14 +286,14 @@ def train_model():
             ctx = ctx.to(device)
             labels = labels.to(device)
             outputs = model(tf_seqs, ctx)
-            outputs = torch.clamp(outputs, 1e-6, 1.0 - 1e-6)
             loss = criterion(outputs, labels)
 
             test_loss += loss.item() * labels.size(0)
-            preds = (outputs > 0.5).float()
+            probs = torch.sigmoid(outputs)
+            preds = (probs > 0.5).float()
             test_correct += (preds == labels).sum().item()
             test_total += labels.size(0)
-            all_preds.extend(outputs.cpu().numpy())
+            all_preds.extend(probs.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
     test_loss /= test_total

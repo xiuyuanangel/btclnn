@@ -172,6 +172,64 @@ def align_tf_sequences(tf_timestamps, tf_features, target_timestamps, seq_length
     return sequences
 
 
+class FeatureNormalizer:
+    """Z-score 特征标准化器(基于训练集统计量)"""
+
+    def __init__(self):
+        self.seq_means = {}   # {period: np.array (feature_size,)}
+        self.seq_stds = {}
+        self.ctx_mean = None  # np.array (context_size,)
+        self.ctx_std = None
+        self._fitted = False
+
+    def fit(self, X_dict_train, X_ctx_train):
+        """从训练集计算均值和标准差"""
+        for period, X in X_dict_train.items():
+            # X: (N, seq_len, feat) → 对前两个维度展平后算统计量
+            flat = X.reshape(-1, X.shape[-1])
+            self.seq_means[period] = flat.mean(axis=0)
+            self.seq_stds[period] = flat.std(axis=0) + 1e-8
+
+        self.ctx_mean = X_ctx_train.mean(axis=0)
+        self.ctx_std = X_ctx_train.std(axis=0) + 1e-8
+        self._fitted = True
+        logger.info("特征标准化器已从训练集拟合")
+        return self
+
+    def transform(self, X_dict, X_ctx):
+        """标准化输入数据"""
+        assert self._fitted, "请先调用 fit()"
+        X_dict_norm = {}
+        for period, X in X_dict.items():
+            X_dict_norm[period] = (X - self.seq_means[period]) / self.seq_stds[period]
+        X_ctx_norm = (X_ctx - self.ctx_mean) / self.ctx_std
+        return X_dict_norm, X_ctx_norm.astype(np.float32)
+
+    def save(self, path):
+        import json
+        state = {
+            'seq_means': {k: v.tolist() for k, v in self.seq_means.items()},
+            'seq_stds': {k: v.tolist() for k, v in self.seq_stds.items()},
+            'ctx_mean': self.ctx_mean.tolist(),
+            'ctx_std': self.ctx_std.tolist(),
+        }
+        with open(path, 'w') as f:
+            json.dump(state, f)
+
+    @classmethod
+    def load(cls, path):
+        import json
+        with open(path, 'r') as f:
+            state = json.load(f)
+        norm = cls()
+        norm.seq_means = {k: np.array(v, dtype=np.float32) for k, v in state['seq_means'].items()}
+        norm.seq_stds = {k: np.array(v, dtype=np.float32) for k, v in state['seq_stds'].items()}
+        norm.ctx_mean = np.array(state['ctx_mean'], dtype=np.float32)
+        norm.ctx_std = np.array(state['ctx_std'], dtype=np.float32)
+        norm._fitted = True
+        return norm
+
+
 class MultiTimeframeDataset(Dataset):
     """多周期融合数据集"""
 

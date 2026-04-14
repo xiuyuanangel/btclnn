@@ -14,7 +14,7 @@ import config
 from data_fetcher import HuobiDataFetcher
 from notifier import MeoWNotifier
 from features import (
-    compute_all_features, compute_context_features,
+    compute_all_features, compute_context_features, FeatureNormalizer,
     SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
 )
 from lnn_model import MultiTimeframeLNN
@@ -126,12 +126,20 @@ def predict():
         logger.error(str(e))
         return None
 
+    # 3.5 特征标准化(使用训练时的统计量)
+    norm_path = os.path.join(config.CHECKPOINT_DIR, 'feature_normalizer.json')
+    if not os.path.exists(norm_path):
+        raise FileNotFoundError(f"标准化参数文件不存在: {norm_path}\n请先运行 train.py 训练模型")
+    normalizer = FeatureNormalizer.load(norm_path)
+    tf_seqs, ctx = normalizer.transform(tf_seqs, ctx)
+
     # 4. 模型推理
     tf_seqs_tensor = {p: torch.FloatTensor(v).to(device) for p, v in tf_seqs.items()}
     ctx_tensor = torch.FloatTensor(ctx).to(device)
 
     with torch.no_grad():
-        probability = model(tf_seqs_tensor, ctx_tensor).item()
+        logits = model(tf_seqs_tensor, ctx_tensor)
+        probability = torch.sigmoid(logits).item()
 
     # 5. 输出结果
     direction = "涨 (UP)" if probability > 0.5 else "跌 (DOWN)"

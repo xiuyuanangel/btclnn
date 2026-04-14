@@ -25,7 +25,7 @@ class LTCCell(nn.Module):
     核心微分方程:
         dh/dt = -h / tau + W_in * u + gate(h, u) * W_rec * h
 
-    离散化: Euler方法, dh_new = h + dh/dt * dt (dt=1)
+    离散化: 4阶Runge-Kutta方法 (dt=1), 比Euler更稳定精确
     """
 
     def __init__(self, input_size, hidden_size):
@@ -40,6 +40,7 @@ class LTCCell(nn.Module):
             nn.Linear(input_size + hidden_size, hidden_size),
             nn.Tanh()
         )
+        self.layer_norm = nn.LayerNorm(hidden_size)
         self._init_weights()
 
     def _init_weights(self):
@@ -51,12 +52,21 @@ class LTCCell(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-    def forward(self, x, h):
+    def _deriv(self, x, h):
+        """计算 dh/dt (ODE 右端项)"""
         tau = torch.nn.functional.softplus(self.tau) + 1.0
         gate = torch.sigmoid(self.gate_net(torch.cat([x, h], dim=-1)))
-        dhdt = -h / tau + self.W_in(x) + gate * self.W_rec(h)
-        h_new = h + dhdt
-        return torch.tanh(h_new)
+        return -h / tau + self.W_in(x) + gate * self.W_rec(h)
+
+    def forward(self, x, h):
+        # 4阶 Runge-Kutta 离散化 (dt=1), 比Euler更稳定精确
+        dt = torch.tensor(1.0, device=h.device)
+        k1 = self._deriv(x, h)
+        k2 = self._deriv(x, h + 0.5 * dt * k1)
+        k3 = self._deriv(x, h + 0.5 * dt * k2)
+        k4 = self._deriv(x, h + dt * k3)
+        h_new = h + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        return torch.tanh(self.layer_norm(h_new))
 
 
 class TimeframeEncoder(nn.Module):
@@ -64,6 +74,7 @@ class TimeframeEncoder(nn.Module):
 
     将一个时间周期的序列编码为固定维度的向量表示。
     每个周期有独立的多层LTC单元, 处理原生分辨率的数据。
+    输出: 最后隐藏状态 + 所有层均值池化 (2 * hidden_size)
     """
 
     def __init__(self, input_size, hidden_size, num_layers):
@@ -88,7 +99,7 @@ class TimeframeEncoder(nn.Module):
             x: (batch, seq_len, input_size)
 
         Returns:
-            h: (batch, hidden_size) 最终隐藏状态
+            h: (batch, 2 * hidden_size) 最后隐藏状态 + 层均值
         """
         batch_size, seq_len = x.size(0), x.size(1)
         device = x.device
@@ -102,10 +113,12 @@ class TimeframeEncoder(nn.Module):
             inp = x[:, t, :]
             for i, cell in enumerate(self.cells):
                 hidden[i] = cell(inp, hidden[i])
-                hidden[i] = torch.clamp(hidden[i], -10, 10)
                 inp = hidden[i]
 
-        return hidden[-1]
+        # 多尺度输出: 最后状态 + 各层均值(捕获全局趋势)
+        last_h = hidden[-1]
+        mean_h = torch.stack(hidden, dim=0).mean(dim=0)
+        return torch.cat([last_h, mean_h], dim=-1)
 
 
 class MultiTimeframeLNN(nn.Module):
@@ -151,27 +164,41 @@ class MultiTimeframeLNN(nn.Module):
             for period, tf_cfg in timeframe_configs.items()
         })
 
-        num_tf = len(timeframe_configs)
-        fusion_input_size = num_tf * self.hidden_size + context_feature_size
+        encoder_output_size = self.hidden_size * 2  # 每个编码器输出维度
 
-        # 融合层: 将所有编码器输出和上下文特征融合
+        # 周期注意力机制: 自适应学习各时间帧的重要性
+        self.tf_attention = nn.Sequential(
+            nn.Linear(encoder_output_size, encoder_output_size // 4),
+            nn.Tanh(),
+            nn.Linear(encoder_output_size // 4, 1),
+        )
+
+        # 加权融合: 各编码器注意力加权求和 + 上下文特征
+        fusion_input_size = encoder_output_size + context_feature_size
+
+        # 融合层: 将加权编码器输出和上下文特征融合
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_size, self.hidden_size),
+            nn.LayerNorm(self.hidden_size),
             nn.ReLU(),
             nn.Dropout(self.dropout_rate),
         )
 
-        # 分类头
+        # 分类头 (输出logits, 不含Sigmoid, 配合BCEWithLogitsLoss使用)
         self.classifier = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(self.dropout_rate),
             nn.Linear(self.hidden_size // 2, output_size),
-            nn.Sigmoid(),
         )
         self._init_fusion_and_classifier()
 
     def _init_fusion_and_classifier(self):
+        for module in self.tf_attention:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
         for module in self.fusion:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -192,13 +219,23 @@ class MultiTimeframeLNN(nn.Module):
         Returns:
             output: (batch,) 预测涨的概率
         """
+        # 各周期编码
         encoded = []
         for period, encoder in self.encoders.items():
             h = encoder(tf_sequences[period])
             encoded.append(h)
 
-        # 拼接所有编码器输出 + 上下文特征
-        fused_input = torch.cat(encoded + [context_features], dim=-1)
+        # 注意力加权融合: 自适应学习各周期重要性
+        scores_list = [self.tf_attention(enc) for enc in encoded]  # 各 (batch, 1)
+        scores = torch.cat(scores_list, dim=-1)                     # (batch, num_tf)
+        attn_weights = torch.softmax(scores, dim=-1)               # 归一化权重
+
+        # 加权求和: (batch, 2*hidden_size)
+        weighted_sum = sum(w * enc for w, enc in zip(
+            attn_weights.unbind(dim=-1), encoded))
+
+        # 拼接加权结果 + 上下文特征
+        fused_input = torch.cat([weighted_sum, context_features], dim=-1)
         fused = self.fusion(fused_input)
         return self.classifier(fused).squeeze(-1)
 
@@ -228,12 +265,12 @@ class LiquidNeuralNetwork(nn.Module):
             )
             for i in range(self.num_layers)
         ])
+        # 分类头 (输出logits, 不含Sigmoid, 配合BCEWithLogitsLoss使用)
         self.classifier = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(self.dropout_rate),
             nn.Linear(self.hidden_size // 2, output_size),
-            nn.Sigmoid(),
         )
         self._init_classifier()
 
