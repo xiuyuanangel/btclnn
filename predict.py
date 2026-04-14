@@ -138,7 +138,7 @@ def predict():
     ctx_tensor = torch.FloatTensor(ctx).to(device)
 
     with torch.no_grad():
-        logits = model(tf_seqs_tensor, ctx_tensor)
+        logits, attn_weights = model(tf_seqs_tensor, ctx_tensor)
         probability = torch.sigmoid(logits).item()
 
     # 5. 输出结果
@@ -147,6 +147,17 @@ def predict():
 
     current_price = df_featured['close'].iloc[-1]
     latest_time = df_featured.index[-1]
+
+    # 解析注意力权重
+    cross_attn = attn_weights.get('cross_attention', None)
+    tf_attn = attn_weights.get('timeframe_attention', None)
+    
+    # 计算各周期重要性
+    if tf_attn is not None:
+        tf_importance = tf_attn.cpu().numpy()[0]  # (num_timeframes,)
+        timeframe_names = list(config.TIMEFRAMES.keys())
+    else:
+        tf_importance = None
 
     # 发送通知推送
     if config.MEOW_NICKNAME:
@@ -173,6 +184,15 @@ def predict():
     print(f"  上涨概率:   {probability:.4f} ({probability * 100:.2f}%)")
     print(f"  置信度:     {confidence:.4f} ({confidence * 100:.2f}%)")
     print(f"  预测窗口:   未来10分钟")
+    
+    # 显示周期注意力权重
+    if tf_importance is not None:
+        print("-" * 50)
+        print(f"  各周期重要性权重:")
+        for name, weight in zip(timeframe_names, tf_importance):
+            bar = "█" * int(weight * 20)
+            print(f"    {name:8s}: {weight:.4f} ({weight*100:5.1f}%) {bar}")
+    
     print("=" * 50)
     print()
 

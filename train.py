@@ -193,7 +193,7 @@ def train_model():
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(tf_seqs, ctx)
+            outputs, _ = model(tf_seqs, ctx)  # 忽略注意力权重
             loss = criterion(outputs, labels)
             loss.backward()
 
@@ -218,7 +218,7 @@ def train_model():
                 tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
                 ctx = ctx.to(device)
                 labels = labels.to(device)
-                outputs = model(tf_seqs, ctx)
+                outputs, _ = model(tf_seqs, ctx)  # 忽略注意力权重
                 loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * labels.size(0)
