@@ -231,8 +231,9 @@ class MultiTimeframeLNN(nn.Module):
         attn_weights = torch.softmax(scores, dim=-1)               # 归一化权重
 
         # 加权求和: (batch, 2*hidden_size)
-        weighted_sum = sum(w * enc for w, enc in zip(
-            attn_weights.unbind(dim=-1), encoded))
+        weighted_sum = torch.zeros_like(encoded[0])
+        for i, enc in enumerate(encoded):
+            weighted_sum = weighted_sum + attn_weights[:, i:i+1] * enc
 
         # 拼接加权结果 + 上下文特征
         fused_input = torch.cat([weighted_sum, context_features], dim=-1)
