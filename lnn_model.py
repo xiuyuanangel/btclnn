@@ -135,8 +135,8 @@ class CrossTimeframeAttention(nn.Module):
         self.num_timeframes = num_timeframes
         self.num_heads = num_heads
         self.head_dim = hidden_size * 2 // num_heads  # encoder输出是2*hidden_size
-
-        assert (hidden_size * 2) % num_heads == 0, "hidden_size*2必须能被num_heads整除"
+        assert (hidden_size * 2) % num_heads == 0, f"hidden_size*2 ({hidden_size*2}) 必须能被 num_heads ({num_heads}) 整除"
+        assert self.head_dim >= 1, "head_dim 必须 >= 1"
 
         # 多头注意力投影
         self.q_proj = nn.Linear(hidden_size * 2, hidden_size * 2)
@@ -347,10 +347,11 @@ class MultiTimeframeLNN(nn.Module):
             )
 
         # 周期注意力机制: 自适应学习各时间帧的重要性
+        tf_attn_inter_size = max(1, encoder_output_size // 4)
         self.tf_attention = nn.Sequential(
-            nn.Linear(encoder_output_size, encoder_output_size // 4),
+            nn.Linear(encoder_output_size, tf_attn_inter_size),
             nn.Tanh(),
-            nn.Linear(encoder_output_size // 4, 1),
+            nn.Linear(tf_attn_inter_size, 1),
         )
 
         # 加权融合: 各编码器注意力加权求和 + 上下文特征

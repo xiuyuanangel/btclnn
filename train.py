@@ -197,8 +197,23 @@ def train_model():
             resume_checkpoint = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
             ckpt_config = resume_checkpoint.get('config', {})
             if 'timeframe_configs' in ckpt_config:
-                model.load_state_dict(resume_checkpoint['model_state_dict'])
-                logger.info("加载已有模型权重作为初始化")
+                # 检查当前模型与 checkpoint 的 state_dict 是否匹配
+                current_state = model.state_dict()
+                ckpt_state = resume_checkpoint['model_state_dict']
+                mismatched = False
+                for k in ckpt_state:
+                    if k in current_state:
+                        if ckpt_state[k].shape != current_state[k].shape:
+                            logger.warning(f"权重形状不匹配: {k} {ckpt_state[k].shape} vs {current_state[k].shape}")
+                            mismatched = True
+                    else:
+                        logger.warning(f"缺失权重键: {k}")
+                        mismatched = True
+                if mismatched:
+                    logger.info("检测到权重形状不匹配，从头训练新模型")
+                else:
+                    model.load_state_dict(ckpt_state)
+                    logger.info("加载已有模型权重作为初始化")
             else:
                 logger.info("检测到旧架构checkpoint，从头训练新模型")
         except Exception as e:
