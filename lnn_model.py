@@ -53,25 +53,27 @@ class LTCCell(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def _deriv(self, x, h):
-        """计算 dh/dt (ODE 右端项)"""
-        tau = torch.nn.functional.softplus(self.tau) + 1.0
-        gate = torch.sigmoid(self.gate_net(torch.cat([x, h], dim=-1)))
-        return -h / tau + self.W_in(x) + gate * self.W_rec(h)
+        """计算 dh/dt (ODE 右端项) — 强制FP32保证数值稳定"""
+        # 在AMP模式下强制FP32执行RK4求导
+        with torch.amp.autocast('cpu' if x.device.type == 'cpu' else 'cuda', enabled=False):
+            fp32_x = x.float()
+            fp32_h = h.float()
+            tau = torch.nn.functional.softplus(self.tau.float()) + 1.0
+            gate = torch.sigmoid(self.gate_net(torch.cat([fp32_x, fp32_h], dim=-1)))
+            result = (-fp32_h / tau
+                      + self.W_in.float()(fp32_x)
+                      + gate * self.W_rec.float()(fp32_h))
+        return result.to(x.dtype)
 
     def forward(self, x, h):
-        # 4阶 Runge-Kutta 离散化 (dt=1), 比Euler更稳定精确
-        dt = 1.0  # 标量，避免创建不必要的tensor导致AMP问题
+        # 4阶 Runge-Kutta 离散化 (dt=1), 内部强制FP32
+        dt = 1.0
         k1 = self._deriv(x, h)
-        k1 = torch.nan_to_num(k1, nan=0.0, posinf=10.0, neginf=-10.0)
         k2 = self._deriv(x, h + 0.5 * dt * k1)
-        k2 = torch.nan_to_num(k2, nan=0.0, posinf=10.0, neginf=-10.0)
         k3 = self._deriv(x, h + 0.5 * dt * k2)
-        k3 = torch.nan_to_num(k3, nan=0.0, posinf=10.0, neginf=-10.0)
         k4 = self._deriv(x, h + dt * k3)
-        k4 = torch.nan_to_num(k4, nan=0.0, posinf=10.0, neginf=-10.0)
 
         h_new = h + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-        h_new = torch.nan_to_num(h_new, nan=0.0, posinf=10.0, neginf=-10.0)
         return torch.tanh(self.layer_norm(h_new))
 
 
@@ -195,8 +197,9 @@ class CrossTimeframeAttention(nn.Module):
         V = self.v_proj(x).view(batch_size, num_tf, self.num_heads, self.head_dim).transpose(1, 2)
         # Q,K,V: (batch, num_heads, num_tf, head_dim)
 
-        # 缩放点积注意力
+        # 缩放点积注意力 (clamp 防止 softmax 溢出)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        scores = torch.clamp(scores, min=-50.0, max=50.0)
         attn_weights = torch.softmax(scores, dim=-1)  # (batch, num_heads, num_tf, num_tf)
 
         # 加权求和
