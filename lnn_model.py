@@ -33,7 +33,8 @@ class LTCCell(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        self.tau = nn.Parameter(torch.randn(hidden_size) * 0.1)
+        # 改进tau初始化: 使用正值初始化，避免数值不稳定
+        self.tau = nn.Parameter(torch.ones(hidden_size) * 2.0 + torch.rand(hidden_size) * 0.5)
         self.W_in = nn.Linear(input_size, hidden_size, bias=False)
         self.W_rec = nn.Linear(hidden_size, hidden_size, bias=False)
         self.gate_net = nn.Sequential(
@@ -44,29 +45,44 @@ class LTCCell(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.W_in.weight, gain=0.5)
-        nn.init.orthogonal_(self.W_rec.weight, gain=0.5)
+        # 使用更合理的gain值避免梯度消失
+        nn.init.xavier_uniform_(self.W_in.weight, gain=1.0)
+        nn.init.orthogonal_(self.W_rec.weight, gain=0.8)
         for module in self.gate_net:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
     def _deriv(self, x, h):
         """计算 dh/dt (ODE 右端项)"""
-        tau = torch.nn.functional.softplus(self.tau) + 1.0
-        gate = torch.sigmoid(self.gate_net(torch.cat([x, h], dim=-1)))
-        return -h / tau + self.W_in(x) + gate * self.W_rec(h)
+        # 确保tau为正且有下界，避免除零
+        tau = torch.nn.functional.softplus(self.tau) + 0.5
+        # 裁剪h避免数值溢出
+        h_clamped = torch.clamp(h, -100.0, 100.0)
+        gate_input = torch.cat([x, h_clamped], dim=-1)
+        gate = torch.sigmoid(self.gate_net(gate_input))
+        # 计算导数时添加数值稳定性保护
+        dh = -h_clamped / tau + self.W_in(x) + gate * self.W_rec(h_clamped)
+        # 裁剪导数防止梯度爆炸
+        return torch.clamp(dh, -50.0, 50.0)
 
     def forward(self, x, h):
         # 4阶 Runge-Kutta 离散化 (dt=1)
         dt = 1.0
+        # 裁剪输入h避免初始值过大
+        h = torch.clamp(h, -100.0, 100.0)
+        
         k1 = self._deriv(x, h)
         k2 = self._deriv(x, h + 0.5 * dt * k1)
         k3 = self._deriv(x, h + 0.5 * dt * k2)
         k4 = self._deriv(x, h + dt * k3)
 
         h_new = h + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        # 在layer_norm前裁剪，避免极端值
+        h_new = torch.clamp(h_new, -100.0, 100.0)
+        # 检测NaN并替换为零
+        h_new = torch.where(torch.isnan(h_new), torch.zeros_like(h_new), h_new)
         return torch.tanh(self.layer_norm(h_new))
 
 
@@ -158,11 +174,11 @@ class CrossTimeframeAttention(nn.Module):
 
     def _init_weights(self):
         for proj in [self.q_proj, self.k_proj, self.v_proj]:
-            nn.init.xavier_uniform_(proj.weight, gain=0.5)
+            nn.init.xavier_uniform_(proj.weight, gain=1.0)
             nn.init.zeros_(proj.bias)
         for module in self.out_proj:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
@@ -192,8 +208,15 @@ class CrossTimeframeAttention(nn.Module):
 
         # 缩放点积注意力 (clamp 防止 softmax 溢出)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        scores = torch.clamp(scores, min=-50.0, max=50.0)
+        # 更严格的裁剪范围，避免数值溢出
+        scores = torch.clamp(scores, min=-20.0, max=20.0)
+        # 数值稳定性: 减去最大值
+        scores = scores - scores.max(dim=-1, keepdim=True)[0]
         attn_weights = torch.softmax(scores, dim=-1)  # (batch, num_heads, num_tf, num_tf)
+        # 确保权重不是NaN
+        attn_weights = torch.where(torch.isnan(attn_weights), 
+                                    torch.ones_like(attn_weights) / num_tf, 
+                                    attn_weights)
 
         # 加权求和
         attn_output = torch.matmul(attn_weights, V)  # (batch, num_heads, num_tf, head_dim)
@@ -236,12 +259,12 @@ class CrossTimeframeGating(nn.Module):
     def _init_weights(self):
         for module in self.global_pool:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         for module in self.gate_net:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
@@ -377,17 +400,17 @@ class MultiTimeframeLNN(nn.Module):
     def _init_fusion_and_classifier(self):
         for module in self.tf_attention:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         for module in self.fusion:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         for module in self.classifier:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 

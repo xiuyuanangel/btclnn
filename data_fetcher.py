@@ -13,6 +13,7 @@ import json
 import os
 import time
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -39,6 +40,8 @@ class HuobiDataFetcher:
         self.session.headers.update({
             "User-Agent": "LNN-Bot/1.0"
         })
+        # 增强连接池
+        self.session.mount('https://', requests.adapters.HTTPAdapter(pool_maxsize=10, max_retries=3))
 
     def get_cache_path(self, period):
         safe_symbol = self.symbol.replace("-", "_")
@@ -179,7 +182,7 @@ class HuobiDataFetcher:
         return sorted(data, key=lambda x: x.get("id", 0))
 
     def fetch_history(self, period, days=None):
-        """获取历史K线数据，按7天分块使用from&to分页
+        """获取历史K线数据，按时间块分块并发使用from&to分页
 
         API规则: size与from&to必填其一；三者都填时忽略from/to
         因此分页只用from&to(不传size)
@@ -223,36 +226,68 @@ class HuobiDataFetcher:
         # 5min周期: 2000 * 300s ≈ 6.9天(7天=2016根会超限)
         max_candles_per_chunk = 1500  # 留buffer
         chunk_seconds = max_candles_per_chunk * minutes_per_candle * 60
-        all_new_data = []
+        
+        # 生成时间块列表
+        chunks = []
         chunk_start = fetch_start
-
         while chunk_start < fetch_end:
             chunk_end = min(chunk_start + chunk_seconds, fetch_end)
-            batch = self._fetch_kline_range(period, chunk_start, chunk_end)
-
+            chunks.append((chunk_start, chunk_end))
+            chunk_start = chunk_end
+        
+        logger.info(f"{period} 数据分块: {len(chunks)} 个时间块，每块约 {minutes_per_candle * max_candles_per_chunk} 根K线")
+        
+        # 4. 并发获取所有时间块数据
+        all_new_data = []
+        lock = threading.Lock()  # 用于线程安全的batch聚合
+        
+        def _fetch_chunk(args):
+            cs, ce = args
+            batch = self._fetch_kline_range(period, cs, ce)
             if batch:
-                # 排除缓存中已有的数据
+                # 在线程内排除缓存中已有的数据，减少后续处理量
                 if cached_data:
                     cached_ids = {item["id"] for item in cached_data}
                     batch = [item for item in batch if item["id"] not in cached_ids]
-                all_new_data.extend(batch)
-
-            chunk_start = chunk_end
-            time.sleep(config.API_REQUEST_INTERVAL)
-
-        # 4. 合并去重排序
+                if batch:
+                    with lock:
+                        all_new_data.extend(batch)
+            return len(batch)
+        
+        # 限制并发数避免触发API限流 (每周期最多3个并发请求)
+        max_concurrent_chunks = min(len(chunks), 3)
+        logger.info(f"并发获取 {period} 数据: {len(chunks)} 个块，最大并发数 {max_concurrent_chunks}")
+        
+        with ThreadPoolExecutor(max_workers=max_concurrent_chunks) as executor:
+            # 提交所有任务
+            futures = [executor.submit(_fetch_chunk, chunk) for chunk in chunks]
+            
+            # 等待所有任务完成并统计
+            completed = 0
+            total_fetched = 0
+            for future in as_completed(futures):
+                try:
+                    count = future.result()
+                    total_fetched += count
+                    completed += 1
+                    if completed % 5 == 0 or completed == len(chunks):
+                        logger.info(f"{period} 进度: {completed}/{len(chunks)} 块完成，已获取 {total_fetched} 条")
+                except Exception as e:
+                    logger.error(f"获取时间块数据异常: {e}")
+        
+        # 5. 合并去重排序
         combined = cached_data + all_new_data
         combined = self.deduplicate(combined)
         combined = self.sort_data(combined)
 
-        # 5. 裁剪到目标范围
+        # 6. 裁剪到目标范围
         combined = [item for item in combined if item.get("id", 0) >= start_ts]
 
-        # 6. 保存缓存
+        # 7. 保存缓存
         if combined:
             self.save_cache(combined, period)
 
-        logger.info(f"获取完成: 共 {len(combined)} 条 {period} K线数据")
+        logger.info(f"获取完成: 共 {len(combined)} 条 {period} K线数据 (新增 {len(all_new_data)} 条)")
         return combined
 
     def _period_to_minutes(self, period):

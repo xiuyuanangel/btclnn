@@ -187,11 +187,17 @@ class FeatureNormalizer:
         for period, X in X_dict_train.items():
             # X: (N, seq_len, feat) → 对前两个维度展平后算统计量
             flat = X.reshape(-1, X.shape[-1])
-            self.seq_means[period] = flat.mean(axis=0)
-            self.seq_stds[period] = flat.std(axis=0) + 1e-8
+            # 移除异常值后计算统计量
+            flat_clipped = np.clip(flat, np.percentile(flat, 1, axis=0), 
+                                   np.percentile(flat, 99, axis=0))
+            self.seq_means[period] = flat_clipped.mean(axis=0)
+            self.seq_stds[period] = flat_clipped.std(axis=0) + 1e-6  # 增加epsilon
 
-        self.ctx_mean = X_ctx_train.mean(axis=0)
-        self.ctx_std = X_ctx_train.std(axis=0) + 1e-8
+        X_ctx_clipped = np.clip(X_ctx_train, 
+                                np.percentile(X_ctx_train, 1, axis=0),
+                                np.percentile(X_ctx_train, 99, axis=0))
+        self.ctx_mean = X_ctx_clipped.mean(axis=0)
+        self.ctx_std = X_ctx_clipped.std(axis=0) + 1e-6  # 增加epsilon
         self._fitted = True
         logger.info("特征标准化器已从训练集拟合")
         return self
@@ -202,11 +208,13 @@ class FeatureNormalizer:
         X_dict_norm = {}
         for period, X in X_dict.items():
             normalized = (X - self.seq_means[period]) / self.seq_stds[period]
-            # 替换可能的 Inf/NaN 为 0 (防御性处理)
-            normalized = np.nan_to_num(normalized, nan=0.0, posinf=10.0, neginf=-10.0)
+            # 替换可能的 Inf/NaN 为 0，并裁剪到合理范围
+            normalized = np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
+            normalized = np.clip(normalized, -10.0, 10.0)  # 裁剪到[-10, 10]
             X_dict_norm[period] = normalized
         X_ctx_norm = (X_ctx - self.ctx_mean) / self.ctx_std
-        X_ctx_norm = np.nan_to_num(X_ctx_norm, nan=0.0, posinf=10.0, neginf=-10.0)
+        X_ctx_norm = np.nan_to_num(X_ctx_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        X_ctx_norm = np.clip(X_ctx_norm, -10.0, 10.0)  # 裁剪到[-10, 10]
         return X_dict_norm, X_ctx_norm.astype(np.float32)
 
     def save(self, path):

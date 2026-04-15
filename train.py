@@ -240,9 +240,32 @@ def train_model():
 
             outputs, _ = model(tf_seqs, ctx)
             loss = criterion(outputs, labels)
+            
+            # 检测 NaN/Inf 并跳过异常batch
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(
+                    f"检测到异常loss={loss.item():.6f}, 跳过此batch"
+                )
+                continue
+            
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # 更严格的梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            
+            # 检查梯度是否正常
+            grad_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    grad_norm += param_norm.item() ** 2
+            grad_norm = grad_norm ** 0.5
+            
+            if torch.isnan(torch.tensor(grad_norm)) or grad_norm > 100.0:
+                logger.warning(f"梯度异常 grad_norm={grad_norm:.4f}, 跳过参数更新")
+                optimizer.zero_grad()
+                continue
+            
             optimizer.step()
 
             # 检测 NaN 并记录诊断信息
@@ -252,7 +275,7 @@ def train_model():
                     f"output range=[{outputs.min().item():.4f}, {outputs.max().item():.4f}], "
                     f"ctx range=[{ctx.min().item():.4f}, {ctx.max().item():.4f}]"
                 )
-                continue  # 跳过此 batch 的参数更新
+                continue  # 跳过此 batch
 
             train_loss += loss.item() * labels.size(0)
             probs = torch.sigmoid(outputs)
