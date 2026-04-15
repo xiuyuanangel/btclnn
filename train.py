@@ -153,11 +153,10 @@ def train_model():
     )
     criterion = nn.BCEWithLogitsLoss()
     
-    # 混合精度训练配置（仅在GPU可用时启用）
-    use_amp = torch.cuda.is_available()
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
-    if use_amp:
-        logger.info("启用自动混合精度训练(AMP)")
+    # 混合精度训练配置
+    # 注意: 跨周期注意力+RK4+LTC在FP16下数值不稳定, 必须使用FP32
+    use_amp = False  # 强制关闭AMP (此模型架构与FP16不兼容)
+    logger.info("混合精度(AMP): 禁用 (RK4+跨周期注意力需要FP32保证数值稳定)")
     
     # 优先从GitHub Release下载最新模型(仅CI环境)
     gh_token = os.environ.get('GH_TOKEN')
@@ -224,23 +223,12 @@ def train_model():
 
             optimizer.zero_grad()
 
-            # 使用自动混合精度
-            if use_amp:
-                with torch.cuda.amp.autocast():
-                    outputs, _ = model(tf_seqs, ctx)
-                    loss = criterion(outputs, labels)
+            outputs, _ = model(tf_seqs, ctx)
+            loss = criterion(outputs, labels)
+            loss.backward()
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                outputs, _ = model(tf_seqs, ctx)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
             # 检测 NaN 并记录诊断信息
             if torch.isnan(loss) or torch.isinf(loss):
@@ -257,6 +245,10 @@ def train_model():
             train_correct += (preds == labels).sum().item()
             train_total += labels.size(0)
 
+        if train_total == 0:
+            logger.error("训练阶段所有batch均为NaN, 无法计算loss")
+            raise RuntimeError("训练失败: 所有batch输出均为NaN")
+
         train_loss /= train_total
         train_acc = train_correct / train_total
 
@@ -270,14 +262,8 @@ def train_model():
                 ctx = ctx.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
                 
-                # 验证阶段也使用混合精度以加速
-                if use_amp:
-                    with torch.cuda.amp.autocast():
-                        outputs, _ = model(tf_seqs, ctx)
-                        loss = criterion(outputs, labels)
-                else:
-                    outputs, _ = model(tf_seqs, ctx)
-                    loss = criterion(outputs, labels)
+                outputs, _ = model(tf_seqs, ctx)
+                loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * labels.size(0)
                 probs = torch.sigmoid(outputs)

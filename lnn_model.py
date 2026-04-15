@@ -53,20 +53,13 @@ class LTCCell(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def _deriv(self, x, h):
-        """计算 dh/dt (ODE 右端项) — 强制FP32保证数值稳定"""
-        # 在AMP模式下强制FP32执行RK4求导
-        with torch.amp.autocast('cpu' if x.device.type == 'cpu' else 'cuda', enabled=False):
-            fp32_x = x.float()
-            fp32_h = h.float()
-            tau = torch.nn.functional.softplus(self.tau.float()) + 1.0
-            gate = torch.sigmoid(self.gate_net(torch.cat([fp32_x, fp32_h], dim=-1)))
-            result = (-fp32_h / tau
-                      + self.W_in.float()(fp32_x)
-                      + gate * self.W_rec.float()(fp32_h))
-        return result.to(x.dtype)
+        """计算 dh/dt (ODE 右端项)"""
+        tau = torch.nn.functional.softplus(self.tau) + 1.0
+        gate = torch.sigmoid(self.gate_net(torch.cat([x, h], dim=-1)))
+        return -h / tau + self.W_in(x) + gate * self.W_rec(h)
 
     def forward(self, x, h):
-        # 4阶 Runge-Kutta 离散化 (dt=1), 内部强制FP32
+        # 4阶 Runge-Kutta 离散化 (dt=1)
         dt = 1.0
         k1 = self._deriv(x, h)
         k2 = self._deriv(x, h + 0.5 * dt * k1)
