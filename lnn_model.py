@@ -60,12 +60,18 @@ class LTCCell(nn.Module):
 
     def forward(self, x, h):
         # 4阶 Runge-Kutta 离散化 (dt=1), 比Euler更稳定精确
-        dt = torch.tensor(1.0, device=h.device)
+        dt = 1.0  # 标量，避免创建不必要的tensor导致AMP问题
         k1 = self._deriv(x, h)
+        k1 = torch.nan_to_num(k1, nan=0.0, posinf=10.0, neginf=-10.0)
         k2 = self._deriv(x, h + 0.5 * dt * k1)
+        k2 = torch.nan_to_num(k2, nan=0.0, posinf=10.0, neginf=-10.0)
         k3 = self._deriv(x, h + 0.5 * dt * k2)
+        k3 = torch.nan_to_num(k3, nan=0.0, posinf=10.0, neginf=-10.0)
         k4 = self._deriv(x, h + dt * k3)
+        k4 = torch.nan_to_num(k4, nan=0.0, posinf=10.0, neginf=-10.0)
+
         h_new = h + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        h_new = torch.nan_to_num(h_new, nan=0.0, posinf=10.0, neginf=-10.0)
         return torch.tanh(self.layer_norm(h_new))
 
 

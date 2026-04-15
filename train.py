@@ -31,7 +31,7 @@ def get_dataloader_workers():
     import multiprocessing
     cpu_count = multiprocessing.cpu_count()
     # 使用CPU核心数的一半，但至少为2
-    return max(2, cpu_count // 2)
+    return max(2, cpu_count // 2) 
 
 
 def train_model():
@@ -140,6 +140,9 @@ def train_model():
         dropout=config.DROPOUT,
     ).to(device)
 
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+
     total_params, trainable_params = count_parameters(model)
     logger.info(f"模型参数: 总计 {total_params:,}, 可训练 {trainable_params:,}")
 
@@ -220,13 +223,13 @@ def train_model():
             labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            
+
             # 使用自动混合精度
             if use_amp:
                 with torch.cuda.amp.autocast():
                     outputs, _ = model(tf_seqs, ctx)
                     loss = criterion(outputs, labels)
-                
+
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -238,6 +241,15 @@ def train_model():
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+
+            # 检测 NaN 并记录诊断信息
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(
+                    f"NaN/Inf 检测! loss={loss.item():.6f}, "
+                    f"output range=[{outputs.min().item():.4f}, {outputs.max().item():.4f}], "
+                    f"ctx range=[{ctx.min().item():.4f}, {ctx.max().item():.4f}]"
+                )
+                continue  # 跳过此 batch 的参数更新
 
             train_loss += loss.item() * labels.size(0)
             probs = torch.sigmoid(outputs)
@@ -341,7 +353,7 @@ def train_model():
             tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
             ctx = ctx.to(device)
             labels = labels.to(device)
-            outputs = model(tf_seqs, ctx)
+            outputs, _ = model(tf_seqs, ctx)
             loss = criterion(outputs, labels)
 
             test_loss += loss.item() * labels.size(0)

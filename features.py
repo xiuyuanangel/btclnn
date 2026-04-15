@@ -201,8 +201,12 @@ class FeatureNormalizer:
         assert self._fitted, "请先调用 fit()"
         X_dict_norm = {}
         for period, X in X_dict.items():
-            X_dict_norm[period] = (X - self.seq_means[period]) / self.seq_stds[period]
+            normalized = (X - self.seq_means[period]) / self.seq_stds[period]
+            # 替换可能的 Inf/NaN 为 0 (防御性处理)
+            normalized = np.nan_to_num(normalized, nan=0.0, posinf=10.0, neginf=-10.0)
+            X_dict_norm[period] = normalized
         X_ctx_norm = (X_ctx - self.ctx_mean) / self.ctx_std
+        X_ctx_norm = np.nan_to_num(X_ctx_norm, nan=0.0, posinf=10.0, neginf=-10.0)
         return X_dict_norm, X_ctx_norm.astype(np.float32)
 
     def save(self, path):
