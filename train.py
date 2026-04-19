@@ -4,9 +4,6 @@ import os
 import time
 import logging
 
-# 解决多GPU显存碎片问题，建议在程序启动前设置一次
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,8 +14,7 @@ from data_fetcher import HuobiDataFetcher
 from notifier import MeoWNotifier
 from features import (
     build_multi_tf_dataset, split_multi_tf_dataset,
-    MultiTimeframeDataset, FeatureNormalizer,
-    SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
+    MultiTimeframeDataset, SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
 )
 from lnn_model import MultiTimeframeLNN, count_parameters
 
@@ -29,34 +25,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_dataloader_workers():
-    """根据CPU核心数获取最优的DataLoader工作进程数"""
-    import multiprocessing
-    cpu_count = multiprocessing.cpu_count()
-    # 使用CPU核心数的一半，但至少为2
-    return max(2, cpu_count // 2) 
-
-
 def train_model():
     """完整的训练流程"""
-    # 启用cudnn自动优化（针对固定输入尺寸的卷积/循环层）
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.enabled = True
-        # 清空GPU缓存，避免显存碎片
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        logger.info("启用cuDNN自动优化并清空GPU缓存")
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"使用设备: {device}")
-    
-    # 如果使用GPU，显示GPU信息
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        logger.info(f"GPU: {gpu_name}, 显存: {gpu_memory:.2f} GB")
-    
     periods = list(config.TIMEFRAMES.keys())
     logger.info(f"多周期融合: {periods}")
 
@@ -104,85 +76,14 @@ def train_model():
     logger.info(f"数据划分 -> 训练: {len(train_data[2])}, "
                 f"验证: {len(val_data[2])}, 测试: {len(test_data[2])}")
 
-    # 特征标准化(基于训练集统计量, 统一应用到验证/测试集)
-    normalizer = FeatureNormalizer().fit(train_data[0], train_data[1])
-    norm_path = os.path.join(config.CHECKPOINT_DIR, 'feature_normalizer.json')
-    normalizer.save(norm_path)
-    train_data = (normalizer.transform(train_data[0], train_data[1])[0],
-                  normalizer.transform(train_data[0], train_data[1])[1],
-                  train_data[2])
-    val_norm = normalizer.transform(val_data[0], val_data[1])
-    val_data = (val_norm[0], val_norm[1], val_data[2])
-    test_norm = normalizer.transform(test_data[0], test_data[1])
-    test_data = (test_norm[0], test_norm[1], test_data[2])
-
-    # 数据完整性检查
-    logger.info("检查数据完整性...")
-    # 训练集
-    train_X_dict, train_X_ctx, train_y = train_data
-    for period in periods:
-        X_period = train_X_dict[period]
-        nan_ratio = np.isnan(X_period).sum() / X_period.size
-        if nan_ratio > 0:
-            logger.warning(f"训练集 {period} 特征包含 {nan_ratio:.2%} NaN, 将替换为0")
-            train_X_dict[period] = np.nan_to_num(X_period, nan=0.0)
-        else:
-            logger.info(f"训练集 {period} 特征无NaN")
-    nan_ratio_ctx = np.isnan(train_X_ctx).sum() / train_X_ctx.size
-    if nan_ratio_ctx > 0:
-        logger.warning(f"训练集上下文特征包含 {nan_ratio_ctx:.2%} NaN, 将替换为0")
-        train_X_ctx = np.nan_to_num(train_X_ctx, nan=0.0)
-    else:
-        logger.info("训练集上下文特征无NaN")
-    train_data = (train_X_dict, train_X_ctx, train_y)
-    
-    # 验证集（可选检查）
-    val_X_dict, val_X_ctx, val_y = val_data
-    for period in periods:
-        X_period = val_X_dict[period]
-        if np.isnan(X_period).any():
-            val_X_dict[period] = np.nan_to_num(X_period, nan=0.0)
-    if np.isnan(val_X_ctx).any():
-        val_X_ctx = np.nan_to_num(val_X_ctx, nan=0.0)
-    val_data = (val_X_dict, val_X_ctx, val_y)
-    
-    # 测试集（可选检查）
-    test_X_dict, test_X_ctx, test_y = test_data
-    for period in periods:
-        X_period = test_X_dict[period]
-        if np.isnan(X_period).any():
-            test_X_dict[period] = np.nan_to_num(X_period, nan=0.0)
-    if np.isnan(test_X_ctx).any():
-        test_X_ctx = np.nan_to_num(test_X_ctx, nan=0.0)
-    test_data = (test_X_dict, test_X_ctx, test_y)
-
     # 创建 DataLoader
     train_dataset = MultiTimeframeDataset(train_data[0], train_data[1], train_data[2], periods)
     val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
     test_dataset = MultiTimeframeDataset(test_data[0], test_data[1], test_data[2], periods)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        drop_last=False,
-        num_workers=get_dataloader_workers(),
-        pin_memory=torch.cuda.is_available(),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=get_dataloader_workers(),
-        pin_memory=torch.cuda.is_available(),
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=get_dataloader_workers(),
-        pin_memory=torch.cuda.is_available(),
-    )
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
 
     # ==================== 3. 创建模型 ====================
     logger.info("=" * 60)
@@ -203,59 +104,18 @@ def train_model():
         hidden_size=config.HIDDEN_SIZE,
         num_layers=config.NUM_LAYERS,
         dropout=config.DROPOUT,
-        use_cross_attention=False,   # 禁用跨周期注意力以节省显存
-        use_cross_gating=False,      # 禁用跨周期门控以节省显存
     ).to(device)
-
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-        logger.warning(
-            f"检测到 {torch.cuda.device_count()} 个 GPU，正在启用 DataParallel。"
-            "DataParallel 会增加显存开销，若出现 OOM 请先降低 config.BATCH_SIZE。"
-        )
 
     total_params, trainable_params = count_parameters(model)
     logger.info(f"模型参数: 总计 {total_params:,}, 可训练 {trainable_params:,}")
-    
-    # 检查模型参数是否包含NaN/Inf
-    has_nan = False
-    for name, param in model.named_parameters():
-        if torch.isnan(param).any() or torch.isinf(param).any():
-            logger.warning(f"参数 {name} 包含NaN/Inf，重新初始化")
-            # 重新初始化权重
-            if param.dim() >= 2:
-                nn.init.xavier_uniform_(param.data)
-            else:
-                nn.init.zeros_(param.data)
-            has_nan = True
-    if has_nan:
-        logger.info("已重新初始化包含NaN/Inf的参数")
 
     # ==================== 4. 训练配置 ====================
-    # 使用AdamW优化器: 更好的权重衰减处理，提升数值稳定性
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=config.LEARNING_RATE, 
-        weight_decay=1e-4,  # 轻量L2正则化
-        eps=1e-8,  # 数值稳定性epsilon
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6,
     )
-    
-    # Warmup调度器: 前5轮线性warmup，避免初期梯度爆炸
-    warmup_epochs = 5
-    
-    criterion = nn.BCEWithLogitsLoss()
-    
-    # 混合精度训练配置
-    # 注意: 跨周期注意力+RK4+LTC在FP16下数值不稳定, 必须使用FP32
-    use_amp = False  # 强制关闭AMP (此模型架构与FP16不兼容)
-    logger.info("混合精度(AMP): 禁用 (RK4+跨周期注意力需要FP32保证数值稳定)")
-    
-    # 梯度累积配置 (减少显存占用同时增大有效batch)
-    gradient_accumulation_steps = max(1, 1024 // config.BATCH_SIZE)
-    
+    criterion = nn.BCELoss()
+
     # 优先从GitHub Release下载最新模型(仅CI环境)
     gh_token = os.environ.get('GH_TOKEN')
     if gh_token:
@@ -295,23 +155,8 @@ def train_model():
             resume_checkpoint = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
             ckpt_config = resume_checkpoint.get('config', {})
             if 'timeframe_configs' in ckpt_config:
-                # 检查当前模型与 checkpoint 的 state_dict 是否匹配
-                current_state = model.state_dict()
-                ckpt_state = resume_checkpoint['model_state_dict']
-                mismatched = False
-                for k in ckpt_state:
-                    if k in current_state:
-                        if ckpt_state[k].shape != current_state[k].shape:
-                            logger.warning(f"权重形状不匹配: {k} {ckpt_state[k].shape} vs {current_state[k].shape}")
-                            mismatched = True
-                    else:
-                        logger.warning(f"缺失权重键: {k}")
-                        mismatched = True
-                if mismatched:
-                    logger.info("检测到权重形状不匹配，从头训练新模型")
-                else:
-                    model.load_state_dict(ckpt_state)
-                    logger.info("加载已有模型权重作为初始化")
+                model.load_state_dict(resume_checkpoint['model_state_dict'])
+                logger.info("加载已有模型权重作为初始化")
             else:
                 logger.info("检测到旧架构checkpoint，从头训练新模型")
         except Exception as e:
@@ -325,74 +170,27 @@ def train_model():
     for epoch in range(start_epoch, config.EPOCHS):
         t0 = time.time()
 
-        # Warmup学习率调整 (前warmup_epochs轮线性增长)
-        if epoch < warmup_epochs:
-            warmup_lr = config.LEARNING_RATE * (epoch + 1) / warmup_epochs
-            for pg in optimizer.param_groups:
-                pg['lr'] = warmup_lr
-        else:
-            warmup_lr = None
-        
-        current_warmup_lr = optimizer.param_groups[0]['lr']
-        
         # --- 训练阶段 ---
         model.train()
         train_loss, train_correct, train_total = 0.0, 0, 0
-        optimizer.zero_grad(set_to_none=True)  # 更高效的zero_grad
-        
-        for step_idx, (tf_seqs, ctx, labels) in enumerate(train_loader):
-            tf_seqs = {p: v.to(device, non_blocking=True) for p, v in tf_seqs.items()}
-            ctx = ctx.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
 
-            outputs, _ = model(tf_seqs, ctx)
+        for tf_seqs, ctx, labels in train_loader:
+            tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
+            ctx = ctx.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(tf_seqs, ctx)
             loss = criterion(outputs, labels)
-            
-            # 梯度累积: 除以累积步数使等效梯度正确
-            loss_scaled = loss / gradient_accumulation_steps
-            
-            # 检测 NaN/Inf 并跳过异常batch
-            if torch.isnan(loss) or torch.isinf(loss):
-                logger.warning(
-                    f"[Epoch{epoch+1} Step{step_idx}] 异常loss={loss.item():.6f}, 跳过"
-                )
-                # 重置梯度，避免累积脏数据
-                optimizer.zero_grad(set_to_none=True)
-                continue
-            
-            loss_scaled.backward()
+            loss.backward()
 
-            # 梯度累积步满后更新参数
-            if (step_idx + 1) % gradient_accumulation_steps == 0:
-                # 更严格的梯度裁剪
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=1.0  # 略微放宽以适应AdamW
-                )
-                
-                # 检查梯度是否正常
-                grad_norm_value = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
-                if grad_norm_value != grad_norm_value or grad_norm_value > 50.0:
-                    logger.warning(f"[Epoch{epoch+1}] 梯度异常 grad_norm={grad_norm_value:.4f}, 跳过更新")
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-                
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-            # 统计（用原始loss，非缩放后的）
             train_loss += loss.item() * labels.size(0)
-            probs = torch.sigmoid(outputs)
-            preds = (probs > 0.5).float()
+            preds = (outputs > 0.5).float()
             train_correct += (preds == labels).sum().item()
             train_total += labels.size(0)
-
-        # 处理最后未完成的累积步骤
-        if train_total > 0 and train_total % (config.BATCH_SIZE * gradient_accumulation_steps) != 0:
-            pass  # 已在循环中处理
-
-        if train_total == 0:
-            logger.error("训练阶段所有batch均为NaN, 无法计算loss")
-            raise RuntimeError("训练失败: 所有batch输出均为NaN")
 
         train_loss /= train_total
         train_acc = train_correct / train_total
@@ -403,16 +201,14 @@ def train_model():
 
         with torch.no_grad():
             for tf_seqs, ctx, labels in val_loader:
-                tf_seqs = {p: v.to(device, non_blocking=True) for p, v in tf_seqs.items()}
-                ctx = ctx.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
-                
-                outputs, _ = model(tf_seqs, ctx)
+                tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
+                ctx = ctx.to(device)
+                labels = labels.to(device)
+                outputs = model(tf_seqs, ctx)
                 loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * labels.size(0)
-                probs = torch.sigmoid(outputs)
-                preds = (probs > 0.5).float()
+                preds = (outputs > 0.5).float()
                 val_correct += (preds == labels).sum().item()
                 val_total += labels.size(0)
 
@@ -422,23 +218,12 @@ def train_model():
 
         elapsed = time.time() - t0
         current_lr = optimizer.param_groups[0]['lr']
-        
-        # 计算训练速度
-        samples_per_sec = train_total / elapsed if elapsed > 0 else 0
-        
-        # 获取GPU内存使用情况
-        gpu_mem_info = ""
-        if torch.cuda.is_available():
-            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
-            mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
-            gpu_mem_info = f" | GPU: {mem_allocated:.2f}/{mem_reserved:.2f} GB"
 
-        warmup_tag = " [WARMUP]" if epoch < warmup_epochs else ""
         logger.info(
-            f"Epoch {epoch+1:3d}/{config.EPOCHS}{warmup_tag} | "
+            f"Epoch {epoch+1:3d}/{config.EPOCHS} | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
             f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
-            f"LR: {current_lr:.6f} | {samples_per_sec:.1f} samples/s | {elapsed:.1f}s{gpu_mem_info}"
+            f"LR: {current_lr:.6f} | {elapsed:.1f}s"
         )
 
         # 保存最佳模型
@@ -485,15 +270,14 @@ def train_model():
             tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
             ctx = ctx.to(device)
             labels = labels.to(device)
-            outputs, _ = model(tf_seqs, ctx)
+            outputs = model(tf_seqs, ctx)
             loss = criterion(outputs, labels)
 
             test_loss += loss.item() * labels.size(0)
-            probs = torch.sigmoid(outputs)
-            preds = (probs > 0.5).float()
+            preds = (outputs > 0.5).float()
             test_correct += (preds == labels).sum().item()
             test_total += labels.size(0)
-            all_preds.extend(probs.cpu().numpy())
+            all_preds.extend(outputs.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
     test_loss /= test_total

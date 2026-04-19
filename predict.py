@@ -14,7 +14,7 @@ import config
 from data_fetcher import HuobiDataFetcher
 from notifier import MeoWNotifier
 from features import (
-    compute_all_features, compute_context_features, FeatureNormalizer,
+    compute_all_features, compute_context_features,
     SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
 )
 from lnn_model import MultiTimeframeLNN
@@ -126,20 +126,12 @@ def predict():
         logger.error(str(e))
         return None
 
-    # 3.5 特征标准化(使用训练时的统计量)
-    norm_path = os.path.join(config.CHECKPOINT_DIR, 'feature_normalizer.json')
-    if not os.path.exists(norm_path):
-        raise FileNotFoundError(f"标准化参数文件不存在: {norm_path}\n请先运行 train.py 训练模型")
-    normalizer = FeatureNormalizer.load(norm_path)
-    tf_seqs, ctx = normalizer.transform(tf_seqs, ctx)
-
     # 4. 模型推理
     tf_seqs_tensor = {p: torch.FloatTensor(v).to(device) for p, v in tf_seqs.items()}
     ctx_tensor = torch.FloatTensor(ctx).to(device)
 
     with torch.no_grad():
-        logits, attn_weights = model(tf_seqs_tensor, ctx_tensor)
-        probability = torch.sigmoid(logits).item()
+        probability = model(tf_seqs_tensor, ctx_tensor).item()
 
     # 5. 输出结果
     direction = "涨 (UP)" if probability > 0.5 else "跌 (DOWN)"
@@ -147,17 +139,6 @@ def predict():
 
     current_price = df_featured['close'].iloc[-1]
     latest_time = df_featured.index[-1]
-
-    # 解析注意力权重
-    cross_attn = attn_weights.get('cross_attention', None)
-    tf_attn = attn_weights.get('timeframe_attention', None)
-    
-    # 计算各周期重要性
-    if tf_attn is not None:
-        tf_importance = tf_attn.cpu().numpy()[0]  # (num_timeframes,)
-        timeframe_names = list(config.TIMEFRAMES.keys())
-    else:
-        tf_importance = None
 
     # 发送通知推送
     if config.MEOW_NICKNAME:
@@ -184,15 +165,6 @@ def predict():
     print(f"  上涨概率:   {probability:.4f} ({probability * 100:.2f}%)")
     print(f"  置信度:     {confidence:.4f} ({confidence * 100:.2f}%)")
     print(f"  预测窗口:   未来10分钟")
-    
-    # 显示周期注意力权重
-    if tf_importance is not None:
-        print("-" * 50)
-        print(f"  各周期重要性权重:")
-        for name, weight in zip(timeframe_names, tf_importance):
-            bar = "█" * int(weight * 20)
-            print(f"    {name:8s}: {weight:.4f} ({weight*100:5.1f}%) {bar}")
-    
     print("=" * 50)
     print()
 
