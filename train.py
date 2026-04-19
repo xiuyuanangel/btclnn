@@ -4,6 +4,9 @@ import os
 import time
 import logging
 
+# 解决多GPU显存碎片问题，建议在程序启动前设置一次
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -155,9 +158,28 @@ def train_model():
     val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
     test_dataset = MultiTimeframeDataset(test_data[0], test_data[1], test_data[2], periods)
 
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        drop_last=False,
+        num_workers=get_dataloader_workers(),
+        pin_memory=torch.cuda.is_available(),
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=get_dataloader_workers(),
+        pin_memory=torch.cuda.is_available(),
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=get_dataloader_workers(),
+        pin_memory=torch.cuda.is_available(),
+    )
 
     # ==================== 3. 创建模型 ====================
     logger.info("=" * 60)
@@ -182,6 +204,10 @@ def train_model():
 
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
+        logger.warning(
+            f"检测到 {torch.cuda.device_count()} 个 GPU，正在启用 DataParallel。"
+            "DataParallel 会增加显存开销，若出现 OOM 请先降低 config.BATCH_SIZE。"
+        )
 
     total_params, trainable_params = count_parameters(model)
     logger.info(f"模型参数: 总计 {total_params:,}, 可训练 {trainable_params:,}")

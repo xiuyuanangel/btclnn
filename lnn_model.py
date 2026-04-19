@@ -68,12 +68,12 @@ class LTCCell(nn.Module):
         x_clamped = torch.clamp(x, -10.0, 10.0)  # 同时裁剪输入
         gate_input = torch.cat([x_clamped, h_clamped], dim=-1)
         gate = torch.sigmoid(self.gate_net(gate_input))
-        # 检测gate中的NaN/Inf并替换
-        gate = torch.where(torch.isnan(gate) | torch.isinf(gate), torch.zeros_like(gate), gate)
+        # 使用 nan_to_num 代替 where，减少临时内存分配
+        gate = torch.nan_to_num(gate, nan=0.0, posinf=1.0, neginf=0.0)
         # 计算导数时添加数值稳定性保护
         dh = -h_clamped / tau + self.W_in(x_clamped) + gate * self.W_rec(h_clamped)
-        # 检测dh中的NaN/Inf并替换
-        dh = torch.where(torch.isnan(dh) | torch.isinf(dh), torch.zeros_like(dh), dh)
+        # 使用 nan_to_num 代替 where，减少临时内存分配
+        dh = torch.nan_to_num(dh, nan=0.0, posinf=20.0, neginf=-20.0)
         # 裁剪导数防止梯度爆炸（更严格）
         return torch.clamp(dh, -20.0, 20.0)
 
@@ -144,8 +144,8 @@ class TimeframeEncoder(nn.Module):
             inp = x[:, t, :]
             for i, cell in enumerate(self.cells):
                 hidden[i] = cell(inp, hidden[i])
-                # 检测并替换NaN/Inf
-                hidden[i] = torch.where(torch.isnan(hidden[i]) | torch.isinf(hidden[i]), torch.zeros_like(hidden[i]), hidden[i])
+                # 使用 nan_to_num 代替 where，减少临时内存分配
+                hidden[i] = torch.nan_to_num(hidden[i], nan=0.0, posinf=50.0, neginf=-50.0)
                 inp = hidden[i]
                 # 层间裁剪防止误差累积
                 if i < len(self.cells) - 1:
@@ -459,8 +459,8 @@ class MultiTimeframeLNN(nn.Module):
         encoded = []
         for period, encoder in self.encoders.items():
             h = encoder(tf_sequences[period])
-            # 编码器输出安全检查
-            h = torch.where(torch.isnan(h) | torch.isinf(h), torch.zeros_like(h), h)
+            # 编码器输出安全检查，使用 nan_to_num 减少临时分配
+            h = torch.nan_to_num(h, nan=0.0, posinf=20.0, neginf=-20.0)
             h = torch.clamp(h, -20.0, 20.0)
             encoded.append(h)
 
@@ -473,9 +473,9 @@ class MultiTimeframeLNN(nn.Module):
             attn_weights_dict['cross_attention'] = attn_weights
             # 将交互后的特征与原始特征残差连接
             encoded = [cross_attn_out[:, i, :] + enc for i, enc in enumerate(encoded)]
-            # 安全检查残差输出
+            # 安全检查残差输出，使用 nan_to_num 减少临时分配
             encoded = [
-                torch.where(torch.isnan(e) | torch.isinf(e), torch.zeros_like(e), e)
+                torch.nan_to_num(e, nan=0.0, posinf=20.0, neginf=-20.0)
                 for e in encoded
             ]
             encoded = [torch.clamp(e, -20.0, 20.0) for e in encoded]
@@ -484,7 +484,7 @@ class MultiTimeframeLNN(nn.Module):
             # 门控融合全局信息
             encoded = self.cross_gating(encoded)
             encoded = [
-                torch.where(torch.isnan(e) | torch.isinf(e), torch.zeros_like(e), e)
+                torch.nan_to_num(e, nan=0.0, posinf=20.0, neginf=-20.0)
                 for e in encoded
             ]
             encoded = [torch.clamp(e, -20.0, 20.0) for e in encoded]
