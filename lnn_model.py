@@ -61,13 +61,19 @@ class LTCCell(nn.Module):
         """计算 dh/dt (ODE 右端项)"""
         # 确保tau为正且有下界，避免除零
         tau = torch.nn.functional.softplus(self.tau) + 1.0  # 增加tau下界到2.0+
+        # 添加微小epsilon防止除零
+        tau = tau + 1e-7
         # 裁剪h避免数值溢出（更严格）
         h_clamped = torch.clamp(h, -50.0, 50.0)
         x_clamped = torch.clamp(x, -10.0, 10.0)  # 同时裁剪输入
         gate_input = torch.cat([x_clamped, h_clamped], dim=-1)
         gate = torch.sigmoid(self.gate_net(gate_input))
+        # 检测gate中的NaN/Inf并替换
+        gate = torch.where(torch.isnan(gate) | torch.isinf(gate), torch.zeros_like(gate), gate)
         # 计算导数时添加数值稳定性保护
         dh = -h_clamped / tau + self.W_in(x_clamped) + gate * self.W_rec(h_clamped)
+        # 检测dh中的NaN/Inf并替换
+        dh = torch.where(torch.isnan(dh) | torch.isinf(dh), torch.zeros_like(dh), dh)
         # 裁剪导数防止梯度爆炸（更严格）
         return torch.clamp(dh, -20.0, 20.0)
 
@@ -138,6 +144,8 @@ class TimeframeEncoder(nn.Module):
             inp = x[:, t, :]
             for i, cell in enumerate(self.cells):
                 hidden[i] = cell(inp, hidden[i])
+                # 检测并替换NaN/Inf
+                hidden[i] = torch.where(torch.isnan(hidden[i]) | torch.isinf(hidden[i]), torch.zeros_like(hidden[i]), hidden[i])
                 inp = hidden[i]
                 # 层间裁剪防止误差累积
                 if i < len(self.cells) - 1:

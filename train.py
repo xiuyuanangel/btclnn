@@ -110,6 +110,46 @@ def train_model():
     test_norm = normalizer.transform(test_data[0], test_data[1])
     test_data = (test_norm[0], test_norm[1], test_data[2])
 
+    # 数据完整性检查
+    logger.info("检查数据完整性...")
+    # 训练集
+    train_X_dict, train_X_ctx, train_y = train_data
+    for period in periods:
+        X_period = train_X_dict[period]
+        nan_ratio = np.isnan(X_period).sum() / X_period.size
+        if nan_ratio > 0:
+            logger.warning(f"训练集 {period} 特征包含 {nan_ratio:.2%} NaN, 将替换为0")
+            train_X_dict[period] = np.nan_to_num(X_period, nan=0.0)
+        else:
+            logger.info(f"训练集 {period} 特征无NaN")
+    nan_ratio_ctx = np.isnan(train_X_ctx).sum() / train_X_ctx.size
+    if nan_ratio_ctx > 0:
+        logger.warning(f"训练集上下文特征包含 {nan_ratio_ctx:.2%} NaN, 将替换为0")
+        train_X_ctx = np.nan_to_num(train_X_ctx, nan=0.0)
+    else:
+        logger.info("训练集上下文特征无NaN")
+    train_data = (train_X_dict, train_X_ctx, train_y)
+    
+    # 验证集（可选检查）
+    val_X_dict, val_X_ctx, val_y = val_data
+    for period in periods:
+        X_period = val_X_dict[period]
+        if np.isnan(X_period).any():
+            val_X_dict[period] = np.nan_to_num(X_period, nan=0.0)
+    if np.isnan(val_X_ctx).any():
+        val_X_ctx = np.nan_to_num(val_X_ctx, nan=0.0)
+    val_data = (val_X_dict, val_X_ctx, val_y)
+    
+    # 测试集（可选检查）
+    test_X_dict, test_X_ctx, test_y = test_data
+    for period in periods:
+        X_period = test_X_dict[period]
+        if np.isnan(X_period).any():
+            test_X_dict[period] = np.nan_to_num(X_period, nan=0.0)
+    if np.isnan(test_X_ctx).any():
+        test_X_ctx = np.nan_to_num(test_X_ctx, nan=0.0)
+    test_data = (test_X_dict, test_X_ctx, test_y)
+
     # 创建 DataLoader
     train_dataset = MultiTimeframeDataset(train_data[0], train_data[1], train_data[2], periods)
     val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
@@ -145,6 +185,20 @@ def train_model():
 
     total_params, trainable_params = count_parameters(model)
     logger.info(f"模型参数: 总计 {total_params:,}, 可训练 {trainable_params:,}")
+    
+    # 检查模型参数是否包含NaN/Inf
+    has_nan = False
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            logger.warning(f"参数 {name} 包含NaN/Inf，重新初始化")
+            # 重新初始化权重
+            if param.dim() >= 2:
+                nn.init.xavier_uniform_(param.data)
+            else:
+                nn.init.zeros_(param.data)
+            has_nan = True
+    if has_nan:
+        logger.info("已重新初始化包含NaN/Inf的参数")
 
     # ==================== 4. 训练配置 ====================
     # 使用AdamW优化器: 更好的权重衰减处理，提升数值稳定性
@@ -285,8 +339,9 @@ def train_model():
                 )
                 
                 # 检查梯度是否正常
-                if torch.isnan(torch.tensor(grad_norm)) or grad_norm > 50.0:
-                    logger.warning(f"[Epoch{epoch+1}] 梯度异常 grad_norm={grad_norm:.4f}, 跳过更新")
+                grad_norm_value = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
+                if grad_norm_value != grad_norm_value or grad_norm_value > 50.0:
+                    logger.warning(f"[Epoch{epoch+1}] 梯度异常 grad_norm={grad_norm_value:.4f}, 跳过更新")
                     optimizer.zero_grad(set_to_none=True)
                     continue
                 
