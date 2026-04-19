@@ -43,7 +43,10 @@ def train_model():
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.enabled = True
-        logger.info("启用cuDNN自动优化")
+        # 清空GPU缓存，避免显存碎片
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        logger.info("启用cuDNN自动优化并清空GPU缓存")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"使用设备: {device}")
@@ -200,6 +203,8 @@ def train_model():
         hidden_size=config.HIDDEN_SIZE,
         num_layers=config.NUM_LAYERS,
         dropout=config.DROPOUT,
+        use_cross_attention=False,   # 禁用跨周期注意力以节省显存
+        use_cross_gating=False,      # 禁用跨周期门控以节省显存
     ).to(device)
 
     if torch.cuda.device_count() > 1:

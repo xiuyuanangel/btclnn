@@ -143,7 +143,12 @@ class TimeframeEncoder(nn.Module):
         for t in range(seq_len):
             inp = x[:, t, :]
             for i, cell in enumerate(self.cells):
-                hidden[i] = cell(inp, hidden[i])
+                # 使用梯度检查点减少显存占用（仅在训练时）
+                if self.training and x.requires_grad:
+                    from torch.utils.checkpoint import checkpoint
+                    hidden[i] = checkpoint(cell, inp, hidden[i], use_reentrant=False)
+                else:
+                    hidden[i] = cell(inp, hidden[i])
                 # 使用 nan_to_num 代替 where，减少临时内存分配
                 hidden[i] = torch.nan_to_num(hidden[i], nan=0.0, posinf=50.0, neginf=-50.0)
                 inp = hidden[i]
