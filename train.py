@@ -106,6 +106,9 @@ def train_model():
         dropout=config.DROPOUT,
     ).to(device)
 
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+
     total_params, trainable_params = count_parameters(model)
     logger.info(f"模型参数: 总计 {total_params:,}, 可训练 {trainable_params:,}")
 
