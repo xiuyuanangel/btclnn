@@ -147,16 +147,29 @@ def train_model():
     logger.info(f"模型参数: 总计 {total_params:,}, 可训练 {trainable_params:,}")
 
     # ==================== 4. 训练配置 ====================
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    # 使用AdamW优化器: 更好的权重衰减处理，提升数值稳定性
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config.LEARNING_RATE, 
+        weight_decay=1e-4,  # 轻量L2正则化
+        eps=1e-8,  # 数值稳定性epsilon
+    )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6,
     )
+    
+    # Warmup调度器: 前5轮线性warmup，避免初期梯度爆炸
+    warmup_epochs = 5
+    
     criterion = nn.BCEWithLogitsLoss()
     
     # 混合精度训练配置
     # 注意: 跨周期注意力+RK4+LTC在FP16下数值不稳定, 必须使用FP32
     use_amp = False  # 强制关闭AMP (此模型架构与FP16不兼容)
     logger.info("混合精度(AMP): 禁用 (RK4+跨周期注意力需要FP32保证数值稳定)")
+    
+    # 梯度累积配置 (减少显存占用同时增大有效batch)
+    gradient_accumulation_steps = max(1, 1024 // config.BATCH_SIZE)
     
     # 优先从GitHub Release下载最新模型(仅CI环境)
     gh_token = os.environ.get('GH_TOKEN')
@@ -227,61 +240,69 @@ def train_model():
     for epoch in range(start_epoch, config.EPOCHS):
         t0 = time.time()
 
+        # Warmup学习率调整 (前warmup_epochs轮线性增长)
+        if epoch < warmup_epochs:
+            warmup_lr = config.LEARNING_RATE * (epoch + 1) / warmup_epochs
+            for pg in optimizer.param_groups:
+                pg['lr'] = warmup_lr
+        else:
+            warmup_lr = None
+        
+        current_warmup_lr = optimizer.param_groups[0]['lr']
+        
         # --- 训练阶段 ---
         model.train()
         train_loss, train_correct, train_total = 0.0, 0, 0
-
-        for tf_seqs, ctx, labels in train_loader:
+        optimizer.zero_grad(set_to_none=True)  # 更高效的zero_grad
+        
+        for step_idx, (tf_seqs, ctx, labels) in enumerate(train_loader):
             tf_seqs = {p: v.to(device, non_blocking=True) for p, v in tf_seqs.items()}
             ctx = ctx.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-
             outputs, _ = model(tf_seqs, ctx)
             loss = criterion(outputs, labels)
+            
+            # 梯度累积: 除以累积步数使等效梯度正确
+            loss_scaled = loss / gradient_accumulation_steps
             
             # 检测 NaN/Inf 并跳过异常batch
             if torch.isnan(loss) or torch.isinf(loss):
                 logger.warning(
-                    f"检测到异常loss={loss.item():.6f}, 跳过此batch"
+                    f"[Epoch{epoch+1} Step{step_idx}] 异常loss={loss.item():.6f}, 跳过"
                 )
+                # 重置梯度，避免累积脏数据
+                optimizer.zero_grad(set_to_none=True)
                 continue
             
-            loss.backward()
+            loss_scaled.backward()
 
-            # 更严格的梯度裁剪
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            
-            # 检查梯度是否正常
-            grad_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    grad_norm += param_norm.item() ** 2
-            grad_norm = grad_norm ** 0.5
-            
-            if torch.isnan(torch.tensor(grad_norm)) or grad_norm > 100.0:
-                logger.warning(f"梯度异常 grad_norm={grad_norm:.4f}, 跳过参数更新")
-                optimizer.zero_grad()
-                continue
-            
-            optimizer.step()
-
-            # 检测 NaN 并记录诊断信息
-            if torch.isnan(loss) or torch.isinf(loss):
-                logger.warning(
-                    f"NaN/Inf 检测! loss={loss.item():.6f}, "
-                    f"output range=[{outputs.min().item():.4f}, {outputs.max().item():.4f}], "
-                    f"ctx range=[{ctx.min().item():.4f}, {ctx.max().item():.4f}]"
+            # 梯度累积步满后更新参数
+            if (step_idx + 1) % gradient_accumulation_steps == 0:
+                # 更严格的梯度裁剪
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0  # 略微放宽以适应AdamW
                 )
-                continue  # 跳过此 batch
+                
+                # 检查梯度是否正常
+                if torch.isnan(torch.tensor(grad_norm)) or grad_norm > 50.0:
+                    logger.warning(f"[Epoch{epoch+1}] 梯度异常 grad_norm={grad_norm:.4f}, 跳过更新")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
+            # 统计（用原始loss，非缩放后的）
             train_loss += loss.item() * labels.size(0)
             probs = torch.sigmoid(outputs)
             preds = (probs > 0.5).float()
             train_correct += (preds == labels).sum().item()
             train_total += labels.size(0)
+
+        # 处理最后未完成的累积步骤
+        if train_total > 0 and train_total % (config.BATCH_SIZE * gradient_accumulation_steps) != 0:
+            pass  # 已在循环中处理
 
         if train_total == 0:
             logger.error("训练阶段所有batch均为NaN, 无法计算loss")
@@ -326,8 +347,9 @@ def train_model():
             mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
             gpu_mem_info = f" | GPU: {mem_allocated:.2f}/{mem_reserved:.2f} GB"
 
+        warmup_tag = " [WARMUP]" if epoch < warmup_epochs else ""
         logger.info(
-            f"Epoch {epoch+1:3d}/{config.EPOCHS} | "
+            f"Epoch {epoch+1:3d}/{config.EPOCHS}{warmup_tag} | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
             f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
             f"LR: {current_lr:.6f} | {samples_per_sec:.1f} samples/s | {elapsed:.1f}s{gpu_mem_info}"

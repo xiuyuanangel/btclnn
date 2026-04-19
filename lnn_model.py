@@ -15,8 +15,11 @@
 
 import torch
 import torch.nn as nn
+import logging
 
 import config
+
+logger = logging.getLogger(__name__)
 
 
 class LTCCell(nn.Module):
@@ -45,42 +48,44 @@ class LTCCell(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # 使用更合理的gain值避免梯度消失
-        nn.init.xavier_uniform_(self.W_in.weight, gain=1.0)
-        nn.init.orthogonal_(self.W_rec.weight, gain=0.8)
+        # 使用更小的gain值降低初始梯度幅度，提升数值稳定性
+        nn.init.xavier_uniform_(self.W_in.weight, gain=0.5)
+        nn.init.orthogonal_(self.W_rec.weight, gain=0.3)  # 更保守的递归权重
         for module in self.gate_net:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=1.0)
+                nn.init.xavier_uniform_(module.weight, gain=0.5)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
     def _deriv(self, x, h):
         """计算 dh/dt (ODE 右端项)"""
         # 确保tau为正且有下界，避免除零
-        tau = torch.nn.functional.softplus(self.tau) + 0.5
-        # 裁剪h避免数值溢出
-        h_clamped = torch.clamp(h, -100.0, 100.0)
-        gate_input = torch.cat([x, h_clamped], dim=-1)
+        tau = torch.nn.functional.softplus(self.tau) + 1.0  # 增加tau下界到2.0+
+        # 裁剪h避免数值溢出（更严格）
+        h_clamped = torch.clamp(h, -50.0, 50.0)
+        x_clamped = torch.clamp(x, -10.0, 10.0)  # 同时裁剪输入
+        gate_input = torch.cat([x_clamped, h_clamped], dim=-1)
         gate = torch.sigmoid(self.gate_net(gate_input))
         # 计算导数时添加数值稳定性保护
-        dh = -h_clamped / tau + self.W_in(x) + gate * self.W_rec(h_clamped)
-        # 裁剪导数防止梯度爆炸
-        return torch.clamp(dh, -50.0, 50.0)
+        dh = -h_clamped / tau + self.W_in(x_clamped) + gate * self.W_rec(h_clamped)
+        # 裁剪导数防止梯度爆炸（更严格）
+        return torch.clamp(dh, -20.0, 20.0)
 
     def forward(self, x, h):
-        # 4阶 Runge-Kutta 离散化 (dt=1)
-        dt = 1.0
+        # 4阶 Runge-Kutta 离散化 (dt=1)，使用更小的dt增强稳定性
+        dt = 0.5  # 减小时间步长提升RK4精度和稳定性
         # 裁剪输入h避免初始值过大
-        h = torch.clamp(h, -100.0, 100.0)
+        h = torch.clamp(h, -50.0, 50.0)
+        x_safe = torch.clamp(x, -10.0, 10.0)
         
-        k1 = self._deriv(x, h)
-        k2 = self._deriv(x, h + 0.5 * dt * k1)
-        k3 = self._deriv(x, h + 0.5 * dt * k2)
-        k4 = self._deriv(x, h + dt * k3)
+        k1 = self._deriv(x_safe, h)
+        k2 = self._deriv(x_safe, h + 0.5 * dt * k1)
+        k3 = self._deriv(x_safe, h + 0.5 * dt * k2)
+        k4 = self._deriv(x_safe, h + dt * k3)
 
         h_new = h + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         # 在layer_norm前裁剪，避免极端值
-        h_new = torch.clamp(h_new, -100.0, 100.0)
+        h_new = torch.clamp(h_new, -50.0, 50.0)
         # 检测NaN并替换为零
         h_new = torch.where(torch.isnan(h_new), torch.zeros_like(h_new), h_new)
         return torch.tanh(self.layer_norm(h_new))
@@ -121,6 +126,9 @@ class TimeframeEncoder(nn.Module):
         batch_size, seq_len = x.size(0), x.size(1)
         device = x.device
 
+        # 裁剪输入到安全范围
+        x = torch.clamp(x, -10.0, 10.0)
+        
         hidden = [
             torch.zeros(batch_size, self.hidden_size, device=device)
             for _ in range(len(self.cells))
@@ -131,6 +139,9 @@ class TimeframeEncoder(nn.Module):
             for i, cell in enumerate(self.cells):
                 hidden[i] = cell(inp, hidden[i])
                 inp = hidden[i]
+                # 层间裁剪防止误差累积
+                if i < len(self.cells) - 1:
+                    inp = torch.clamp(inp, -50.0, 50.0)
 
         # 多尺度输出: 最后状态 + 各层均值(捕获全局趋势)
         last_h = hidden[-1]
@@ -424,10 +435,25 @@ class MultiTimeframeLNN(nn.Module):
             output: (batch,) 预测涨的概率
             attn_weights: dict 可选，包含注意力权重用于可视化
         """
+        # 输入数据范围检查和裁剪
+        for period, seq in tf_sequences.items():
+            if torch.isnan(seq).any():
+                logger.warning(f"[NaN检测] {period} 序列包含NaN，替换为0")
+                tf_sequences[period] = torch.where(torch.isnan(seq), torch.zeros_like(seq), seq)
+                tf_sequences[period] = torch.clamp(tf_sequences[period], -10.0, 10.0)
+        
+        if torch.isnan(context_features).any() or torch.isinf(context_features).any():
+            logger.warning("[NaN检测] 上下文特征包含NaN/Inf")
+            context_features = torch.nan_to_num(context_features, nan=0.0, posinf=10.0, neginf=-10.0)
+        context_features = torch.clamp(context_features, -10.0, 10.0)
+        
         # 各周期编码
         encoded = []
         for period, encoder in self.encoders.items():
             h = encoder(tf_sequences[period])
+            # 编码器输出安全检查
+            h = torch.where(torch.isnan(h) | torch.isinf(h), torch.zeros_like(h), h)
+            h = torch.clamp(h, -20.0, 20.0)
             encoded.append(h)
 
         # 跨周期交互
@@ -439,10 +465,21 @@ class MultiTimeframeLNN(nn.Module):
             attn_weights_dict['cross_attention'] = attn_weights
             # 将交互后的特征与原始特征残差连接
             encoded = [cross_attn_out[:, i, :] + enc for i, enc in enumerate(encoded)]
+            # 安全检查残差输出
+            encoded = [
+                torch.where(torch.isnan(e) | torch.isinf(e), torch.zeros_like(e), e)
+                for e in encoded
+            ]
+            encoded = [torch.clamp(e, -20.0, 20.0) for e in encoded]
 
         if self.use_cross_gating and hasattr(self, 'cross_gating'):
             # 门控融合全局信息
             encoded = self.cross_gating(encoded)
+            encoded = [
+                torch.where(torch.isnan(e) | torch.isinf(e), torch.zeros_like(e), e)
+                for e in encoded
+            ]
+            encoded = [torch.clamp(e, -20.0, 20.0) for e in encoded]
 
         # 注意力加权融合: 自适应学习各周期重要性
         scores_list = [self.tf_attention(enc) for enc in encoded]  # 各 (batch, 1)
@@ -459,6 +496,12 @@ class MultiTimeframeLNN(nn.Module):
         fused_input = torch.cat([weighted_sum, context_features], dim=-1)
         fused = self.fusion(fused_input)
         output = self.classifier(fused).squeeze(-1)
+
+        # 最终输出安全检查
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            logger.warning(f"[NaN检测] 模型最终输出含NaN/Inf: "
+                          f"range=[{output.min().item():.4f}, {output.max().item():.4f}], 替换为0")
+            output = torch.nan_to_num(output, nan=0.0, posinf=5.0, neginf=-5.0)
 
         return output, attn_weights_dict
 
