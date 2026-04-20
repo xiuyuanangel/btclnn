@@ -30,8 +30,8 @@ NUM_LAYERS = 2              # 隐藏层数量
 DROPOUT = 0.3               # 丢弃率
 LEARNING_RATE = 0.001       # 学习率
 BATCH_SIZE = 1024             # 批处理大小
-EPOCHS = 5                 # 训练轮数
-PATIENCE = 5              # 早停耐心值
+EPOCHS = 90                 # 训练轮数
+PATIENCE = 90              # 早停耐心值
 
 # ==================== 数据存储路径 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
