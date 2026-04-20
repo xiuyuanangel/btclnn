@@ -26,18 +26,19 @@ TIMEFRAMES = {
 
 # ==================== 模型配置 ====================
 HIDDEN_SIZE = 64            # 隐藏层大小
-NUM_LAYERS = 2              # 隐藏层数量
+NUM_LAYERS = 3              # 隐藏层数量
 DROPOUT = 0.3               # 丢弃率
 LEARNING_RATE = 0.001       # 学习率
 BATCH_SIZE = 1024             # 批处理大小
 EPOCHS = 200                 # 训练轮数
-PATIENCE = 150              # 早停耐心值
+PATIENCE = 200              # 早停耐心值
 
 # ==================== 数据存储路径 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data", "cache")
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 MODEL_PATH = os.path.join(CHECKPOINT_DIR, "lnn_best.pth")
+MODEL_PATH_FINAL = os.path.join(CHECKPOINT_DIR, "lnn_final.pth")
 
 # 确保目录存在
 os.makedirs(DATA_DIR, exist_ok=True)

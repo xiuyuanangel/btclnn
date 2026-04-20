@@ -25,6 +25,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _load_best_fallback(model, device):
+    """从best模型加载权重作为初始化的降级方案"""
+    try:
+        best_ckpt = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
+        ckpt_config = best_ckpt.get('config', {})
+        if 'timeframe_configs' in ckpt_config:
+            model.load_state_dict(best_ckpt['model_state_dict'])
+            logger.info("从最佳模型加载权重作为初始化")
+        else:
+            logger.info("检测到旧架构checkpoint，从头训练新模型")
+    except Exception as e:
+        logger.warning(f"加载best checkpoint也失败，从头训练: {e}")
+
+
 def train_model():
     """完整的训练流程"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -137,7 +151,7 @@ def train_model():
                      '--clobber'],
                     capture_output=True, text=True, timeout=120,
                 )
-                if dl.returncode == 0 and os.path.exists(config.MODEL_PATH):
+                if dl.returncode == 0:
                     logger.info("Release模型下载成功")
                 else:
                     logger.warning(f"Release模型下载失败: {dl.stderr.strip()}")
@@ -148,29 +162,33 @@ def train_model():
     else:
         logger.info("未找到已有GITHUB_TOKEN, 忽略Release下载")
 
-    # 加载已有模型权重(作为初始化, 每次固定训练25轮)
-    start_epoch = 0
+    # 加载最终模型权重作为初始化(每次固定训练EPOCHS轮)
     best_val_loss = float('inf')
     patience_counter = 0
 
-    if os.path.exists(config.MODEL_PATH):
+    if os.path.exists(config.MODEL_PATH_FINAL):
         try:
-            resume_checkpoint = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
+            resume_checkpoint = torch.load(config.MODEL_PATH_FINAL, map_location=device, weights_only=False)
             ckpt_config = resume_checkpoint.get('config', {})
             if 'timeframe_configs' in ckpt_config:
                 model.load_state_dict(resume_checkpoint['model_state_dict'])
-                logger.info("加载已有模型权重作为初始化")
+                logger.info(f"从最终模型加载权重初始化 (上次已训练 {resume_checkpoint.get('epoch', 0)} 轮)")
             else:
                 logger.info("检测到旧架构checkpoint，从头训练新模型")
         except Exception as e:
-            logger.warning(f"加载checkpoint失败，从头训练: {e}")
+            logger.warning(f"加载final checkpoint失败，尝试从best模型加载: {e}")
+            _load_best_fallback(model, device)
+    elif os.path.exists(config.MODEL_PATH):
+        _load_best_fallback(model, device)
+    else:
+        logger.info("未找到已有模型，从头训练")
 
     # ==================== 5. 训练循环 ====================
     logger.info("=" * 60)
-    logger.info(f"步骤 4: 开始训练 ({start_epoch+1}~{config.EPOCHS} epochs)")
+    logger.info(f"步骤 4: 开始训练 (1~{config.EPOCHS} epochs)")
     logger.info("=" * 60)
 
-    for epoch in range(start_epoch, config.EPOCHS):
+    for epoch in range(config.EPOCHS):
         t0 = time.time()
 
         # --- 训练阶段 ---
@@ -237,6 +255,7 @@ def train_model():
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'val_loss': val_loss,
                 'val_acc': val_acc,
                 'best_val_loss': best_val_loss,
@@ -255,6 +274,67 @@ def train_model():
             if patience_counter >= config.PATIENCE:
                 logger.info(f"早停: 连续 {config.PATIENCE} 轮验证损失未改善")
                 break
+
+    # ==================== 5.5 保存最终模型(用于断点续训) ====================
+    last_epoch = epoch + 1
+    torch.save({
+        'epoch': last_epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'val_loss': val_loss,
+        'val_acc': val_acc,
+        'best_val_loss': best_val_loss,
+        'patience_counter': patience_counter,
+        'config': {
+            'timeframe_configs': tf_configs,
+            'context_feature_size': ctx_size,
+            'hidden_size': config.HIDDEN_SIZE,
+            'num_layers': config.NUM_LAYERS,
+            'dropout': config.DROPOUT,
+        },
+    }, config.MODEL_PATH_FINAL)
+    logger.info(f"保存最终模型 (epoch={last_epoch}, val_loss={val_loss:.4f}) -> {config.MODEL_PATH_FINAL}")
+
+    # 上传到GitHub Release(仅CI环境)
+    if gh_token:
+        try:
+            import subprocess, json as _json
+            from datetime import datetime
+            tag_name = f"model-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            # 查找是否已存在release
+            result = subprocess.run(
+                ['gh', 'release', 'view', '--json', 'tagName', '--jq', '.tagName'],
+                capture_output=True, text=True, timeout=30,
+            )
+            existing_tag = result.stdout.strip() if result.returncode == 0 else None
+
+            release_title = f"LNN Model {tag_name}"
+            notes = (
+                f"## 多周期融合LNN模型\n\n"
+                f"- **最佳模型**: `lnn_best.pth` (val_loss={best_val_loss:.4f})\n"
+                f"- **最终模型**: `lnn_final.pth` (训练{last_epoch}轮后的完整状态, 用于断点续训)\n"
+                f"\n包含模型权重、优化器状态、学习率调度器状态，可直接加载继续训练。"
+            )
+            cmd_args = ['gh', 'release', 'create', tag_name,
+                        '--title', release_title, '--notes', notes]
+
+            if existing_tag:
+                # 更新已有release
+                cmd_args.extend(['--edit-last'])
+
+            cmd_args.extend([
+                config.MODEL_PATH, config.MODEL_PATH_FINAL,
+                '--clobber',
+            ])
+            ul = subprocess.run(cmd_args, capture_output=True, text=True, timeout=180)
+            if ul.returncode == 0:
+                action = "更新" if existing_tag else "创建"
+                logger.info(f"{action}Release成功: {tag_name} (best + final)")
+            else:
+                logger.warning(f"Release上传失败: {ul.stderr.strip()}")
+        except Exception as e:
+            logger.warning(f"上传模型到Release失败: {e}")
 
     # ==================== 6. 测试评估 ====================
     logger.info("=" * 60)
