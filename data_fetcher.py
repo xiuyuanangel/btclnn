@@ -19,11 +19,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
 import numpy as np
+import urllib3
 
 import config
 
+# 禁用SSL不安全警告(火币备用节点证书有问题)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# 全局API并发信号量: 限制所有线程的总请求数，避免触发API限流
+_api_semaphore = threading.Semaphore(4)
 
 
 class HuobiDataFetcher:
@@ -40,8 +47,13 @@ class HuobiDataFetcher:
         self.session.headers.update({
             "User-Agent": "LNN-Bot/1.0"
         })
-        # 增强连接池
-        self.session.mount('https://', requests.adapters.HTTPAdapter(pool_maxsize=10, max_retries=3))
+        # 禁用SSL验证(火币备用节点证书问题) + 增强连接池
+        self.session.mount('https://', requests.adapters.HTTPAdapter(
+            pool_maxsize=10,
+            max_retries=0,  # 我们自己控制重试逻辑
+        ))
+        # 节点切换锁(多线程安全)
+        self._url_lock = threading.Lock()
 
     def get_cache_path(self, period):
         safe_symbol = self.symbol.replace("-", "_")
@@ -93,17 +105,18 @@ class HuobiDataFetcher:
         return normalized
 
     def _switch_to_next_url(self):
-        """切换到下一个备用API节点"""
-        next_index = (self.current_url_index + 1) % len(self.base_urls)
-        old_url = self.base_url
-        self.base_url = self.base_urls[next_index]
-        self.current_url_index = next_index
+        """切换到下一个备用API节点(线程安全)"""
+        with self._url_lock:
+            next_index = (self.current_url_index + 1) % len(self.base_urls)
+            old_url = self.base_url
+            self.base_url = self.base_urls[next_index]
+            self.current_url_index = next_index
         logger.warning(f"API节点切换: {old_url} -> {self.base_url}")
         return self.base_url
 
     def _fetch_kline_range(self, period, from_ts, to_ts):
         """使用 from&to 获取指定时间范围的K线数据(不传size)
-        支持多节点自动切换: 主节点失败时自动尝试备用节点
+        支持多节点自动切换 + 限流自动退避
 
         Args:
             period: K线周期 (1min, 5min, 15min, 30min, 60min, 4hour, 1day)
@@ -113,57 +126,87 @@ class HuobiDataFetcher:
         Returns:
             list: K线数据列表
         """
-        max_retries = len(self.base_urls)  # 每个节点尝试一次
+        # 获取全局信号量(限制总并发请求数, 带超时防死锁)
+        if not _api_semaphore.acquire(timeout=120):
+            logger.error(f"获取API信号量超时 ({period}, {from_ts}-{to_ts})")
+            return []
 
-        for attempt in range(max_retries):
-            url = f"{self.base_url}{config.HUOBI_KLINE_ENDPOINT}"
-            params = {
-                "contract_code": self.symbol,
-                "period": period,
-                "from": int(from_ts),
-                "to": int(to_ts),
-            }
+        max_node_retries = len(self.base_urls)  # 每个节点尝试一次
+        rate_limit_backoff = 1.0  # 限流退避初始秒数
 
-            try:
-                response = self.session.get(url, params=params, timeout=30)
-                response.raise_for_status()
-                result = response.json()
+        try:
+            for attempt in range(max_node_retries):
+                url = f"{self.base_url}{config.HUOBI_KLINE_ENDPOINT}"
+                params = {
+                    "contract_code": self.symbol,
+                    "period": period,
+                    "from": int(from_ts),
+                    "to": int(to_ts),
+                }
 
-                if result.get("status") != "ok":
-                    # API返回错误，尝试下一个节点
-                    logger.error(f"[{self.base_url}] API返回错误: {result.get('err_msg', result)}")
-                    if attempt < max_retries - 1:
+                try:
+                    response = self.session.get(
+                        url, params=params, timeout=30,
+                        verify=False,  # 跳过SSL证书验证
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+
+                    if result.get("status") != "ok":
+                        err_code = result.get("err-code", "")
+                        err_msg = result.get("err_msg", result)
+
+                        # 限流错误: 等待后重试(不切换节点)
+                        if "limit" in str(err_code).lower() or "limit" in str(err_msg).lower():
+                            logger.warning(
+                                f"[{self.base_url}] API限流 ({period}), "
+                                f"等待 {rate_limit_backoff:.1f}s 后重试..."
+                            )
+                            time.sleep(rate_limit_backoff)
+                            rate_limit_backoff = min(rate_limit_backoff * 2, 10.0)
+                            continue
+
+                        # 其他API错误: 切换到下一个节点
+                        logger.error(f"[{self.base_url}] API返回错误: {err_msg}")
+                        if attempt < max_node_retries - 1:
+                            self._switch_to_next_url()
+                            continue
+                        return []
+
+                    data = result.get("data", [])
+                    if not data:
+                        return []
+
+                    return self._normalize_kline(data)
+
+                except requests.exceptions.SSLError as e:
+                    logger.error(f"[{self.base_url}] SSL错误: {e}")
+                    if attempt < max_node_retries - 1:
                         self._switch_to_next_url()
                         continue
                     return []
 
-                data = result.get("data", [])
-                if not data:
+                except requests.exceptions.ConnectionError as e:
+                    logger.error(f"[{self.base_url}] 连接错误: {e}")
+                    if attempt < max_node_retries - 1:
+                        self._switch_to_next_url()
+                        time.sleep(0.5)
+                        continue
                     return []
 
-                return self._normalize_kline(data)
+                except requests.RequestException as e:
+                    logger.error(f"[{self.base_url}] API请求失败: {e}")
+                    if attempt < max_node_retries - 1:
+                        self._switch_to_next_url()
+                        continue
+                    return []
 
-            except requests.RequestException as e:
-                logger.error(f"[{self.base_url}] API请求失败: {e}")
-                if config.MEOW_NICKNAME:
-                    try:
-                        notifier = MeoWNotifier(config.MEOW_NICKNAME)
-                        notifier.send_data_fetch_error(f"API请求失败 [{self.base_url}]: {e}")
-                    except Exception:
-                        pass
-                if attempt < max_retries - 1:
-                    self._switch_to_next_url()
-                    continue
-                return []
-            except (IndexError, KeyError, ValueError) as e:
-                logger.error(f"数据解析失败: {e}")
-                if config.MEOW_NICKNAME:
-                    try:
-                        notifier = MeoWNotifier(config.MEOW_NICKNAME)
-                        notifier.send_data_fetch_error(f"数据解析失败: {e}")
-                    except Exception:
-                        pass
-                return []
+                except (IndexError, KeyError, ValueError) as e:
+                    logger.error(f"数据解析失败: {e}")
+                    return []
+            return []
+        finally:
+            _api_semaphore.release()
 
     def deduplicate(self, data):
         """基于时间戳去重"""
@@ -194,7 +237,7 @@ class HuobiDataFetcher:
         Returns:
             list: K线数据列表(按时间升序)
         """
-        days = days or config.LOOKBACK_DAYS
+        days = days or 30  # 默认30天(兼容 get_10min_data 等无参调用)
         minutes_per_candle = self._period_to_minutes(period)
         target_count = days * 24 * 60 // minutes_per_candle
 
@@ -237,28 +280,28 @@ class HuobiDataFetcher:
         
         logger.info(f"{period} 数据分块: {len(chunks)} 个时间块，每块约 {minutes_per_candle * max_candles_per_chunk} 根K线")
         
-        # 4. 并发获取所有时间块数据
+        # 4. 并发获取所有时间块数据(全局信号量已限制总并发数)
         all_new_data = []
         lock = threading.Lock()  # 用于线程安全的batch聚合
-        
+
         def _fetch_chunk(args):
             cs, ce = args
             batch = self._fetch_kline_range(period, cs, ce)
             if batch:
-                # 在线程内排除缓存中已有的数据，减少后续处理量
-                if cached_data:
-                    cached_ids = {item["id"] for item in cached_data}
+                # 排除缓存中已有的数据(使用预构建的ID集合)
+                if cached_ids:
                     batch = [item for item in batch if item["id"] not in cached_ids]
                 if batch:
                     with lock:
                         all_new_data.extend(batch)
             return len(batch)
-        
-        # 限制并发数避免触发API限流 (每周期最多3个并发请求)
-        max_concurrent_chunks = min(len(chunks), 3)
-        logger.info(f"并发获取 {period} 数据: {len(chunks)} 个块，最大并发数 {max_concurrent_chunks}")
-        
-        with ThreadPoolExecutor(max_workers=max_concurrent_chunks) as executor:
+
+        logger.info(f"并发获取 {period} 数据: {len(chunks)} 个块")
+
+        # 预构建缓存ID集合(避免每个线程内重复构建)
+        cached_ids = {item["id"] for item in cached_data} if cached_data else None
+
+        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
             # 提交所有任务
             futures = [executor.submit(_fetch_chunk, chunk) for chunk in chunks]
             
@@ -328,7 +371,7 @@ class HuobiDataFetcher:
 
     def get_10min_data(self, days=None):
         """获取10分钟K线数据(从5分钟聚合)"""
-        days = days or config.LOOKBACK_DAYS
+        days = days or 30  # 默认30天(兼容 get_10min_data 等无参调用)
 
         data_5min = self.fetch_history("5min", days + 2)
         if not data_5min:
