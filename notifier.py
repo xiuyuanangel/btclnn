@@ -274,6 +274,38 @@ class MeoWNotifier:
         msg = f"获取K线数据时发生错误:\n{error_msg}"
         return self.send(title, msg)
 
+    def send_prediction_verify(self, direction: str, actual_direction: str,
+                                is_correct: bool, current_price: float,
+                                verify_price: float, price_change_pct: float) -> bool:
+        """
+        发送预测验证结果通知(10分钟后对比实际价格)
+
+        Args:
+            direction: 预测方向
+            actual_direction: 实际方向
+            is_correct: 预测是否正确
+            current_price: 预测时价格
+            verify_price: 验证时价格
+            price_change_pct: 价格变化百分比
+
+        Returns:
+            bool: 是否发送成功
+        """
+        mark = "✅" if is_correct else "❌"
+        title = f"{mark} BTC预测验证 - {'正确' if is_correct else '错误'}"
+
+        msg = (
+            f'<div style="font-size:40px;line-height:1.8">'
+            f'<b>预测方向:</b> {direction}<br>'
+            f'<b>实际方向:</b> {actual_direction}<br>'
+            f'<b>结果:</b> {"正确 ✅" if is_correct else "错误 ❌"}<br>'
+            f'<br>'
+            f'<b>预测价格:</b> {current_price:.2f} USDT<br>'
+            f'<b>验证价格:</b> {verify_price:.2f} USDT<br>'
+            f'<b>价格变化:</b> {price_change_pct:+.2f}%</div>'
+        )
+        return self.send(title, msg, msg_type="html", html_height=220)
+
 
 # 便捷函数，用于快速发送通知
 def notify_prediction(nickname: str, time: str, price: float, direction: str,

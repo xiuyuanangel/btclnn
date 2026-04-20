@@ -41,7 +41,24 @@ def _load_best_fallback(model, device):
 
 def train_model():
     """完整的训练流程"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 检测CUDA兼容性: PyTorch>=2.4仅支持sm_70+, P100(sm_60)/V100(sm_70)需验证
+    _use_cuda = False
+    if torch.cuda.is_available():
+        try:
+            cap = torch.cuda.get_device_capability()
+            major, minor = cap[0], cap[1]
+            if major < 7:
+                logger.warning(
+                    f"GPU计算能力为sm_{major}{minor}，当前PyTorch要求>=sm_70，自动降级到CPU训练"
+                )
+            else:
+                _use_cuda = True
+        except Exception:
+            logger.warning("检测GPU能力失败，自动降级到CPU")
+    else:
+        logger.info("未检测到可用GPU")
+
+    device = torch.device("cuda" if _use_cuda else "cpu")
     logger.info(f"使用设备: {device}")
     periods = list(config.TIMEFRAMES.keys())
     logger.info(f"多周期融合: {periods}")

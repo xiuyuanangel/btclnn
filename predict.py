@@ -4,6 +4,7 @@
 """
 
 import os
+import time
 import logging
 
 import numpy as np
@@ -108,7 +109,16 @@ def prepare_multi_tf_features(timeframe_data):
 
 def predict():
     """执行预测: 基于多周期数据判断10分钟后涨跌"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 检测CUDA兼容性(同train.py)
+    _use_cuda = False
+    if torch.cuda.is_available():
+        try:
+            cap = torch.cuda.get_device_capability()
+            if cap[0] >= 7:
+                _use_cuda = True
+        except Exception:
+            pass
+    device = torch.device("cuda" if _use_cuda else "cpu")
     logger.info(f"使用设备: {device}")
 
     # 1. 加载模型
@@ -168,13 +178,85 @@ def predict():
     print("=" * 50)
     print()
 
-    return {
-        'time': str(latest_time),
-        'price': float(current_price),
-        'direction': direction,
-        'probability': probability,
-        'confidence': confidence,
-    }
+    # 6. 等待10分钟验证预测结果
+    logger.info("等待10分钟获取最新价格验证预测...")
+    wait_seconds = 600
+    # 对齐到下一个整10分钟边界(减少等待时间)
+    now = pd.Timestamp.now()
+    next_10min = now.floor('10min') + pd.Timedelta(minutes=10)
+    wait = max((next_10min - now).total_seconds(), 60)
+    if wait < wait_seconds:
+        logger.info(f"对齐到 {next_10min}, 等待 {wait:.0f}s")
+        time.sleep(wait)
+    else:
+        time.sleep(wait_seconds)
+
+    # 获取验证数据(只需5min即可对比价格)
+    try:
+        verify_data = fetcher.fetch_multi_timeframe()
+        verify_df = fetcher.get_dataframe(verify_data['5min'])
+        verify_price = verify_df['close'].iloc[-1]
+        verify_time = verify_df.index[-1]
+
+        actual_direction = "涨 (UP)" if verify_price > current_price else "跌 (DOWN)"
+        is_correct = (probability > 0.5) == (verify_price > current_price)
+        price_change = (verify_price - float(current_price)) / float(current_price) * 100
+
+        result_mark = "✅ 正确" if is_correct else "❌ 错误"
+        print("-" * 50)
+        print(f"  📊 预测验证结果 [{result_mark}]")
+        print("-" * 50)
+        print(f"  预测时间:   {latest_time} | 价格: {current_price:.2f} USDT")
+        print(f"  验证时间:   {verify_time} | 价格: {verify_price:.2f} USDT")
+        print(f"  预测方向:   {direction}")
+        print(f"  实际方向:   {actual_direction}")
+        print(f"  价格变化:   {price_change:+.2f}%")
+        print("=" * 50)
+        print()
+
+        logger.info(
+            f"预测验证: {'正确' if is_correct else '错误'}, "
+            f"预测{direction}, 实际{actual_direction}, 变化{price_change:+.2f}%"
+        )
+
+        # 推送验证结果通知
+        if config.MEOW_NICKNAME:
+            try:
+                notifier = MeoWNotifier(config.MEOW_NICKNAME)
+                notifier.send_prediction_verify(
+                    direction=direction,
+                    actual_direction=actual_direction,
+                    is_correct=is_correct,
+                    current_price=float(current_price),
+                    verify_price=float(verify_price),
+                    price_change_pct=price_change,
+                )
+            except Exception as e:
+                logger.warning(f"验证通知推送失败: {e}")
+
+        return {
+            'time': str(latest_time),
+            'price': float(current_price),
+            'direction': direction,
+            'probability': probability,
+            'confidence': confidence,
+            'verified': True,
+            'is_correct': is_correct,
+            'verify_time': str(verify_time),
+            'verify_price': float(verify_price),
+            'price_change_pct': price_change,
+        }
+    except Exception as e:
+        logger.warning(f"验证阶段获取数据失败: {e}")
+        print("⚠️  无法获取验证数据，跳过预测验证")
+        return {
+            'time': str(latest_time),
+            'price': float(current_price),
+            'direction': direction,
+            'probability': probability,
+            'confidence': confidence,
+            'verified': False,
+        }
 
 
 if __name__ == "__main__":
