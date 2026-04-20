@@ -309,25 +309,28 @@ def train_model():
             )
             existing_tag = result.stdout.strip() if result.returncode == 0 else None
 
-            release_title = f"LNN Model {tag_name}"
             notes = (
                 f"## 多周期融合LNN模型\n\n"
                 f"- **最佳模型**: `lnn_best.pth` (val_loss={best_val_loss:.4f})\n"
                 f"- **最终模型**: `lnn_final.pth` (训练{last_epoch}轮后的完整状态, 用于断点续训)\n"
                 f"\n包含模型权重、优化器状态、学习率调度器状态，可直接加载继续训练。"
             )
-            cmd_args = ['gh', 'release', 'create', tag_name,
-                        '--title', release_title, '--notes', notes]
 
             if existing_tag:
-                # 更新已有release
-                cmd_args.extend(['--edit-last'])
+                # 已有Release: 删除旧版并创建新tag(更新notes和文件)
+                subprocess.run(
+                    ['gh', 'release', 'delete', existing_tag, '--yes'],
+                    capture_output=True, text=True, timeout=30,
+                )
 
-            cmd_args.extend([
-                config.MODEL_PATH, config.MODEL_PATH_FINAL,
-                '--clobber',
-            ])
-            ul = subprocess.run(cmd_args, capture_output=True, text=True, timeout=180)
+            release_title = f"LNN Model {tag_name}"
+            ul = subprocess.run(
+                ['gh', 'release', 'create', tag_name,
+                 '--title', release_title, '--notes', notes,
+                 config.MODEL_PATH, config.MODEL_PATH_FINAL,
+                 '--clobber'],
+                capture_output=True, text=True, timeout=180,
+            )
             if ul.returncode == 0:
                 action = "更新" if existing_tag else "创建"
                 logger.info(f"{action}Release成功: {tag_name} (best + final)")
