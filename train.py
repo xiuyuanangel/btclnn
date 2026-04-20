@@ -327,8 +327,7 @@ def train_model():
             ul = subprocess.run(
                 ['gh', 'release', 'create', tag_name,
                  '--title', release_title, '--notes', notes,
-                 config.MODEL_PATH, config.MODEL_PATH_FINAL,
-                 '--clobber'],
+                 config.MODEL_PATH, config.MODEL_PATH_FINAL],
                 capture_output=True, text=True, timeout=180,
             )
             if ul.returncode == 0:
