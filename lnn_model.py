@@ -45,11 +45,11 @@ class LTCCell(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.W_in.weight, gain=0.5)
-        nn.init.orthogonal_(self.W_rec.weight, gain=0.5)
+        nn.init.xavier_uniform_(self.W_in.weight, gain=1.0)
+        nn.init.orthogonal_(self.W_rec.weight, gain=1.0)
         for module in self.gate_net:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
@@ -66,6 +66,7 @@ class TimeframeEncoder(nn.Module):
 
     将一个时间周期的序列编码为固定维度的向量表示。
     每个周期有独立的多层LTC单元, 处理原生分辨率的数据。
+    层间加入LayerNorm稳定梯度流动。
     """
 
     def __init__(self, input_size, hidden_size, num_layers):
@@ -77,6 +78,11 @@ class TimeframeEncoder(nn.Module):
                 hidden_size,
             )
             for i in range(num_layers)
+        ])
+        # 层间LayerNorm: 防止深层梯度消失/爆炸
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_size)
+            for _ in range(num_layers)
         ])
         self._init_weights()
 
@@ -104,6 +110,8 @@ class TimeframeEncoder(nn.Module):
             inp = x[:, t, :]
             for i, cell in enumerate(self.cells):
                 hidden[i] = cell(inp, hidden[i])
+                # 层间归一化: 稳定后续层的输入分布
+                hidden[i] = self.layer_norms[i](hidden[i])
                 inp = hidden[i]
 
         return hidden[-1]

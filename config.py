@@ -25,7 +25,7 @@ TIMEFRAMES = {
 
 # ==================== 模型配置 ====================
 HIDDEN_SIZE = 96            # 隐藏层大小
-NUM_LAYERS = 4              # 隐藏层数量
+NUM_LAYERS = 2              # 隐藏层数量(减少深度防止梯度消失)
 DROPOUT = 0.3               # 丢弃率
 LEARNING_RATE = 0.001       # 学习率
 BATCH_SIZE = 1024           # 批处理大小
