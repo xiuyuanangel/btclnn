@@ -290,7 +290,7 @@ def build_multi_tf_dataset(tf_dfs, target_df):
                 f"({global_valid.sum()/len(target_timestamps)*100:.1f}%) "
                 f"(过滤掉{n_filtered_out}个部分缺失样本)")
 
-    # 6. 构建最终数组(仅包含全周期有效的样本)
+    # 6. 构建最终数组(仅包含全周期有效的样本) + 特征标准化
     X_dict = {}
     for period in periods:
         X_dict[period] = all_sequences[period][global_valid]
@@ -299,11 +299,39 @@ def build_multi_tf_dataset(tf_dfs, target_df):
     X_ctx = ctx_data.astype(np.float32)[global_valid]
     y = label_data.astype(np.float32)[global_valid]
 
+    # 7. Z-Score标准化: 每个特征维度标准化为均值0/标准差1
+    #    防止极端值(如volume_ratio=100)导致LTC单元tanh饱和→梯度消失
+    logger.info("执行特征Z-Score标准化...")
+    _norm_stats = {}  # 保存统计量供预测时复用
+    for period in periods:
+        arr = X_dict[period]
+        shape = arr.shape
+        flat = arr.reshape(-1, shape[-1])
+        _mean = flat.mean(axis=0)
+        _std = flat.std(axis=0) + 1e-8
+        X_dict[period] = ((flat - _mean) / _std).reshape(shape)
+        _norm_stats[period] = {'mean': _mean, 'std': _std}
+        logger.info(f"  {period} 标准化后: mean={X_dict[period].mean():.4f}, std={X_dict[period].std():.4f}")
+
+    # 上下文特征也标准化
+    _ctx_mean = X_ctx.mean(axis=0)
+    _ctx_std = X_ctx.std(axis=0) + 1e-8
+    X_ctx = (X_ctx - _ctx_mean) / _ctx_std
+    _norm_stats['context'] = {'mean': _ctx_mean, 'std': _ctx_std}
+    logger.info(f"  context 标准化后: mean={X_ctx.mean():.4f}, std={X_ctx.std():.4f}")
+
     if len(y) > 0:
         up_ratio = y.mean()
         logger.info(f"标签分布: 涨={y.sum():.0f} ({up_ratio:.2%}), "
                      f"跌={len(y)-y.sum():.0f} ({1-up_ratio:.2%})")
     logger.info(f"多周期数据集: {len(y)} 个有效样本")
+
+    # 保存标准化参数(供预测时复用)
+    import pickle, os
+    _norm_path = os.path.join(config.CHECKPOINT_DIR, 'feature_norm_stats.pkl')
+    with open(_norm_path, 'wb') as f:
+        pickle.dump({'periods': periods, 'stats': _norm_stats}, f)
+    logger.info(f"标准化统计量已保存 -> {_norm_path}")
 
     return X_dict, X_ctx, y
 

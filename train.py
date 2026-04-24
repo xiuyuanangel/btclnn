@@ -235,6 +235,65 @@ def train_model():
     logger.info(f"步骤 4: 开始训练 (1~{config.EPOCHS} epochs)")
     logger.info("=" * 60)
 
+    # ====== 诊断: 首次前向传播信号追踪 ======
+    model.eval()
+    _diag_iter = iter(train_loader)
+    _diag_tf, _diag_ctx, _diag_lbl = next(_diag_iter)
+    if not _use_preconverted:
+        _diag_tf = {p: v.to(device) for p, v in _diag_tf.items()}
+        _diag_ctx = _diag_ctx.to(device)
+
+    with torch.no_grad():
+        # 1) 输入统计
+        for p in periods:
+            d = _diag_tf[p]
+            logger.info(f"[诊断] 输入 {p}: mean={d.mean():.6f}, std={d.std():.6f}, "
+                       f"min={d.min():.4f}, max={d.max():.4f}")
+        logger.info(f"[诊断] ctx: mean={_diag_ctx.mean():.6f}, std={_diag_ctx.std():.6f}")
+
+        # 2) 各编码器输出(兼容DataParallel)
+        _base_model = model.module if hasattr(model, 'module') else model
+        _enc_outs = []
+        for p in periods:
+            h = _base_model.encoders[p](_diag_tf[p])
+            _enc_outs.append(h)
+            logger.info(f"[诊断] {p} 编码器输出: mean={h.mean():.8f}, std={h.std():.8f}, "
+                       f"abs_mean={h.abs().mean():.8f}")
+
+        # 3) 注意力后(如果有)
+        if hasattr(_base_model, 'cross_attn'):
+            _attn_out = _base_model.cross_attn(_enc_outs)
+            for i, h in enumerate(_attn_out):
+                logger.info(f"[诊断] 注意力后 {periods[i]}: mean={h.mean():.8f}, std={h.std():.8f}")
+            _use_attn = _attn_out
+        else:
+            _use_attn = _enc_outs
+
+        # 4) 融合层输入/输出
+        _fused_in = torch.cat(_use_attn + [_diag_ctx], dim=-1)
+        logger.info(f"[诊断] 融合输入: mean={_fused_in.mean():.8f}, std={_fused_in.std():.8f}")
+
+        _fused = _base_model.fusion(_fused_in)
+        logger.info(f"[诊断] 融合输出: mean={_fused.mean():.8f}, std={_fused.std():.8f}")
+
+        # 5) 最终预测
+        _out = _base_model.classifier(_fused).squeeze(-1)
+        logger.info(f"[诊断] 最终输出: mean={_out.mean:.6f}, min={_out.min():.6f}, max={_out.max():.6f}")
+
+        # 6) 反向梯度诊断
+    model.train()
+    optimizer.zero_grad()
+    _diag_out = model(_diag_tf, _diag_ctx)
+    _diag_loss = criterion(_diag_out, _diag_lbl[:len(_diag_out)] if _use_preconverted else _diag_lbl)
+    _diag_loss.backward()
+    total_norm = sum(p.grad.norm().item()**2 for p in model.parameters() if p.grad is not None)**0.5
+    logger.info(f"[诊断] 初始loss={_diag_loss.item():.6f}, 梯度L2范数={total_norm:.8f}")
+    for name, param in model.named_parameters():
+        if param.grad is not None and param.grad.norm().item() > 0:
+            logger.info(f"  grad | {name}: norm={param.grad.norm():.8e}")
+    optimizer.zero_grad()
+    # ====== 诊断结束 ======
+
     for epoch in range(config.EPOCHS):
         t0 = time.time()
 

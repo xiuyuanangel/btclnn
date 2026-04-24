@@ -24,6 +24,44 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def load_norm_stats():
+    """加载训练时保存的特征标准化统计量"""
+    import pickle
+    path = os.path.join(config.CHECKPOINT_DIR, 'feature_norm_stats.pkl')
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"标准化参数文件不存在: {path}\n"
+            f"请先运行 train.py 训练模型以生成该文件"
+        )
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def normalize_with_stats(tf_seqs_raw, ctx_raw, norm_data):
+    """使用训练时的统计量对原始特征进行Z-Score标准化
+
+    Args:
+        tf_seqs_raw: dict of {period: np.array (1, seq_len, feat_size)} 原始特征
+        ctx_raw: np.array (1, ctx_size) 原始上下文
+        norm_data: dict {'periods': list, 'stats': dict} 标准化参数
+
+    Returns:
+        标准化后的 tf_seqs, ctx (同shape)
+    """
+    stats = norm_data['stats']
+    periods = norm_data['periods']
+
+    tf_seqs = {}
+    for p in periods:
+        s = stats[p]
+        tf_seqs[p] = (tf_seqs_raw[p] - s['mean']) / s['std']
+
+    cs = stats['context']
+    ctx = (ctx_raw - cs['mean']) / cs['std']
+
+    return tf_seqs, ctx
+
+
 def load_model(device):
     """加载训练好的多周期融合模型"""
     if not os.path.exists(config.MODEL_PATH):
@@ -124,21 +162,27 @@ def predict():
     # 1. 加载模型
     model = load_model(device)
 
-    # 2. 获取多周期数据
+    # 2. 加载标准化参数(必须与训练时一致)
+    norm_data = load_norm_stats()
+
+    # 3. 获取多周期数据
     logger.info("正在获取多周期K线数据...")
     fetcher = HuobiDataFetcher()
     timeframe_data = fetcher.fetch_multi_timeframe()
 
-    # 3. 特征准备
+    # 4. 特征准备(原始)
     try:
-        tf_seqs, ctx, df_featured = prepare_multi_tf_features(timeframe_data)
+        tf_seqs_raw, ctx_raw, df_featured = prepare_multi_tf_features(timeframe_data)
     except ValueError as e:
         logger.error(str(e))
         return None
 
-    # 4. 模型推理
-    tf_seqs_tensor = {p: torch.FloatTensor(v).to(device) for p, v in tf_seqs.items()}
-    ctx_tensor = torch.FloatTensor(ctx).to(device)
+    # 5. 应用与训练一致的Z-Score标准化
+    tf_seqs_norm, ctx_norm = normalize_with_stats(tf_seqs_raw, ctx_raw, norm_data)
+
+    # 6. 模型推理
+    tf_seqs_tensor = {p: torch.from_numpy(v.copy()).float().to(device) for p, v in tf_seqs_norm.items()}
+    ctx_tensor = torch.from_numpy(ctx_norm.copy()).float().to(device)
 
     with torch.no_grad():
         probability = model(tf_seqs_tensor, ctx_tensor).item()
