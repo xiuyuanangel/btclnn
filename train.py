@@ -112,9 +112,20 @@ def train_model():
     val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
     test_dataset = MultiTimeframeDataset(test_data[0], test_data[1], test_data[2], periods)
 
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+    # DataLoader配置: GPU平台启用多进程预取 + 页锁定内存加速数据传输
+    _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
+    if _use_cuda:
+        _dl_kwargs = {
+            'num_workers': min(8, os.cpu_count() or 4),
+            'pin_memory': True,
+            'prefetch_factor': 4,
+            'persistent_workers': True,
+        }
+    logger.info(f"DataLoader参数: {_dl_kwargs}")
+
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False, **_dl_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, **_dl_kwargs)
+    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False, **_dl_kwargs)
 
     # ==================== 3. 创建模型 ====================
     logger.info("=" * 60)
