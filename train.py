@@ -1,4 +1,4 @@
-"""液态神经网络训练脚本 — 多周期融合版"""
+"""液态神经网络训练脚本 - 多周期融合版"""
 
 import os
 import time
@@ -62,7 +62,7 @@ def train_model():
     device = torch.device("cuda" if _use_cuda else "cpu")
     logger.info(f"使用设备: {device}")
     periods = list(config.TIMEFRAMES.keys())
-    logger.info(f"多周期融合: {periods}")
+    logger.info(f"多周期融合 {periods}")
 
     # 初始化通知器
     notifier = None
@@ -78,7 +78,7 @@ def train_model():
     fetcher = HuobiDataFetcher()
     timeframe_data = fetcher.fetch_multi_timeframe()
 
-    # 构建10min目标时间线(用于标签对齐)
+    # 构建10min目标时间帧(用于标签对齐)
     data_10min = fetcher.resample_to_10min(timeframe_data['5min'])
     target_df = fetcher.get_dataframe(data_10min)
 
@@ -99,9 +99,9 @@ def train_model():
     X_dict, X_ctx, y = build_multi_tf_dataset(tf_dfs, target_df)
 
     if len(y) < 100:
-        logger.error(f"有效样本不足: {len(y)} 个, 需要至少 100 个")
+        logger.error(f"有效样本不足: {len(y)} 个, 需要至少100 个")
         if notifier:
-            notifier.send_training_error(f"有效样本不足: {len(y)} 个, 需要至少 100 个")
+            notifier.send_training_error(f"有效样本不足: {len(y)} 个, 需要至少100 个")
         return None
 
     train_data, val_data, test_data = split_multi_tf_dataset(X_dict, X_ctx, y)
@@ -112,7 +112,7 @@ def train_model():
     _use_preconverted = False
     if _use_cuda:
         t_pre = time.time()
-        # 一次性将全部numpy转为Tensor并搬入GPU(消除训练循环中的逐样本创建+逐batch搬运)
+        # 一次性将全部numpy转为Tensor并搬入GPU(消除训练循环中的逐样本创建逐batch搬运)
         def _to_gpu_tensor_dict(data_tuple):
             x_d, x_c, y_arr = data_tuple
             return (
@@ -135,7 +135,7 @@ def train_model():
         val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
         test_dataset = MultiTimeframeDataset(test_data[0], test_data[1], test_data[2], periods)
 
-    # DataLoader配置: GPU数据已在显存中, 无需多进程/页锁定; CPU平台启用加速
+    # DataLoader配置: GPU数据已在显存, 无需多进程页锁, CPU平台启用加锁
     if _use_cuda:
         _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
     else:
@@ -171,7 +171,7 @@ def train_model():
         model = nn.DataParallel(model)
 
     total_params, trainable_params = count_parameters(model)
-    logger.info(f"模型参数: 总计 {total_params:,}, 可训练 {trainable_params:,}")
+    logger.info(f"模型参数: 总计 {total_params:,}, 可训练{trainable_params:,}")
 
     # ==================== 4. 训练配置 ====================
     optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
@@ -209,7 +209,7 @@ def train_model():
     else:
         logger.info("未找到已有GITHUB_TOKEN, 忽略Release下载")
 
-    # 加载最终模型权重作为初始化(每次固定训练EPOCHS轮)
+    # 加载最终模型权重作为初始化(每次固定训练EPOCHS)
     best_val_loss = float('inf')
     patience_counter = 0
 
@@ -219,7 +219,7 @@ def train_model():
             ckpt_config = resume_checkpoint.get('config', {})
             if 'timeframe_configs' in ckpt_config:
                 model.load_state_dict(resume_checkpoint['model_state_dict'])
-                logger.info(f"从最终模型加载权重初始化 (上次已训练 {resume_checkpoint.get('epoch', 0)} 轮)")
+                logger.info(f"从最终模型加载权重初始化 (上次已训练{resume_checkpoint.get('epoch', 0)} 轮)")
             else:
                 logger.info("检测到旧架构checkpoint，从头训练新模型")
         except Exception as e:
@@ -232,7 +232,7 @@ def train_model():
 
     # ==================== 5. 训练循环 ====================
     logger.info("=" * 60)
-    logger.info(f"步骤 4: 开始训练 (1~{config.EPOCHS} epochs)")
+    logger.info(f"步骤 4: 开始训练(1~{config.EPOCHS} epochs)")
     logger.info("=" * 60)
 
     # ====== 诊断: 首次前向传播信号追踪 ======
@@ -257,7 +257,7 @@ def train_model():
         for p in periods:
             h = _base_model.encoders[p](_diag_tf[p])
             _enc_outs.append(h)
-            logger.info(f"[诊断] {p} 编码器输出: mean={h.mean():.8f}, std={h.std():.8f}, "
+            logger.info(f"[诊断] {p} 编码器输出 mean={h.mean():.8f}, std={h.std():.8f}, "
                        f"abs_mean={h.abs().mean():.8f}")
 
         # 3) 注意力后(如果有)
@@ -269,7 +269,7 @@ def train_model():
         else:
             _use_attn = _enc_outs
 
-        # 4) 融合层输入/输出
+        # 4) 融合层输入输出
         _fused_in = torch.cat(_use_attn + [_diag_ctx], dim=-1)
         logger.info(f"[诊断] 融合输入: mean={_fused_in.mean():.8f}, std={_fused_in.std():.8f}")
 
@@ -278,7 +278,7 @@ def train_model():
 
         # 5) 最终预测
         _out = _base_model.classifier(_fused).squeeze(-1)
-        logger.info(f"[诊断] 最终输出: mean={_out.mean:.6f}, min={_out.min():.6f}, max={_out.max():.6f}")
+        logger.info(f"[诊断] 最终输出 mean={_out.mean():.6f}, min={_out.min():.6f}, max={_out.max():.6f}")
 
         # 6) 反向梯度诊断
     model.train()
@@ -286,7 +286,7 @@ def train_model():
     _diag_out = model(_diag_tf, _diag_ctx)
     _diag_loss = criterion(_diag_out, _diag_lbl[:len(_diag_out)] if _use_preconverted else _diag_lbl)
     _diag_loss.backward()
-    total_norm = sum(p.grad.norm().item()**2 for p in model.parameters() if p.grad is not None)**0.5
+    total_norm = sum(p.grad.norm().item()**2 for p in model.parameters() if p.grad is not None)**00.5
     logger.info(f"[诊断] 初始loss={_diag_loss.item():.6f}, 梯度L2范数={total_norm:.8f}")
     for name, param in model.named_parameters():
         if param.grad is not None and param.grad.norm().item() > 0:
@@ -376,14 +376,14 @@ def train_model():
                     'dropout': config.DROPOUT,
                 },
             }, config.MODEL_PATH)
-            logger.info(f"  -> 保存最佳模型 (val_loss={val_loss:.4f})")
+            logger.info(f"  -> 保存最佳模型(val_loss={val_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= config.PATIENCE:
                 logger.info(f"早停: 连续 {config.PATIENCE} 轮验证损失未改善")
                 break
 
-    # ==================== 5.5 保存最终模型(用于断点续训) ====================
+    # ==================== 5.5 保存最终模型用于断点续训) ====================
     last_epoch = epoch + 1
     torch.save({
         'epoch': last_epoch,
@@ -402,7 +402,7 @@ def train_model():
             'dropout': config.DROPOUT,
         },
     }, config.MODEL_PATH_FINAL)
-    logger.info(f"保存最终模型 (epoch={last_epoch}, val_loss={val_loss:.4f}) -> {config.MODEL_PATH_FINAL}")
+    logger.info(f"保存最终模型(epoch={last_epoch}, val_loss={val_loss:.4f}) -> {config.MODEL_PATH_FINAL}")
 
     # 上传到GitHub Release(仅CI环境)
     if gh_token:
@@ -420,8 +420,8 @@ def train_model():
             notes = (
                 f"## 多周期融合LNN模型\n\n"
                 f"- **最佳模型**: `lnn_best.pth` (val_loss={best_val_loss:.4f})\n"
-                f"- **最终模型**: `lnn_final.pth` (训练{last_epoch}轮后的完整状态, 用于断点续训)\n"
-                f"\n包含模型权重、优化器状态、学习率调度器状态，可直接加载继续训练。"
+                f"- **最终模型**: `lnn_final.pth` (训练{last_epoch}轮后的完整状态 用于断点续训)\n"
+                f"\n包含模型权重、优化器状态、学习率调度器状态，可直接加载继续训练\n"
             )
 
             if existing_tag:
@@ -489,10 +489,10 @@ def train_model():
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
-    logger.info(f"测试集 Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
+    logger.info(f"测试集Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
     logger.info(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
     logger.info(f"混淆矩阵: TP={tp} FP={fp} TN={tn} FN={fn}")
-    logger.info(f"最佳模型来自 Epoch {checkpoint['epoch']}")
+    logger.info(f"最佳模型来自Epoch {checkpoint['epoch']}")
 
     # 发送训练完成通知
     if notifier:
@@ -520,7 +520,7 @@ if __name__ == "__main__":
                 notifier.send_training_error("训练失败，未生成模型")
             sys.exit(1)
     except Exception as e:
-        logger.error(f"训练过程中发生异常: {e}")
+        logger.error(f"训练过程中发生异常 {e}")
         if config.MEOW_NICKNAME:
             notifier = MeoWNotifier(config.MEOW_NICKNAME)
             notifier.send_training_error(str(e))
