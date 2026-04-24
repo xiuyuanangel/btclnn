@@ -173,7 +173,7 @@ def align_tf_sequences(tf_timestamps, tf_features, target_timestamps, seq_length
 
 
 class MultiTimeframeDataset(Dataset):
-    """多周期融合数据集"""
+    """多周期融合数据集(接收numpy数组, __getitem__逐样本转tensor)"""
 
     def __init__(self, X_dict, X_ctx, y, periods):
         """
@@ -195,6 +195,32 @@ class MultiTimeframeDataset(Dataset):
         tf_seqs = {p: torch.FloatTensor(self.X_dict[p][idx]) for p in self.periods}
         ctx = torch.FloatTensor(self.X_ctx[idx])
         label = torch.tensor(self.y[idx], dtype=torch.float32)
+        return tf_seqs, ctx, label
+
+
+class PreConvertedTensorDataset(Dataset):
+    """GPU优化数据集: 数据已预转为Tensor并搬入设备, __getitem__仅做索引(零开销)"""
+
+    def __init__(self, X_dict_tensors, X_ctx_tensor, y_tensor, periods):
+        """
+        Args:
+            X_dict_tensors: dict of {period: torch.Tensor (N, seq_length, feature_size), 已在目标device上}
+            X_ctx_tensor: torch.Tensor (N, context_size), 已在目标device上
+            y_tensor: torch.Tensor (N,), 已在目标device上
+            periods: list of period names
+        """
+        self.X_dict = X_dict_tensors
+        self.X_ctx = X_ctx_tensor
+        self.y = y_tensor
+        self.periods = periods
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        tf_seqs = {p: self.X_dict[p][idx] for p in self.periods}
+        ctx = self.X_ctx[idx]
+        label = self.y[idx]
         return tf_seqs, ctx, label
 
 

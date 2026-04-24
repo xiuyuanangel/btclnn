@@ -14,7 +14,8 @@ from data_fetcher import HuobiDataFetcher
 from notifier import MeoWNotifier
 from features import (
     build_multi_tf_dataset, split_multi_tf_dataset,
-    MultiTimeframeDataset, SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
+    MultiTimeframeDataset, PreConvertedTensorDataset,
+    SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
 )
 from lnn_model import MultiTimeframeLNN, count_parameters
 
@@ -107,21 +108,39 @@ def train_model():
     logger.info(f"数据划分 -> 训练: {len(train_data[2])}, "
                 f"验证: {len(val_data[2])}, 测试: {len(test_data[2])}")
 
-    # 创建 DataLoader
-    train_dataset = MultiTimeframeDataset(train_data[0], train_data[1], train_data[2], periods)
-    val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
-    test_dataset = MultiTimeframeDataset(test_data[0], test_data[1], test_data[2], periods)
-
-    # DataLoader配置: GPU平台启用多进程预取 + 页锁定内存加速数据传输
-    _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
+    # 创建 Dataset: GPU平台预转Tensor并搬入GPU, CPU平台使用原始numpy
+    _use_preconverted = False
     if _use_cuda:
-        _dl_kwargs = {
-            'num_workers': min(8, os.cpu_count() or 4),
-            'pin_memory': True,
-            'prefetch_factor': 4,
-            'persistent_workers': True,
-        }
-    logger.info(f"DataLoader参数: {_dl_kwargs}")
+        t_pre = time.time()
+        # 一次性将全部numpy转为Tensor并搬入GPU(消除训练循环中的逐样本创建+逐batch搬运)
+        def _to_gpu_tensor_dict(data_tuple):
+            x_d, x_c, y_arr = data_tuple
+            return (
+                {p: torch.tensor(x_d[p], dtype=torch.float32, device=device) for p in periods},
+                torch.tensor(x_c, dtype=torch.float32, device=device),
+                torch.tensor(y_arr, dtype=torch.float32, device=device),
+            )
+
+        train_data = _to_gpu_tensor_dict(train_data)
+        val_data = _to_gpu_tensor_dict(val_data)
+        test_data = _to_gpu_tensor_dict(test_data)
+
+        train_dataset = PreConvertedTensorDataset(train_data[0], train_data[1], train_data[2], periods)
+        val_dataset = PreConvertedTensorDataset(val_data[0], val_data[1], val_data[2], periods)
+        test_dataset = PreConvertedTensorDataset(test_data[0], test_data[1], test_data[2], periods)
+        _use_preconverted = True
+        logger.info(f"GPU数据预转完成 ({time.time()-t_pre:.2f}s), 数据已常驻显存")
+    else:
+        train_dataset = MultiTimeframeDataset(train_data[0], train_data[1], train_data[2], periods)
+        val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
+        test_dataset = MultiTimeframeDataset(test_data[0], test_data[1], test_data[2], periods)
+
+    # DataLoader配置: GPU数据已在显存中, 无需多进程/页锁定; CPU平台启用加速
+    if _use_cuda:
+        _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
+    else:
+        _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
+    logger.info(f"DataLoader参数: {_dl_kwargs} | 预转GPU: {_use_preconverted}")
 
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False, **_dl_kwargs)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, **_dl_kwargs)
@@ -224,9 +243,10 @@ def train_model():
         train_loss, train_correct, train_total = 0.0, 0, 0
 
         for tf_seqs, ctx, labels in train_loader:
-            tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
-            ctx = ctx.to(device)
-            labels = labels.to(device)
+            if not _use_preconverted:
+                tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
+                ctx = ctx.to(device)
+                labels = labels.to(device)
 
             optimizer.zero_grad()
             outputs = model(tf_seqs, ctx)
@@ -250,9 +270,10 @@ def train_model():
 
         with torch.no_grad():
             for tf_seqs, ctx, labels in val_loader:
-                tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
-                ctx = ctx.to(device)
-                labels = labels.to(device)
+                if not _use_preconverted:
+                    tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
+                    ctx = ctx.to(device)
+                    labels = labels.to(device)
                 outputs = model(tf_seqs, ctx)
                 loss = criterion(outputs, labels)
 
@@ -380,9 +401,10 @@ def train_model():
 
     with torch.no_grad():
         for tf_seqs, ctx, labels in test_loader:
-            tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
-            ctx = ctx.to(device)
-            labels = labels.to(device)
+            if not _use_preconverted:
+                tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
+                ctx = ctx.to(device)
+                labels = labels.to(device)
             outputs = model(tf_seqs, ctx)
             loss = criterion(outputs, labels)
 
