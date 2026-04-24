@@ -169,7 +169,7 @@ def align_tf_sequences(tf_timestamps, tf_features, target_timestamps, seq_length
 
     logger.info(f"    有效对齐: {valid.sum()}/{n_target} "
                 f"({valid.sum()/n_target*100:.1f}%)")
-    return sequences
+    return sequences, valid
 
 
 class MultiTimeframeDataset(Dataset):
@@ -241,25 +241,37 @@ def build_multi_tf_dataset(tf_dfs, target_df):
     label_data = target_df['label'].values
     ctx_data = target_df[CONTEXT_FEATURE_COLS].values
 
-    # 4. 各周期对齐提取序列
+    # 4. 各周期对齐提取序列 + 收集有效掩码
     all_sequences = {}
+    all_valid_masks = {}
     for period in periods:
         seq_length = config.TIMEFRAMES[period]['seq_length']
         df = tf_featured[period]
         tf_ts = df['id'].values.astype(np.int64)
         tf_feat = df[SEQ_FEATURE_COLS].values
-        all_sequences[period] = align_tf_sequences(
+        sequences, valid_mask = align_tf_sequences(
             tf_ts, tf_feat, target_timestamps, seq_length
         )
+        all_sequences[period] = sequences
+        all_valid_masks[period] = valid_mask
 
-    # 5. 构建最终数组(各周期零填充, 不再过滤)
+    # 5. 取所有周期有效对齐的交集(只保留所有周期都有真实数据的样本)
+    global_valid = np.ones(len(target_timestamps), dtype=bool)
+    for period, mask in all_valid_masks.items():
+        global_valid &= mask
+    n_filtered_out = len(target_timestamps) - global_valid.sum()
+    logger.info(f"全局有效对齐: {global_valid.sum()}/{len(target_timestamps)} "
+                f"({global_valid.sum()/len(target_timestamps)*100:.1f}%) "
+                f"(过滤掉{n_filtered_out}个部分缺失样本)")
+
+    # 6. 构建最终数组(仅包含全周期有效的样本)
     X_dict = {}
     for period in periods:
-        X_dict[period] = all_sequences[period]
+        X_dict[period] = all_sequences[period][global_valid]
         logger.info(f"  {period} 序列形状: {X_dict[period].shape}")
 
-    X_ctx = ctx_data.astype(np.float32)
-    y = label_data.astype(np.float32)
+    X_ctx = ctx_data.astype(np.float32)[global_valid]
+    y = label_data.astype(np.float32)[global_valid]
 
     if len(y) > 0:
         up_ratio = y.mean()
