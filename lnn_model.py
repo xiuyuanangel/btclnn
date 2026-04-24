@@ -1,13 +1,14 @@
 """液态神经网络(LNN)模型实现
 
 基于 Liquid Time-Constant Networks (LTC) 论文的核心思想:
-- 连续时间动态: dh/dt = f(h, u, t)
-- 可学习的时间常数(每个神经元独立的时间尺度)
-- 输入依赖的动态调制(网络的"液态"特性)
+|- 连续时间动态: dh/dt = f(h, u, t)
+|- 可学习的时间常数(每个神经元独立的时间尺度)
+|- 输入依赖的动态调制(网络的"液态"特性)
 
 多周期融合架构:
   每个时间周期(5min/15min/60min/4hour/1day)拥有独立的LTC编码器,
-  各编码器输出拼接后经融合层产生最终预测。
+  通过跨周期注意力机制(Cross-TF Attention)让各周期相互影响,
+  各编码器输出经融合层产生最终预测。
 
 参考论文:
   Hasani et al., "Liquid Time-Constant Networks", 2021
@@ -15,6 +16,7 @@
 
 import torch
 import torch.nn as nn
+import math
 
 import config
 
@@ -107,14 +109,104 @@ class TimeframeEncoder(nn.Module):
         return hidden[-1]
 
 
+class CrossTimeframeAttention(nn.Module):
+    """跨周期注意力机制(Cross-Timeframe Attention)
+
+    让每个时间周期能够主动关注其他周期的信息,
+    学习不同时间尺度之间的相互影响关系。
+
+    例如: 5min微观结构可以参考1day宏观趋势来调整判断,
+          宏观趋势也可以从微观结构的异常信号中获得预警。
+
+    架构:
+      各周期编码输出 → Stack为序列 → Multi-Head Self-Attention → 残差连接+LayerNorm → Unstack
+    """
+
+    def __init__(self, hidden_size, num_timeframes, num_heads=4, dropout=0.1):
+        """
+        Args:
+            hidden_size: 每个周期的隐藏维度
+            num_timeframes: 周期数量
+            num_heads: 注意力头数(需整除hidden_size)
+            dropout: 注意力dropout率
+        """
+        super().__init__()
+        assert hidden_size % num_heads == 0, \
+            f"hidden_size({hidden_size})必须能被num_heads({num_heads})整除"
+
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = math.sqrt(self.head_dim)
+
+        # Q/K/V投影(所有周期共享, 让注意力模式可迁移)
+        self.W_q = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_k = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_v = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # 输出投影
+        self.W_o = nn.Linear(hidden_size, hidden_size)
+
+        # 层归一化与残差
+        self.norm = nn.LayerNorm(hidden_size)
+        self.attn_dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for W in [self.W_q, self.W_k, self.W_v]:
+            nn.init.xavier_uniform_(W.weight, gain=1.0 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.W_o.weight)
+
+    def forward(self, encoded_list):
+        """
+        Args:
+            encoded_list: list of (batch, hidden_size), 各周期编码器的输出,
+                         列表顺序与config.TIMEFRAMES.keys()一致
+
+        Returns:
+            enhanced_list: list of (batch, hidden_size), 融合了跨周期信息的增强表示
+        """
+        # (batch, num_tf, hidden_size)
+        x = torch.stack(encoded_list, dim=1)
+        batch_size, num_tf, _ = x.shape
+
+        # 投影Q/K/V
+        Q = self.W_q(x)  # (B, N, D)
+        K = self.W_k(x)
+        V = self.W_v(x)
+
+        # 多头reshape: (B, N, H, D/H) -> (B, H, N, D/H)
+        Q = Q.view(batch_size, num_tf, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, num_tf, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, num_tf, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled Dot-Product Attention: (B, H, N, N)
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        attn_probs = self.attn_dropout(attn_probs)
+
+        # 加权求和: (B, H, N, D/H) -> (B, N, H, D/H) -> (B, N, D)
+        context = torch.matmul(attn_probs, V)
+        context = context.transpose(1, 2).contiguous().view(batch_size, num_tf, self.hidden_size)
+
+        # 输出投影 + 残差 + LayerNorm
+        output = self.W_o(context)
+        output = self.norm(x + output)
+
+        # Unstack回列表
+        return [output[:, i, :] for i in range(num_tf)]
+
+
 class MultiTimeframeLNN(nn.Module):
     """多周期融合液态神经网络
 
     架构:
-        各周期序列 → 独立LTC编码器 → 拼接(+上下文特征) → 融合层 → 分类头 → 涨/跌概率
+        各周期序列 → 独立LTC编码器 → 跨周期注意力(Cross-TF Attention)
+        → 拼接(+上下文特征) → 融合层 → 分类头 → 涨/跌概率
 
     每个周期(5min/15min/60min/4hour/1day)有独立的编码器处理原生分辨率数据,
-    捕获从微观结构到宏观趋势的多尺度市场动态。
+    通过Cross-TF Attention学习不同时间尺度之间的相互影响。
     """
 
     def __init__(
@@ -125,6 +217,8 @@ class MultiTimeframeLNN(nn.Module):
         num_layers=None,
         dropout=None,
         output_size=1,
+        use_cross_attention=True,
+        cross_attn_heads=4,
     ):
         """
         Args:
@@ -134,11 +228,18 @@ class MultiTimeframeLNN(nn.Module):
             num_layers: 每个编码器的LTC层数
             dropout: Dropout比率
             output_size: 输出维度(默认1=二元分类)
+            use_cross_attention: 是否启用跨周期注意力(默认True)
+            cross_attn_heads: 跨周期注意力的头数
         """
         super().__init__()
         self.hidden_size = hidden_size or config.HIDDEN_SIZE
         self.num_layers = num_layers or config.NUM_LAYERS
         self.dropout_rate = dropout or config.DROPOUT
+        self.use_cross_attention = use_cross_attention
+
+        # 周期名称列表(保持确定顺序)
+        self.period_names = list(timeframe_configs.keys())
+        num_tf = len(timeframe_configs)
 
         # 每个周期独立的LTC编码器
         self.encoders = nn.ModuleDict({
@@ -150,7 +251,15 @@ class MultiTimeframeLNN(nn.Module):
             for period, tf_cfg in timeframe_configs.items()
         })
 
-        num_tf = len(timeframe_configs)
+        # 跨周期注意力模块(可选)
+        if self.use_cross_attention and num_tf > 1:
+            self.cross_attn = CrossTimeframeAttention(
+                hidden_size=self.hidden_size,
+                num_timeframes=num_tf,
+                num_heads=cross_attn_heads,
+                dropout=self.dropout_rate,
+            )
+
         fusion_input_size = num_tf * self.hidden_size + context_feature_size
 
         # 融合层: 将所有编码器输出和上下文特征融合
@@ -191,12 +300,17 @@ class MultiTimeframeLNN(nn.Module):
         Returns:
             output: (batch,) 预测涨的概率
         """
+        # 1. 各周期独立编码(保持固定顺序)
         encoded = []
-        for period, encoder in self.encoders.items():
-            h = encoder(tf_sequences[period])
+        for period in self.period_names:
+            h = self.encoders[period](tf_sequences[period])
             encoded.append(h)
 
-        # 拼接所有编码器输出 + 上下文特征
+        # 2. 跨周期注意力交互(可选)
+        if self.use_cross_attention and hasattr(self, 'cross_attn'):
+            encoded = self.cross_attn(encoded)
+
+        # 3. 拼接所有编码器输出 + 上下文特征
         fused_input = torch.cat(encoded + [context_features], dim=-1)
         fused = self.fusion(fused_input)
         return self.classifier(fused).squeeze(-1)
