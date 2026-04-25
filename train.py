@@ -288,9 +288,9 @@ def train_model():
     _diag_loss.backward()
     total_norm = sum(p.grad.norm().item()**2 for p in model.parameters() if p.grad is not None)**00.5
     logger.info(f"[诊断] 初始loss={_diag_loss.item():.6f}, 梯度L2范数={total_norm:.8f}")
-    for name, param in model.named_parameters():
-        if param.grad is not None and param.grad.norm().item() > 0:
-            logger.info(f"  grad | {name}: norm={param.grad.norm():.8e}")
+    # for name, param in model.named_parameters():
+    #     if param.grad is not None and param.grad.norm().item() > 0:
+    #         logger.info(f"  grad | {name}: norm={param.grad.norm():.8e}")
     optimizer.zero_grad()
     # ====== 诊断结束 ======
 
