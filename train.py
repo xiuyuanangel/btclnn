@@ -235,9 +235,17 @@ def train_model():
         logger.info("未找到已有模型，从头训练")
 
     # ==================== 5. 训练循环 ====================
+    _max_epochs = config.EPOCHS
+    _max_seconds = getattr(config, 'MAX_TRAIN_SECONDS', None)
     logger.info("=" * 60)
-    logger.info(f"步骤 4: 开始训练(1~{config.EPOCHS} epochs)")
+    if _max_seconds:
+        logger.info(f"步骤 4: 开始训练(时间限制: {_max_seconds/3600:.1f}小时, 上限{_max_epochs} epochs)")
+    else:
+        logger.info(f"步骤 4: 开始训练(1~{_max_epochs} epochs)")
     logger.info("=" * 60)
+
+    train_start_time = time.time()
+    epoch = 0
 
     # ====== 诊断: 首次前向传播信号追踪 ======
     model.eval()
@@ -298,8 +306,14 @@ def train_model():
     optimizer.zero_grad()
     # ====== 诊断结束 ======
 
-    for epoch in range(config.EPOCHS):
+    while epoch < _max_epochs:
+        # 时间限制检查
+        if _max_seconds and (time.time() - train_start_time) >= _max_seconds:
+            logger.info(f"达到最大训练时长({_max_seconds/3600:.1f}小时), 停止训练")
+            break
+
         t0 = time.time()
+        epoch += 1
 
         # --- 训练阶段 ---
         model.train()
@@ -353,10 +367,11 @@ def train_model():
         current_lr = optimizer.param_groups[0]['lr']
 
         logger.info(
-            f"Epoch {epoch+1:3d}/{config.EPOCHS} | "
+            f"Epoch {epoch:3d}/{_max_epochs} | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
             f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
-            f"LR: {current_lr:.6f} | {elapsed:.1f}s"
+            f"LR: {current_lr:.6f} | {elapsed:.1f}s | "
+            f"已用{(time.time()-train_start_time)/3600:.1f}h"
         )
 
         # 保存最佳模型
@@ -388,9 +403,10 @@ def train_model():
                 break
 
     # ==================== 5.5 保存最终模型用于断点续训) ====================
-    last_epoch = epoch + 1
+    _total_time = time.time() - train_start_time
+    logger.info(f"训练结束: 共{epoch}轮, 总耗时{_total_time/3600:.1f}小时")
     torch.save({
-        'epoch': last_epoch,
+        'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
@@ -406,7 +422,7 @@ def train_model():
             'dropout': config.DROPOUT,
         },
     }, config.MODEL_PATH_FINAL)
-    logger.info(f"保存最终模型(epoch={last_epoch}, val_loss={val_loss:.4f}) -> {config.MODEL_PATH_FINAL}")
+    logger.info(f"保存最终模型(epoch={epoch}, val_loss={val_loss:.4f}) -> {config.MODEL_PATH_FINAL}")
 
     # 上传到GitHub Release(仅CI环境)
     if gh_token:
@@ -424,7 +440,7 @@ def train_model():
             notes = (
                 f"## 多周期融合LNN模型\n\n"
                 f"- **最佳模型**: `lnn_best.pth` (val_loss={best_val_loss:.4f})\n"
-                f"- **最终模型**: `lnn_final.pth` (训练{last_epoch}轮后的完整状态 用于断点续训)\n"
+                f"- **最终模型**: `lnn_final.pth` (训练{epoch}轮后的完整状态 用于断点续训)\n"
                 f"\n包含模型权重、优化器状态、学习率调度器状态，可直接加载继续训练\n"
             )
 
