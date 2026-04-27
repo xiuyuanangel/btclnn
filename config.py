@@ -24,13 +24,14 @@ TIMEFRAMES = {
 }
 
 # ==================== 模型配置 ====================
-HIDDEN_SIZE = 96            # 隐藏层大小
-NUM_LAYERS = 2              # 隐藏层数量(减少深度防止梯度消失)
-DROPOUT = 0.3               # 丢弃率
-LEARNING_RATE = 0.001       # 学习率
+HIDDEN_SIZE = 96            # 隐藏层大小(从96降至64, 配合精简特征降低过拟合风险)
+NUM_LAYERS = 3              # 隐藏层数量(减少深度防止梯度消失)
+DROPOUT = 0.5               # 丢弃率(从0.3提升至0.5, 增强正则化)
+LEARNING_RATE = 5e-4        # 学习率(从1e-3降低至5e-4, 更稳定收敛)
+WEIGHT_DECAY = 1e-4         # L2正则化(新增, 进一步抑制过拟合)
 BATCH_SIZE = 1024           # 批处理大小
-EPOCHS = 110                 # 训练轮数
-PATIENCE = 110               # 早停耐心值
+EPOCHS = 110                # 训练轮数
+PATIENCE = 100               # 早停耐心值(从110降至15, 更快截断过拟合)
 
 # ==================== 数据存储路径 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

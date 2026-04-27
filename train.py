@@ -174,9 +174,13 @@ def train_model():
     logger.info(f"模型参数: 总计 {total_params:,}, 可训练{trainable_params:,}")
 
     # ==================== 4. 训练配置 ====================
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    optimizer = torch.optim.Adam(
+        model.parameters(), 
+        lr=config.LEARNING_RATE,
+        weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-4),
+    )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6,
+        optimizer, mode='min', factor=0.3, patience=3, min_lr=1e-6,
     )
     criterion = nn.BCELoss()
 

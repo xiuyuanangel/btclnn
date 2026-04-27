@@ -68,13 +68,13 @@ def compute_labels(df):
     return df
 
 
-# 序列特征列名(每个时间步13个特征, 所有周期共享)
+# 序列特征列名(混合方案: 原始OHLCV + 单期收益率, 每个时间步5个特征, 所有周期共享)
 SEQ_FEATURE_COLS = [
-    'return_1', 'return_6', 'return_36', 'return_144',
-    'volume_ratio',
-    'range_ratio', 'body_ratio', 'close_position',
-    'rsi_6', 'rsi_36',
-    'deviation_6', 'deviation_144',
+    'close',      # 核心价格
+    'vol',        # 成交量
+    'return_1',   # 单期收益率（最直接的变化量）
+    'high',       # 最高价
+    'low',        # 最低价
 ]
 
 # 上下文特征列名(60天窗口的6个统计特征)
@@ -89,12 +89,11 @@ CONTEXT_FEATURE_COLS = [
 
 
 def compute_all_features(df):
-    """对DataFrame计算全部序列特征(原地修改)"""
-    df = compute_returns(df)
-    df = compute_volume_features(df)
-    df = compute_price_features(df)
-    df = compute_rolling_stats(df)
-    df = compute_rsi(df)
+    """对DataFrame计算序列特征(原地修改)
+    
+    混合方案: 仅计算 return_1, 其余(close/vol/high/low)为原始OHLCV字段
+    """
+    df = compute_returns(df, windows=(1,))
     return df
 
 
