@@ -216,6 +216,7 @@ def train_model():
     # 加载最终模型权重作为初始化(每次固定训练EPOCHS)
     best_val_loss = float('inf')
     patience_counter = 0
+    epoch = 0
 
     if os.path.exists(config.MODEL_PATH_FINAL):
         try:
@@ -224,6 +225,7 @@ def train_model():
             if 'timeframe_configs' in ckpt_config:
                 model.load_state_dict(resume_checkpoint['model_state_dict'])
                 logger.info(f"从最终模型加载权重初始化 (上次已训练{resume_checkpoint.get('epoch', 0)} 轮)")
+                epoch = resume_checkpoint.get('epoch', 0)
             else:
                 logger.info("检测到旧架构checkpoint，从头训练新模型")
         except Exception as e:
@@ -245,7 +247,7 @@ def train_model():
     logger.info("=" * 60)
 
     train_start_time = time.time()
-    epoch = 0
+    
 
     # ====== 诊断: 首次前向传播信号追踪 ======
     model.eval()
