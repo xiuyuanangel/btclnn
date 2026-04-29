@@ -192,14 +192,17 @@ def predict():
     confidence = abs(probability - 0.5) * 2
 
     current_price = df_featured['close'].iloc[-1]
-    latest_time = df_featured.index[-1]
+    # 记录实际预测时刻(系统时间), 而非K线起始时间(id)
+    prediction_time = pd.Timestamp.now()
+    # K线时间仅作参考(显示的是最新一根K线的起始时间)
+    latest_kline_time = df_featured.index[-1]
 
     # 发送通知推送
     if config.MEOW_NICKNAME:
         try:
             notifier = MeoWNotifier(config.MEOW_NICKNAME)
             notifier.send_prediction(
-                time=str(latest_time),
+                time=str(prediction_time),
                 price=float(current_price),
                 direction=direction,
                 probability=probability,
@@ -213,7 +216,7 @@ def predict():
     print(f"  多周期融合 LNN 预测结果")
     print("=" * 50)
     print(f"  融合周期:   {', '.join(config.TIMEFRAMES.keys())}")
-    print(f"  当前时间:   {latest_time}")
+    print(f"  预测时间:   {prediction_time}")
     print(f"  当前价格:   {current_price:.2f} USDT")
     print(f"  预测方向:   {direction}")
     print(f"  上涨概率:   {probability:.4f} ({probability * 100:.2f}%)")
@@ -235,12 +238,21 @@ def predict():
     else:
         time.sleep(wait_seconds)
 
-    # 获取验证数据(只需5min即可对比价格)
+    # 获取验证数据(强制刷新缓存, 使用10min聚合数据与训练标签对齐)
     try:
-        verify_data = fetcher.fetch_multi_timeframe()
-        verify_df = fetcher.get_dataframe(verify_data['5min'])
+        # 强制刷新缓存, 确保获取到最新K线数据
+        verify_data = fetcher.fetch_multi_timeframe(force_refresh=True)
+
+        # 用5min聚合为10min, 与训练时的标签定义一致
+        verify_10min = fetcher.resample_to_10min(verify_data['5min'])
+        verify_df = fetcher.get_dataframe(verify_10min)
+
+        if verify_df.empty:
+            logger.warning("验证阶段: 10min聚合数据为空")
+            raise ValueError("empty 10min data")
+
         verify_price = verify_df['close'].iloc[-1]
-        verify_time = verify_df.index[-1]
+        verify_time = pd.Timestamp.now()  # 验证时刻的实际系统时间
 
         actual_direction = "涨 (UP)" if verify_price > current_price else "跌 (DOWN)"
         is_correct = (probability > 0.5) == (verify_price > current_price)
@@ -250,7 +262,7 @@ def predict():
         print("-" * 50)
         print(f"  📊 预测验证结果 [{result_mark}]")
         print("-" * 50)
-        print(f"  预测时间:   {latest_time} | 价格: {current_price:.2f} USDT")
+        print(f"  预测时间:   {prediction_time} | 价格: {current_price:.2f} USDT")
         print(f"  验证时间:   {verify_time} | 价格: {verify_price:.2f} USDT")
         print(f"  预测方向:   {direction}")
         print(f"  实际方向:   {actual_direction}")
@@ -279,7 +291,7 @@ def predict():
                 logger.warning(f"验证通知推送失败: {e}")
 
         return {
-            'time': str(latest_time),
+            'time': str(prediction_time),
             'price': float(current_price),
             'direction': direction,
             'probability': probability,
@@ -294,7 +306,7 @@ def predict():
         logger.warning(f"验证阶段获取数据失败: {e}")
         print("⚠️  无法获取验证数据，跳过预测验证")
         return {
-            'time': str(latest_time),
+            'time': str(prediction_time),
             'price': float(current_price),
             'direction': direction,
             'probability': probability,

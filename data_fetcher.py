@@ -224,18 +224,13 @@ class HuobiDataFetcher:
     def sort_data(self, data):
         return sorted(data, key=lambda x: x.get("id", 0))
 
-    def fetch_history(self, period, days=None):
+    def fetch_history(self, period, days=None, force_refresh=False):
         """获取历史K线数据，按时间块分块并发使用from&to分页
-
-        API规则: size与from&to必填其一；三者都填时忽略from/to
-        因此分页只用from&to(不传size)
 
         Args:
             period: K线周期
             days: 需要的历史天数
-
-        Returns:
-            list: K线数据列表(按时间升序)
+            force_refresh: 是否强制刷新缓存(跳过新鲜度检查直接拉取最新数据)
         """
         days = days or 30  # 默认30天(兼容 get_10min_data 等无参调用)
         minutes_per_candle = self._period_to_minutes(period)
@@ -249,8 +244,8 @@ class HuobiDataFetcher:
         cached_data = self.deduplicate(cached_data)
         cached_data = self.sort_data(cached_data)
 
-        # 缓存检查: 数据量充足且最新K线在10分钟内
-        if cached_data:
+        # 缓存检查: 数据量充足且最新K线在10分钟内 (force_refresh时跳过)
+        if cached_data and not force_refresh:
             last_ts = cached_data[-1].get("id", 0)
             if len(cached_data) >= target_count and (now_ts - last_ts) < 600:
                 logger.info(f"缓存数据充足且新鲜: {len(cached_data)} 条")
@@ -382,8 +377,11 @@ class HuobiDataFetcher:
         self.save_cache(data_10min, "10min")
         return data_10min
 
-    def fetch_multi_timeframe(self):
+    def fetch_multi_timeframe(self, force_refresh=False):
         """获取所有配置周期的K线数据(多线程并发)
+
+        Args:
+            force_refresh: 是否强制刷新所有周期的缓存
 
         Returns:
             dict: {period: list_of_kline_dicts} 每个周期的原始K线数据
@@ -395,7 +393,7 @@ class HuobiDataFetcher:
             period, cfg = period_cfg
             lookback = cfg['lookback_days']
             logger.info(f"[并发] 开始获取 {period} 数据 (lookback={lookback}天)...")
-            data = self.fetch_history(period, lookback)
+            data = self.fetch_history(period, lookback, force_refresh=force_refresh)
             logger.info(f"[并发] {period}: {len(data)} 条K线")
             return period, data
 
