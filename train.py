@@ -224,7 +224,25 @@ def train_model():
         每个预测窗口有独立的pos_weight(基于训练集涨跌比例计算)。
         正样本的 loss 乘以 pos_weight, 负样本保持原值。
         """
+        def __init__(self, per_horizon_weights):
+            super().__init__()
+            self.register_buffer(
+                'weights',
+                torch.tensor(per_horizon_weights, dtype=torch.float32),
+            )
+
         def forward(self, pred, target):
+            """
+            Args:
+                pred: (batch, num_horizons) sigmoid后的概率
+                target: (batch, num_horizons) 0/1标签
+            """
+            weight_vec = self.weights.to(target.device)
+            bce = F.binary_cross_entropy(pred, target, reduction='none')  # (batch, H)
+            weight_vec = weight_vec.unsqueeze(0)  # (1, H) broadcast to (B, H)
+            sample_weights = torch.where(target >= 0.5, weight_vec,
+                                          torch.ones_like(target))
+            return (bce * sample_weights).mean()
             """
             Args:
                 pred: (batch, num_horizons) sigmoid后的概率
