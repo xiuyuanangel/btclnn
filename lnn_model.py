@@ -54,7 +54,7 @@ class LTCCell(nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
-                    nn.zeros_(module.bias)
+                    nn.init.zeros_(module.bias)
 
     def _ode_rhs(self, h, u):
         """ODE右侧函数: f(h,u) = dh/dt"""
@@ -273,7 +273,7 @@ class GatedResidualFusion(nn.Module):
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight, gain=0.5)  # 小gain让门控初始接近均匀
                     if m.bias is not None:
-                        nn.zeros_(m.bias)
+                        nn.init.zeros_(m.bias)
         if hasattr(self, 'ctx_proj'):
             nn.init.xavier_uniform_(self.ctx_proj.weight, gain=0.5)
 
@@ -413,7 +413,7 @@ class MultiTimeframeLNN(nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
-                    nn.zeros_(module.bias)
+                    nn.init.zeros_(module.bias)
 
     def forward(self, tf_sequences, context_features):
         """
@@ -481,7 +481,7 @@ class LiquidNeuralNetwork(nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
-                    nn.zeros_(module.bias)
+                    nn.init.zeros_(module.bias)
 
     def forward(self, seq_features, context_features):
         batch_size, seq_len = seq_features.size(0), seq_features.size(1)
