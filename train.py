@@ -7,13 +7,14 @@ import logging
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import config
 from data_fetcher import HuobiDataFetcher
 from notifier import MeoWNotifier
 from features import (
-    build_multi_tf_dataset, split_multi_tf_dataset,
+    build_multi_tf_dataset, split_multi_tf_dataset, normalize_datasets,
     MultiTimeframeDataset, PreConvertedTensorDataset,
     SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
 )
@@ -78,13 +79,16 @@ def train_model():
     fetcher = HuobiDataFetcher()
     timeframe_data = fetcher.fetch_multi_timeframe()
 
-    # 构建10min目标时间帧(用于标签对齐)
+    # 构建10min目标时间帧(用于样本时间轴对齐)
     data_10min = fetcher.resample_to_10min(timeframe_data['5min'])
     target_df = fetcher.get_dataframe(data_10min)
 
     if target_df.empty or len(target_df) < 100:
         logger.error("目标时间线数据不足")
         return None
+
+    # 5min数据作为标签来源(细粒度计算多周期标签)
+    label_source_df = fetcher.get_dataframe(timeframe_data['5min'])
 
     # 各周期转DataFrame
     tf_dfs = {}
@@ -96,7 +100,11 @@ def train_model():
     logger.info("步骤 2: 多周期特征工程与数据集构建")
     logger.info("=" * 60)
 
-    X_dict, X_ctx, y = build_multi_tf_dataset(tf_dfs, target_df)
+    X_dict, X_ctx, y = build_multi_tf_dataset(tf_dfs, target_df, label_source_df=label_source_df)
+
+    # 多标签维度
+    _num_horizons = len(config.PREDICTION_HORIZONS)
+    logger.info(f"多标签训练: {_num_horizons} 个预测窗口 -> {config.PREDICTION_HORIZONS}")
 
     if len(y) < 100:
         logger.error(f"有效样本不足: {len(y)} 个, 需要至少100 个")
@@ -107,6 +115,9 @@ def train_model():
     train_data, val_data, test_data = split_multi_tf_dataset(X_dict, X_ctx, y)
     logger.info(f"数据划分 -> 训练: {len(train_data[2])}, "
                 f"验证: {len(val_data[2])}, 测试: {len(test_data[2])}")
+
+    # 基于训练集统计量标准化(避免数据泄露: 验证/测试集不参与fit)
+    train_data, val_data, test_data = normalize_datasets(train_data, val_data, test_data)
 
     # 创建 Dataset: GPU平台预转Tensor并搬入GPU, CPU平台使用原始numpy
     _use_preconverted = False
@@ -165,6 +176,7 @@ def train_model():
         hidden_size=config.HIDDEN_SIZE,
         num_layers=config.NUM_LAYERS,
         dropout=config.DROPOUT,
+        output_size=_num_horizons,  # 多标签输出
     ).to(device)
 
     if torch.cuda.device_count() > 1:
@@ -182,7 +194,58 @@ def train_model():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.3, patience=3, min_lr=1e-6,
     )
-    criterion = nn.BCELoss()
+    criterion = nn.BCELoss()  # 多标签BCE: 逐元素计算后取mean
+
+    # ==================== 4.5 类别平衡权重 ====================
+    # 基于训练集标签分布计算正样本权重(pos_weight)
+    # 金融涨跌数据通常不平衡, pos_weight = 负样本数/正样本数
+    _train_labels = train_data[2]  # (N_train, num_horizons)
+    if _train_labels.ndim == 1:
+        _train_labels = _train_labels.reshape(-1, 1)
+    _pos_weights = []
+    for h_idx in range(_num_horizons):
+        _pos = (_train_labels[:, h_idx] == 1).sum()
+        _neg = (_train_labels[:, h_idx] == 0).sum()
+        if _pos > 0:
+            pw = float(_neg) / float(_pos)
+            pw = min(pw, 5.0)  # 上限5:1, 防止极端不平衡导致训练不稳定
+            _pos_weights.append(pw)
+            logger.info(f"  窗口[{config.PREDICTION_HORIZONS[h_idx]}m] "
+                       f"类别分布 -> 涨:{_pos:.0f} 跌:{_neg:.0f} pos_weight={pw:.2f}")
+        else:
+            _pos_weights.append(1.0)
+            logger.info(f"  窗口[{config.PREDICTION_HORIZONS[h_idx]}m] 无正样本, pos_weight=1.0")
+
+    # 构建加权BCE损失: 对每个horizon独立应用pos_weight
+    import torch.nn.functional as F
+    class WeightedBCELoss(nn.Module):
+        """带类别权重的多标签二元交叉熵损失
+
+        每个预测窗口有独立的pos_weight(基于训练集涨跌比例计算)。
+        正样本的 loss 乘以 pos_weight, 负样本保持原值。
+        """
+        def __init__(self, per_horizon_weights):
+            super().__init__()
+            # 注册为buffer, 自动随模型移到GPU
+            self.register_buffer(
+                'weights',
+                torch.tensor(per_horizon_weights, dtype=torch.float32),
+            )
+
+        def forward(self, pred, target):
+            """
+            Args:
+                pred: (batch, num_horizons) sigmoid后的概率
+                target: (batch, num_horizons) 0/1标签
+            """
+            bce = F.binary_cross_entropy(pred, target, reduction='none')  # (batch, H)
+            weight_vec = self.weights.unsqueeze(0)  # (1, H) broadcast to (B, H)
+            sample_weights = torch.where(target >= 0.5, weight_vec,
+                                          torch.ones_like(target))
+            return (bce * sample_weights).mean()
+
+    criterion = WeightedBCELoss(_pos_weights)
+    logger.info(f"使用 WeightedBCELoss, 各窗口pos_weight={_pos_weights}")
 
     # 优先从GitHub Release下载最新模型(仅CI环境)
     gh_token = os.environ.get('GH_TOKEN')
@@ -283,22 +346,44 @@ def train_model():
         else:
             _use_attn = _enc_outs
 
-        # 4) 融合层输入输出
-        _fused_in = torch.cat(_use_attn + [_diag_ctx], dim=-1)
-        logger.info(f"[诊断] 融合输入: mean={_fused_in.mean():.8f}, std={_fused_in.std():.8f}")
-
-        _fused = _base_model.fusion(_fused_in)
+        # 4) Gated Residual Fusion 输入输出
+        #    fusion现在接收 (encoded_list, context_features) 而非拼接后的tensor
+        logger.info(f"[诊断] GatedFusion 输入: {len(_use_attn)}个周期编码 + ctx")
+        _fused = _base_model.fusion(_use_attn, _diag_ctx)
         logger.info(f"[诊断] 融合输出: mean={_fused.mean():.8f}, std={_fused.std():.8f}")
 
+        # 可选: 打印各周期门控权重(可解释性诊断)
+        if hasattr(_base_model.fusion, 'gate_networks'):
+            with torch.no_grad():
+                _gate_logits = []
+                for gi, gn in enumerate(_base_model.fusion.gate_networks):
+                    gl = gn(_use_attn[gi])  # (B,1)
+                    _gate_logits.append(gl.item() if gl.numel() == 1 else gl.mean().item())
+                _gates = F.softmax(
+                    torch.tensor(_gate_logits, device=_use_attn[0].device), dim=0
+                ).cpu().numpy()
+            _gate_str = " | ".join(
+                [f"{periods[i]}:{_gates[i]:.3f}" for i in range(len(periods))]
+            )
+            logger.info(f"[诊断] 门控权重 -> {_gate_str}")
+
         # 5) 最终预测
-        _out = _base_model.classifier(_fused).squeeze(-1)
-        logger.info(f"[诊断] 最终输出 mean={_out.mean():.6f}, min={_out.min():.6f}, max={_out.max():.6f}")
+        _out = _base_model.classifier(_fused)
+        logger.info(f"[诊断] 最终输出 shape={_out.shape}, mean={_out.mean():.6f}, "
+                     f"min={_out.min():.6f}, max={_out.max():.6f}")
+        for _hi, _hn in enumerate(config.PREDICTION_HORIZONS):
+            logger.info(f"[诊断]   窗口[{_hn}m] mean={_out[:, _hi].mean():.4f}")
 
         # 6) 反向梯度诊断
     model.train()
     optimizer.zero_grad()
     _diag_out = model(_diag_tf, _diag_ctx)
-    _diag_loss = criterion(_diag_out, _diag_lbl[:len(_diag_out)] if _use_preconverted else _diag_lbl)
+    # 多标签: 截取匹配的batch维度
+    _diag_lbl_batch = (_diag_lbl[:len(_diag_out)] if _use_preconverted else _diag_lbl)
+    # 确保标签形状兼容(处理1D->2D广播)
+    if _diag_lbl_batch.dim() == 1 and _diag_out.dim() == 2:
+        pass  # BCELoss会自动广播
+    _diag_loss = criterion(_diag_out, _diag_lbl_batch)
     _diag_loss.backward()
     total_norm = sum(p.grad.norm().item()**2 for p in model.parameters() if p.grad is not None)**00.5
     logger.info(f"[诊断] 初始loss={_diag_loss.item():.6f}, 梯度L2范数={total_norm:.8f}")
@@ -320,6 +405,9 @@ def train_model():
         # --- 训练阶段 ---
         model.train()
         train_loss, train_correct, train_total = 0.0, 0, 0
+        # 各窗口分别统计准确率
+        _train_horizon_correct = [0] * _num_horizons
+        _train_horizon_total = [0] * _num_horizons
 
         for tf_seqs, ctx, labels in train_loader:
             if not _use_preconverted:
@@ -335,17 +423,25 @@ def train_model():
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            train_loss += loss.item() * labels.size(0)
+            batch_size = labels.size(0)
+            train_loss += loss.item() * batch_size
             preds = (outputs > 0.5).float()
             train_correct += (preds == labels).sum().item()
-            train_total += labels.size(0)
+            train_total += labels.numel()  # 总元素数(batch*num_horizons)
+            # 各窗口独立统计
+            for h in range(_num_horizons):
+                _train_horizon_correct[h] += (preds[:, h] == labels[:, h]).sum().item()
+                _train_horizon_total[h] += labels[:, h].size(0)
 
         train_loss /= train_total
         train_acc = train_correct / train_total
+        _train_acc_per_h = [_train_horizon_correct[h] / max(_train_horizon_total[h], 1) for h in range(_num_horizons)]
 
         # --- 验证阶段 ---
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
+        _val_horizon_correct = [0] * _num_horizons
+        _val_horizon_total = [0] * _num_horizons
 
         with torch.no_grad():
             for tf_seqs, ctx, labels in val_loader:
@@ -356,13 +452,19 @@ def train_model():
                 outputs = model(tf_seqs, ctx)
                 loss = criterion(outputs, labels)
 
-                val_loss += loss.item() * labels.size(0)
+                batch_size = labels.size(0)
+                val_loss += loss.item() * batch_size
                 preds = (outputs > 0.5).float()
                 val_correct += (preds == labels).sum().item()
-                val_total += labels.size(0)
+                val_total += labels.numel()
+                # 各窗口独立统计
+                for h in range(_num_horizons):
+                    _val_horizon_correct[h] += (preds[:, h] == labels[:, h]).sum().item()
+                    _val_horizon_total[h] += labels[:, h].size(0)
 
         val_loss /= val_total
         val_acc = val_correct / val_total
+        _val_acc_per_h = [_val_horizon_correct[h] / max(_val_horizon_total[h], 1) for h in range(_num_horizons)]
         scheduler.step(val_loss)
 
         elapsed = time.time() - t0
@@ -375,6 +477,11 @@ def train_model():
             f"LR: {current_lr:.6f} | {elapsed:.1f}s | "
             f"已用{(time.time()-train_start_time)/3600:.1f}h"
         )
+        # 各窗口训练/验证准确率
+        _h_train_str = " | ".join([f"{config.PREDICTION_HORIZONS[h]}m:{_train_acc_per_h[h]:.3f}" for h in range(_num_horizons)])
+        _h_val_str = " | ".join([f"{config.PREDICTION_HORIZONS[h]}m:{_val_acc_per_h[h]:.3f}" for h in range(_num_horizons)])
+        logger.info(f"  各窗口 TrainAcc -> {_h_train_str}")
+        logger.info(f"  各窗口 Val   Acc -> {_h_val_str}")
 
         # 保存最佳模型
         if val_loss < best_val_loss:
@@ -395,6 +502,8 @@ def train_model():
                     'hidden_size': config.HIDDEN_SIZE,
                     'num_layers': config.NUM_LAYERS,
                     'dropout': config.DROPOUT,
+                    'output_size': _num_horizons,
+                    'horizons': config.PREDICTION_HORIZONS,
                 },
             }, config.MODEL_PATH)
             logger.info(f"  -> 保存最佳模型(val_loss={val_loss:.4f})")
@@ -422,6 +531,8 @@ def train_model():
             'hidden_size': config.HIDDEN_SIZE,
             'num_layers': config.NUM_LAYERS,
             'dropout': config.DROPOUT,
+            'output_size': _num_horizons,
+            'horizons': config.PREDICTION_HORIZONS,
         },
     }, config.MODEL_PATH_FINAL)
     logger.info(f"保存最终模型(epoch={epoch}, val_loss={val_loss:.4f}) -> {config.MODEL_PATH_FINAL}")
@@ -479,6 +590,9 @@ def train_model():
 
     test_loss, test_correct, test_total = 0.0, 0, 0
     all_preds, all_labels = [], []
+    # 各窗口分别统计
+    _test_h_correct = [0] * _num_horizons
+    _test_h_total = [0] * _num_horizons
 
     with torch.no_grad():
         for tf_seqs, ctx, labels in test_loader:
@@ -489,10 +603,15 @@ def train_model():
             outputs = model(tf_seqs, ctx)
             loss = criterion(outputs, labels)
 
-            test_loss += loss.item() * labels.size(0)
+            batch_size = labels.size(0)
+            test_loss += loss.item() * batch_size
             preds = (outputs > 0.5).float()
             test_correct += (preds == labels).sum().item()
-            test_total += labels.size(0)
+            test_total += labels.numel()
+            # 各窗口统计
+            for h in range(_num_horizons):
+                _test_h_correct[h] += (preds[:, h] == labels[:, h]).sum().item()
+                _test_h_total[h] += labels[:, h].size(0)
             all_preds.extend(outputs.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
@@ -502,6 +621,7 @@ def train_model():
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
 
+    # 整体指标(所有窗口合并)
     tp = int(((all_preds > 0.5) & (all_labels == 1)).sum())
     fp = int(((all_preds > 0.5) & (all_labels == 0)).sum())
     tn = int(((all_preds <= 0.5) & (all_labels == 0)).sum())
@@ -514,10 +634,27 @@ def train_model():
     logger.info(f"测试集Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
     logger.info(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
     logger.info(f"混淆矩阵: TP={tp} FP={fp} TN={tn} FN={fn}")
+    # 各窗口独立指标
+    for h_idx, h_name in enumerate(config.PREDICTION_HORIZONS):
+        _h_acc = _test_h_correct[h_idx] / max(_test_h_total[h_idx], 1)
+        _h_pred = all_preds[:, h_idx]
+        _h_label = all_labels[:, h_idx]
+        _h_tp = int(((_h_pred > 0.5) & (_h_label == 1)).sum())
+        _h_fp = int(((_h_pred > 0.5) & (_h_label == 0)).sum())
+        _h_tn = int(((_h_pred <= 0.5) & (_h_label == 0)).sum())
+        _h_fn = int(((_h_pred <= 0.5) & (_h_label == 1)).sum())
+        _h_prec = _h_tp / (_h_tp + _h_fp) if (_h_tp + _h_fp) > 0 else 0
+        _h_rec = _h_tp / (_h_tp + _h_fn) if (_h_tp + _h_fn) > 0 else 0
+        logger.info(f"  [{h_name}min窗口] Acc:{_h_acc:.4f} Prec:{_h_prec:.4f} Rec:{_h_rec:.4f} "
+                     f"TP={_h_tp} FP={_h_fp} TN={_h_tn} FN={_h_fn}")
     logger.info(f"最佳模型来自Epoch {checkpoint['epoch']}")
 
     # 发送训练完成通知
     if notifier:
+        _horizon_results = {}
+        for h_idx, h_name in enumerate(config.PREDICTION_HORIZONS):
+            _h_acc = _test_h_correct[h_idx] / max(_test_h_total[h_idx], 1)
+            _horizon_results[f"{h_name}m"] = _h_acc
         notifier.send_training_complete(
             epoch=checkpoint['epoch'],
             val_loss=checkpoint['val_loss'],
@@ -525,7 +662,8 @@ def train_model():
             test_acc=test_acc,
             precision=precision,
             recall=recall,
-            f1=f1
+            f1=f1,
+            horizon_results=_horizon_results,
         )
 
     return model

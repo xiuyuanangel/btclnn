@@ -229,7 +229,8 @@ class MeoWNotifier:
 
     def send_training_complete(self, epoch: int, val_loss: float, val_acc: float,
                                test_acc: float = None, precision: float = None,
-                               recall: float = None, f1: float = None) -> bool:
+                               recall: float = None, f1: float = None,
+                               horizon_results: dict = None) -> bool:
         """
         发送训练完成通知
 
@@ -241,6 +242,7 @@ class MeoWNotifier:
             precision: 精确率（可选）
             recall: 召回率（可选）
             f1: F1分数（可选）
+            horizon_results: 各预测窗口的准确率字典 (可选), 如 {"10m": 0.65, "30m": 0.58}
         """
         title = "✅ 模型训练完成"
 
@@ -259,8 +261,14 @@ class MeoWNotifier:
         if f1 is not None:
             msg_lines.append(f"<b>F1分数:</b> {f1:.4f}")
 
+        # 各窗口准确率
+        if horizon_results:
+            h_str = " | ".join([f"{k}:{v*100:.1f}%" for k, v in horizon_results.items()])
+            msg_lines.append(f"<b>各窗口准确率:</b> {h_str}")
+
+        _height = 280 if horizon_results else 250
         msg = '<div style="font-size:40px;line-height:1.8">' + "<br>".join(msg_lines) + '</div>'
-        return self.send(title, msg, msg_type="html", html_height=250)
+        return self.send(title, msg, msg_type="html", html_height=_height)
 
     def send_training_error(self, error_msg: str) -> bool:
         """发送训练错误通知"""
@@ -276,9 +284,10 @@ class MeoWNotifier:
 
     def send_prediction_verify(self, direction: str, actual_direction: str,
                                 is_correct: bool, current_price: float,
-                                verify_price: float, price_change_pct: float) -> bool:
+                                verify_price: float, price_change_pct: float,
+                                horizon: int = None) -> bool:
         """
-        发送预测验证结果通知(10分钟后对比实际价格)
+        发送预测验证结果通知
 
         Args:
             direction: 预测方向
@@ -287,15 +296,18 @@ class MeoWNotifier:
             current_price: 预测时价格
             verify_price: 验证时价格
             price_change_pct: 价格变化百分比
+            horizon: 预测窗口(分钟), 可选
 
         Returns:
             bool: 是否发送成功
         """
         mark = "✅" if is_correct else "❌"
-        title = f"{mark} BTC预测验证 - {'正确' if is_correct else '错误'}"
+        h_label = f"[{horizon}min]" if horizon else ""
+        title = f"{mark} BTC预测验证{h_label} - {'正确' if is_correct else '错误'}"
 
         msg = (
             f'<div style="font-size:40px;line-height:1.8">'
+            f'<b>预测窗口:</b> {horizon or 10}分钟<br>'
             f'<b>预测方向:</b> {direction}<br>'
             f'<b>实际方向:</b> {actual_direction}<br>'
             f'<b>结果:</b> {"正确 ✅" if is_correct else "错误 ❌"}<br>'
@@ -305,6 +317,64 @@ class MeoWNotifier:
             f'<b>价格变化:</b> {price_change_pct:+.2f}%</div>'
         )
         return self.send(title, msg, msg_type="html", html_height=220)
+
+    def send_multi_horizon_prediction(self, time: str, price: float,
+                                       horizons_results: list) -> bool:
+        """
+        发送多窗口预测结果通知
+
+        Args:
+            time: 当前时间
+            price: 当前价格
+            horizons_results: 各窗口预测结果列表, 每项包含:
+                - horizon: 窗口(分钟)
+                - direction: 方向字符串
+                - probability: 上涨概率
+                - confidence: 置信度
+
+        Returns:
+            bool: 是否发送成功
+        """
+        # 根据最短窗口的概率确定整体表情
+        _primary_prob = horizons_results[0]['probability'] if horizons_results else 0.5
+        if _primary_prob > 0.7:
+            emoji = "🚀"
+            trend = "强烈看涨"
+        elif _primary_prob > 0.6:
+            emoji = "📈"
+            trend = "看涨"
+        elif _primary_prob > 0.5:
+            emoji = "↗️"
+            trend = "轻微看涨"
+        elif _primary_prob > 0.4:
+            emoji = "↘️"
+            trend = "轻微看跌"
+        elif _primary_prob > 0.3:
+            emoji = "📉"
+            trend = "看跌"
+        else:
+            emoji = "🔻"
+            trend = "强烈看跌"
+
+        title = f"{emoji} BTC多窗口预测 - {trend}"
+
+        lines = [
+            f'<b>时间:</b> {time}',
+            f'<b>当前价格:</b> {price:.2f} USDT',
+            '<br>',
+        ]
+        for r in horizons_results:
+            h = r['horizon']
+            lines.append(
+                f"<b>[{h:>3}min]</b> {r['direction']:<12} "
+                f"上涨:{r['probability']*100:.1f}% "
+                f"置信:{r['confidence']*100:.1f}%"
+            )
+
+        msg = '<div style="font-size:40px;line-height:1.8">' + "<br>".join(lines) + '</div>'
+        # 每个窗口约50px高度 + 头部信息
+        html_h = max(200, len(horizons_results) * 55 + 100)
+        return self.send(title, msg, msg_type="html", html_height=html_h)
 
 
 # 便捷函数，用于快速发送通知

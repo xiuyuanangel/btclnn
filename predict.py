@@ -1,6 +1,7 @@
-"""液态神经网络预测脚本 — 多周期融合版
+"""液态神经网络预测脚本 — 多周期多窗口融合版
 
-使用训练好的多周期融合模型，基于最新K线数据预测10分钟后涨跌。
+使用训练好的多周期融合模型，基于最新K线数据预测多个时间窗口后的涨跌。
+默认同时输出10分钟和30分钟后的涨跌概率。
 """
 
 import os
@@ -63,7 +64,7 @@ def normalize_with_stats(tf_seqs_raw, ctx_raw, norm_data):
 
 
 def load_model(device):
-    """加载训练好的多周期融合模型"""
+    """加载训练好的多周期融合模型(多标签版)"""
     if not os.path.exists(config.MODEL_PATH):
         raise FileNotFoundError(
             f"模型文件不存在: {config.MODEL_PATH}\n"
@@ -73,12 +74,17 @@ def load_model(device):
     checkpoint = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
     model_cfg = checkpoint['config']
 
+    # 从checkpoint或config获取输出维度
+    _output_size = model_cfg.get('output_size', len(getattr(config, 'PREDICTION_HORIZONS', [10])))
+    _horizons = model_cfg.get('horizons', getattr(config, 'PREDICTION_HORIZONS', [10]))
+
     model = MultiTimeframeLNN(
         timeframe_configs=model_cfg['timeframe_configs'],
         context_feature_size=model_cfg['context_feature_size'],
         hidden_size=model_cfg.get('hidden_size', config.HIDDEN_SIZE),
         num_layers=model_cfg.get('num_layers', config.NUM_LAYERS),
         dropout=model_cfg.get('dropout', config.DROPOUT),
+        output_size=_output_size,
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -86,9 +92,10 @@ def load_model(device):
 
     logger.info(
         f"模型加载成功 (Epoch {checkpoint['epoch']}, "
-        f"Val Loss: {checkpoint['val_loss']:.4f})"
+        f"Val Loss: {checkpoint['val_loss']:.4f}, "
+        f"输出维度: {_output_size} 窗口={_horizons})"
     )
-    return model
+    return model, _horizons
 
 
 def prepare_multi_tf_features(timeframe_data):
@@ -146,7 +153,7 @@ def prepare_multi_tf_features(timeframe_data):
 
 
 def predict():
-    """执行预测: 基于多周期数据判断10分钟后涨跌"""
+    """执行预测: 基于多周期数据判断多个时间窗口后的涨跌"""
     # 检测CUDA兼容性(同train.py)
     _use_cuda = False
     if torch.cuda.is_available():
@@ -159,8 +166,9 @@ def predict():
     device = torch.device("cuda" if _use_cuda else "cpu")
     logger.info(f"使用设备: {device}")
 
-    # 1. 加载模型
-    model = load_model(device)
+    # 1. 加载模型(返回模型和窗口列表)
+    model, horizons = load_model(device)
+    num_horizons = len(horizons)
 
     # 2. 加载标准化参数(必须与训练时一致)
     norm_data = load_norm_stats()
@@ -185,134 +193,177 @@ def predict():
     ctx_tensor = torch.from_numpy(ctx_norm.copy()).float().to(device)
 
     with torch.no_grad():
-        probability = model(tf_seqs_tensor, ctx_tensor).item()
+        probabilities = model(tf_seqs_tensor, ctx_tensor)  # (1, num_horizons)
+        probabilities = probabilities.cpu().numpy()[0]     # (num_horizons,)
 
-    # 5. 输出结果
-    direction = "涨 (UP)" if probability > 0.5 else "跌 (DOWN)"
-    confidence = abs(probability - 0.5) * 2
-
+    # 7. 输出结果
     current_price = df_featured['close'].iloc[-1]
-    # 记录实际预测时刻(系统时间), 而非K线起始时间(id)
     prediction_time = pd.Timestamp.now()
-    # K线时间仅作参考(显示的是最新一根K线的起始时间)
     latest_kline_time = df_featured.index[-1]
+
+    # 构建各窗口预测结果
+    results = []
+    print()
+    print("=" * 60)
+    print(f"  多周期融合 LNN 预测结果 (多窗口)")
+    print("=" * 60)
+    print(f"  融合周期:   {', '.join(config.TIMEFRAMES.keys())}")
+    print(f"  预测时间:   {prediction_time}")
+    print(f"  当前价格:   {current_price:.2f} USDT")
+    print("-" * 60)
+
+    for i, h in enumerate(horizons):
+        prob = float(probabilities[i])
+        direction = "涨 (UP)" if prob > 0.5 else "跌 (DOWN)"
+        confidence = abs(prob - 0.5) * 2
+
+        result = {
+            'horizon': h,
+            'direction': direction,
+            'probability': prob,
+            'confidence': confidence,
+        }
+        results.append(result)
+
+        print(f"  [{h:>3}分钟] 方向: {direction:<12} "
+              f"上涨概率: {prob:.4f} ({prob*100:.2f}%)  "
+              f"置信度: {confidence:.4f} ({confidence*100:.2f}%)")
+
+    print("=" * 60)
+    print()
 
     # 发送通知推送
     if config.MEOW_NICKNAME:
         try:
             notifier = MeoWNotifier(config.MEOW_NICKNAME)
-            notifier.send_prediction(
+            notifier.send_multi_horizon_prediction(
                 time=str(prediction_time),
                 price=float(current_price),
-                direction=direction,
-                probability=probability,
-                confidence=confidence
+                horizons_results=results,
             )
         except Exception as e:
             logger.warning(f"通知推送失败: {e}")
 
-    print()
-    print("=" * 50)
-    print(f"  多周期融合 LNN 预测结果")
-    print("=" * 50)
-    print(f"  融合周期:   {', '.join(config.TIMEFRAMES.keys())}")
-    print(f"  预测时间:   {prediction_time}")
-    print(f"  当前价格:   {current_price:.2f} USDT")
-    print(f"  预测方向:   {direction}")
-    print(f"  上涨概率:   {probability:.4f} ({probability * 100:.2f}%)")
-    print(f"  置信度:     {confidence:.4f} ({confidence * 100:.2f}%)")
-    print(f"  预测窗口:   未来10分钟")
-    print("=" * 50)
-    print()
+    # 8. 分阶段验证各窗口预测
+    verify_results = {}
+    sorted_horizons = sorted(horizons)  # 按时间从小到大排序
 
-    # 6. 等待10分钟验证预测结果
-    logger.info("等待10分钟获取最新价格验证预测...")
-    wait_seconds = 600
-    # 对齐到下一个整10分钟边界(减少等待时间)
-    now = pd.Timestamp.now()
-    next_10min = now.floor('10min') + pd.Timedelta(minutes=10)
-    wait = max((next_10min - now).total_seconds(), 60)
-    if wait < wait_seconds:
-        logger.info(f"对齐到 {next_10min}, 等待 {wait:.0f}s")
-        time.sleep(wait)
-    else:
-        time.sleep(wait_seconds)
+    for h in sorted_horizons:
+        # 找到对应的result
+        h_result = next(r for r in results if r['horizon'] == h)
+        h_prob = h_result['probability']
+        h_direction = h_result['direction']
 
-    # 获取验证数据(强制刷新缓存, 使用10min聚合数据与训练标签对齐)
-    try:
-        # 强制刷新缓存, 确保获取到最新K线数据
-        verify_data = fetcher.fetch_multi_timeframe(force_refresh=True)
+        wait_seconds = h * 60  # 等待h分钟
 
-        # 用5min聚合为10min, 与训练时的标签定义一致
-        verify_10min = fetcher.resample_to_10min(verify_data['5min'])
-        verify_df = fetcher.get_dataframe(verify_10min)
+        logger.info(f"等待{h}分钟验证{h}min窗口的预测...")
+        now = pd.Timestamp.now()
 
-        if verify_df.empty:
-            logger.warning("验证阶段: 10min聚合数据为空")
-            raise ValueError("empty 10min data")
+        # 对齐到下一个整h分钟边界
+        # 例如h=10对齐到下一个10min边界, h=30对齐到下一个30min边界
+        if h <= 30:
+            align_floor = f'{h}min'
+        else:
+            align_floor = '1h'
+        next_boundary = now.floor(align_floor) + pd.Timedelta(minutes=h)
+        wait = max((next_boundary - now).total_seconds(), 30)
+        if wait < wait_seconds:
+            logger.info(f"对齐到 {next_boundary}, 等待 {wait:.0f}s")
+            time.sleep(wait)
+        else:
+            time.sleep(wait_seconds)
 
-        verify_price = verify_df['close'].iloc[-1]
-        verify_time = pd.Timestamp.now()  # 验证时刻的实际系统时间
+        try:
+            # 强制刷新缓存获取最新K线数据
+            verify_data = fetcher.fetch_multi_timeframe(force_refresh=True)
 
-        actual_direction = "涨 (UP)" if verify_price > current_price else "跌 (DOWN)"
-        is_correct = (probability > 0.5) == (verify_price > current_price)
-        price_change = (verify_price - float(current_price)) / float(current_price) * 100
+            # 用5min聚合为对应粒度的数据进行验证
+            if h % 5 == 0:
+                shift_bars = h // 5
+                verify_df = fetcher.get_dataframe(verify_data['5min'])
+            elif h % 10 == 0:
+                verify_10min = fetcher.resample_to_10min(verify_data['5min'])
+                verify_df = fetcher.get_dataframe(verify_10min)
+                shift_bars = h // 10
+            else:
+                verify_5min = fetcher.get_dataframe(verify_data['5min'])
+                verify_df = verify_5min
+                shift_bars = h // 5
 
-        result_mark = "✅ 正确" if is_correct else "❌ 错误"
-        print("-" * 50)
-        print(f"  📊 预测验证结果 [{result_mark}]")
-        print("-" * 50)
-        print(f"  预测时间:   {prediction_time} | 价格: {current_price:.2f} USDT")
-        print(f"  验证时间:   {verify_time} | 价格: {verify_price:.2f} USDT")
-        print(f"  预测方向:   {direction}")
-        print(f"  实际方向:   {actual_direction}")
-        print(f"  价格变化:   {price_change:+.2f}%")
-        print("=" * 50)
-        print()
+            if verify_df.empty or len(verify_df) < shift_bars + 1:
+                logger.warning(f"验证阶段({h}m): 数据不足, 跳过")
+                verify_results[h] = {'verified': False, 'reason': 'data_insufficient'}
+                continue
 
-        logger.info(
-            f"预测验证: {'正确' if is_correct else '错误'}, "
-            f"预测{direction}, 实际{actual_direction}, 变化{price_change:+.2f}%"
-        )
+            # 用shift后的价格作为验证价格
+            verify_price_idx = min(shift_bars, len(verify_df) - 1)
+            verify_price = verify_df['close'].iloc[-1]
+            # 取shift_bars前的当前价格进行对比
+            base_price_for_verify = verify_df['close'].iloc[-(shift_bars + 1)] if len(verify_df) > shift_bars else current_price
 
-        # 推送验证结果通知
-        if config.MEOW_NICKNAME:
-            try:
-                notifier = MeoWNotifier(config.MEOW_NICKNAME)
-                notifier.send_prediction_verify(
-                    direction=direction,
-                    actual_direction=actual_direction,
-                    is_correct=is_correct,
-                    current_price=float(current_price),
-                    verify_price=float(verify_price),
-                    price_change_pct=price_change,
-                )
-            except Exception as e:
-                logger.warning(f"验证通知推送失败: {e}")
+            verify_time = pd.Timestamp.now()
 
-        return {
-            'time': str(prediction_time),
-            'price': float(current_price),
-            'direction': direction,
-            'probability': probability,
-            'confidence': confidence,
-            'verified': True,
-            'is_correct': is_correct,
-            'verify_time': str(verify_time),
-            'verify_price': float(verify_price),
-            'price_change_pct': price_change,
-        }
-    except Exception as e:
-        logger.warning(f"验证阶段获取数据失败: {e}")
-        print("⚠️  无法获取验证数据，跳过预测验证")
-        return {
-            'time': str(prediction_time),
-            'price': float(current_price),
-            'direction': direction,
-            'probability': probability,
-            'confidence': confidence,
-            'verified': False,
-        }
+            actual_direction = "涨 (UP)" if verify_price > base_price_for_verify else "跌 (DOWN)"
+            is_correct = (h_prob > 0.5) == (verify_price > base_price_for_verify)
+            price_change = (verify_price - float(base_price_for_verify)) / float(base_price_for_verify) * 100
+
+            result_mark = "✅ 正确" if is_correct else "❌ 错误"
+            print("-" * 50)
+            print(f"  📊 [{h}分钟窗口] 预测验证结果 [{result_mark}]")
+            print("-" * 50)
+            print(f"  预测时间:   {prediction_time} | 价格: {current_price:.2f}")
+            print(f"  验证时间:   {verify_time} | 价格: {verify_price:.2f}")
+            print(f"  预测方向:   {h_direction}")
+            print(f"  实际方向:   {actual_direction}")
+            print(f"  价格变化:   {price_change:+.2f}%")
+            print("=" * 50)
+            print()
+
+            logger.info(
+                f"[{h}m验证] {'正确' if is_correct else '错误'}, "
+                f"预测{h_direction}, 实际{actual_direction}, 变化{price_change:+.2f}%"
+            )
+
+            verify_results[h] = {
+                'verified': True,
+                'is_correct': is_correct,
+                'verify_time': str(verify_time),
+                'verify_price': float(verify_price),
+                'base_price': float(base_price_for_verify),
+                'price_change_pct': price_change,
+                'actual_direction': actual_direction,
+            }
+
+            # 推送验证结果通知
+            if config.MEOW_NICKNAME:
+                try:
+                    notifier = MeoWNotifier(config.MEOW_NICKNAME)
+                    notifier.send_prediction_verify(
+                        direction=h_direction,
+                        actual_direction=actual_direction,
+                        is_correct=is_correct,
+                        current_price=float(current_price),
+                        verify_price=float(verify_price),
+                        price_change_pct=price_change,
+                        horizon=h,
+                    )
+                except Exception as e:
+                    logger.warning(f"{h}m验证通知推送失败: {e}")
+
+        except Exception as e:
+            logger.warning(f"验证阶段({h}m)获取数据失败: {e}")
+            print(f"⚠️  [{h}分钟窗口] 无法获取验证数据，跳过预测验证")
+            verify_results[h] = {'verified': False, 'reason': str(e)}
+
+    # 9. 汇总返回所有结果
+    final_result = {
+        'time': str(prediction_time),
+        'price': float(current_price),
+        'horizons': [r['horizon'] for r in results],
+        'predictions': results,
+        'verifications': verify_results,
+    }
+    return final_result
 
 
 if __name__ == "__main__":
