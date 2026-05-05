@@ -41,7 +41,7 @@ WEIGHT_DECAY = 1e-4         # L2正则化(新增, 进一步抑制过拟合)
 BATCH_SIZE = 1024           # 批处理大小
 EPOCHS = 99999               # 训练轮数(上限, 实际由 MAX_TRAIN_SECONDS 控制)
 MAX_TRAIN_SECONDS = 17640   # 最大训练时长(秒), 默认4.8小时(预留余量给测试+上传)
-PATIENCE = 150               # 早停耐心值(更快截断过拟合)
+PATIENCE = 140               # 早停耐心值(更快截断过拟合)
 
 # ==================== 数据存储路径 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
