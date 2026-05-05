@@ -482,13 +482,11 @@ def normalize_datasets(train_data, val_data, test_data):
     _ctx_std = ctx_tr.std(axis=0) + 1e-8
     _norm_stats['context'] = {'mean': _ctx_mean, 'std': _ctx_std}
 
-    # 训练集上下文
-    train_data[1] = (ctx_tr - _ctx_mean) / _ctx_std
-    logger.info(f"  context train 标准化后: mean={train_data[1].mean():.4f}, std={train_data[1].std():.4f}")
-
-    # 验证集 & 测试集上下文
-    for data_tuple in [val_data, test_data]:
-        data_tuple[1] = (data_tuple[1] - _ctx_mean) / _ctx_std
+    # 标准化上下文特征
+    ctx_tr = (ctx_tr - _ctx_mean) / _ctx_std
+    ctx_val = (val_data[1] - _ctx_mean) / _ctx_std
+    ctx_test = (test_data[1] - _ctx_mean) / _ctx_std
+    logger.info(f"  context train 标准化后: mean={ctx_tr.mean():.4f}, std={ctx_tr.std():.4f}")
 
     # 保存标准化参数(供预测时复用)
     _norm_path = os.path.join(config.CHECKPOINT_DIR, 'feature_norm_stats.pkl')
@@ -496,7 +494,11 @@ def normalize_datasets(train_data, val_data, test_data):
         pickle.dump({'periods': periods, 'stats': _norm_stats}, f)
     logger.info(f"标准化统计量已保存 -> {_norm_path}")
 
-    return train_data, val_data, test_data
+    return (
+        (X_tr, ctx_tr, y_tr),
+        (val_data[0], ctx_val, val_data[2]),
+        (test_data[0], ctx_test, test_data[2]),
+    )
 
 
 def split_multi_tf_dataset(X_dict, X_ctx, y, train_ratio=None, val_ratio=None):
