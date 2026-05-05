@@ -16,6 +16,9 @@ VAL_RATIO = 0.15            # 验证集比例
 PREDICTION_HORIZONS = [10, 30]
 # 标签来源: 用5min粒度的close计算各horizon后的价格变化
 LABEL_SOURCE_PERIOD = "5min"  # 标签基于该周期的K线数据计算
+LABEL_SMOOTH_WINDOW = 3       # 未来价格平滑窗口(单位: bar)
+LABEL_MIN_RETURN = 0.0008     # 5min 标签最小收益门限(0.08%)
+LABEL_DROP_NEUTRAL = True     # 是否丢弃噪声中性样本
 
 # ==================== 多周期配置 ====================
 # 每个周期独立编码, 覆盖微观到宏观的不同时间尺度

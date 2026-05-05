@@ -65,6 +65,8 @@ def compute_rsi(df, windows=(6, 36, 144)):
 def compute_labels(df, horizons=None, source_period_minutes=5):
     """计算多周期标签: 各预测时间窗口后是否上涨
 
+    使用未来平滑价格和最小收益门限降低噪声，并可丢弃中性样本。
+
     Args:
         df: K线DataFrame(需包含close列)
         horizons: 预测时间窗口列表(分钟), 默认从config读取
@@ -73,11 +75,40 @@ def compute_labels(df, horizons=None, source_period_minutes=5):
     if horizons is None:
         horizons = config.PREDICTION_HORIZONS
 
+    smooth_window = getattr(config, 'LABEL_SMOOTH_WINDOW', 1)
+    min_return = getattr(config, 'LABEL_MIN_RETURN', 0.0)
+    drop_neutral = getattr(config, 'LABEL_DROP_NEUTRAL', False)
+
     for h in horizons:
         shift_steps = h // source_period_minutes
+        future_close = df['close'].shift(-shift_steps)
+        if smooth_window > 1:
+            # 对未来价格做平滑，减少单根K线噪声
+            future_close = future_close.rolling(window=smooth_window, min_periods=1).mean()
+            future_close = future_close.shift(-(smooth_window - 1))
+
+        future_return = future_close / df['close'] - 1.0
         col_name = f'label_{h}m'
-        df[col_name] = (df['close'].shift(-shift_steps) > df['close']).astype(int)
+        label = pd.Series(np.nan, index=df.index)
+        label[future_return > min_return] = 1
+        label[future_return < -min_return] = 0
+
+        if drop_neutral:
+            df[col_name] = label
+        else:
+            # 保留中性样本为0/1二值标签，仍可训练但噪声较大
+            df[col_name] = label.fillna(0).astype(int)
     return df
+
+
+def normalize_sequence_samplewise(tf_seqs):
+    """对每个样本序列进行内部归一化，强调相对结构而非绝对量级。"""
+    normalized = {}
+    for period, seqs in tf_seqs.items():
+        mean = seqs.mean(axis=1, keepdims=True)
+        std = seqs.std(axis=1, keepdims=True)
+        normalized[period] = (seqs - mean) / (std + 1e-8)
+    return normalized
 
 
 # 序列特征列名(混合方案: 原始OHLCV + 单期收益率, 每个时间步5个特征, 所有周期共享)
@@ -371,6 +402,9 @@ def build_multi_tf_dataset(tf_dfs, target_df, label_source_df=None):
         )
         all_sequences[period] = sequences
         all_valid_masks[period] = valid_mask
+
+    # 4.5 每个样本序列级别归一化，强调同一序列内部结构关系
+    all_sequences = normalize_sequence_samplewise(all_sequences)
 
     # 5. 取所有周期有效对齐的交集(只保留所有周期都有真实数据的样本)
     global_valid = np.ones(len(target_timestamps), dtype=bool)

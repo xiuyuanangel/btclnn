@@ -185,7 +185,9 @@ def predict():
         logger.error(str(e))
         return None
 
-    # 5. 应用与训练一致的Z-Score标准化
+    # 5. 应用序列级别归一化 + 与训练一致的Z-Score标准化
+    from features import normalize_sequence_samplewise
+    tf_seqs_raw = normalize_sequence_samplewise(tf_seqs_raw)
     tf_seqs_norm, ctx_norm = normalize_with_stats(tf_seqs_raw, ctx_raw, norm_data)
 
     # 6. 模型推理
