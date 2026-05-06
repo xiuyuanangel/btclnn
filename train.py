@@ -101,7 +101,10 @@ def train_model():
     logger.info("步骤 2: 多周期特征工程与数据集构建")
     logger.info("=" * 60)
 
-    X_dict, X_ctx, y = build_multi_tf_dataset(tf_dfs, target_df, label_source_df=label_source_df)
+    X_dict, X_ctx, y = build_multi_tf_dataset(
+        tf_dfs, target_df, label_source_df=label_source_df,
+        export_debug_csv=getattr(config, 'DEBUG_EXPORT_CSV', False),
+    )
 
     # 多标签维度
     _num_horizons = len(config.PREDICTION_HORIZONS)
@@ -323,9 +326,9 @@ def train_model():
                                               torch.ones_like(target))
                 return (bce * focal * sample_weights).mean()
 
-        criterion = WeightedFocalLoss(_pos_weights, gamma=2.0)
+        criterion = WeightedFocalLoss(_pos_weights, gamma=0.5)
         if fold_idx == 0:
-            logger.info(f"使用 WeightedFocalLoss(gamma=2.0), 各窗口pos_weight={_pos_weights}")
+            logger.info(f"使用 WeightedFocalLoss(gamma=0.5), 各窗口pos_weight={_pos_weights}")
 
         # ---- CV 各折训练循环 ----
         _max_epochs = config.EPOCHS

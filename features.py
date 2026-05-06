@@ -299,7 +299,8 @@ class PreConvertedTensorDataset(Dataset):
         return tf_seqs, ctx, label
 
 
-def build_multi_tf_dataset(tf_dfs, target_df, label_source_df=None):
+def build_multi_tf_dataset(tf_dfs, target_df, label_source_df=None,
+                          export_debug_csv=False):
     """构建多周期融合数据集(多标签版)
 
     对每个目标预测时间点(10min粒度), 从各周期提取对应时间窗口的序列特征。
@@ -310,6 +311,7 @@ def build_multi_tf_dataset(tf_dfs, target_df, label_source_df=None):
         tf_dfs: dict of {period: DataFrame} 各周期的原始K线DataFrame
         target_df: DataFrame 目标K线数据(含DatetimeIndex和OHLCV, 用于确定样本时间轴)
         label_source_df: DataFrame 标签来源的细粒度K线数据(默认用target_df)
+        export_debug_csv: 是否导出样本CSV供人工核验
 
     Returns:
         X_dict: dict of {period: np.array (N, seq_len, feature_size)}
@@ -433,7 +435,98 @@ def build_multi_tf_dataset(tf_dfs, target_df, label_source_df=None):
                          f"跌={(len(y)-y[:, i].sum()):.0f} ({1-up_ratio:.2%})")
     logger.info(f"多周期数据集: {len(y)} 个有效样本, {len(horizons)} 个预测窗口 (原始数据)")
 
+    # 导出调试CSV(仅需少量样本, 不影响训练性能)
+    if export_debug_csv:
+        _csv_path = os.path.join(config.BASE_DIR, 'data', 'dataset_debug.csv')
+        export_dataset_debug_csv(
+            X_dict, X_ctx, y,
+            target_df_with_id=target_df,
+            tf_dfs_raw=tf_dfs,
+            global_valid_mask=global_valid,
+            output_path=_csv_path,
+            num_samples=30,
+        )
+
     return X_dict, X_ctx, y
+
+
+def export_dataset_debug_csv(X_dict, X_ctx, y, target_df_with_id, tf_dfs_raw,
+                             global_valid_mask, output_path, num_samples=30):
+    """导出少量数据集样本到CSV，供人工核验多周期对齐是否正确
+
+    每行对应一个样本，包含：
+      - target_datetime: 样本时间点(10min粒度)
+      - 各周期的窗口时间范围
+      - 各周期的窗口两端收盘价(原始价格)
+      - 上下文特征
+      - 标签值
+
+    Args:
+        X_dict: build_multi_tf_dataset 的输出
+        X_ctx: 同上
+        y: 同上
+        target_df_with_id: 包含'id'列的target DataFrame
+        tf_dfs_raw: {period: DataFrame} 原始K线数据(含id/close列)
+        global_valid_mask: np.array(bool) 有效样本掩码
+        output_path: csv保存路径
+        num_samples: 导出的样本数
+    """
+    periods = list(config.TIMEFRAMES.keys())
+    seq_lengths = {p: cfg['seq_length'] for p, cfg in config.TIMEFRAMES.items()}
+    horizons = config.PREDICTION_HORIZONS
+    target_ts = target_df_with_id['id'].values.astype(np.int64)
+    target_dt = pd.to_datetime(target_ts, unit='s')
+
+    # 有效样本对应的目标时间戳和原始价格
+    valid_ts = target_ts[global_valid_mask]
+
+    n = min(num_samples, len(y))
+    logger.info(f"导出 {n} 条数据样本到 {output_path}")
+
+    rows = []
+    for i in range(n):
+        row = {
+            'sample_idx': i,
+            'target_datetime': pd.to_datetime(valid_ts[i], unit='s'),
+            'target_timestamp': valid_ts[i],
+        }
+
+        # 各周期的窗口信息
+        for period in periods:
+            seq_len = seq_lengths[period]
+            # 查找target时刻在该周期中最接近的历史bar索引
+            tf_ts_raw = tf_dfs_raw[period]['id'].values.astype(np.int64)
+            idx = np.searchsorted(tf_ts_raw, valid_ts[i], side='right') - 1
+            if idx >= seq_len - 1:
+                win_start_ts = tf_ts_raw[idx - seq_len + 1]
+                win_end_ts = tf_ts_raw[idx]
+                win_start_close = tf_dfs_raw[period].iloc[idx - seq_len + 1]['close']
+                win_end_close = tf_dfs_raw[period].iloc[idx]['close']
+                row[f'{period}_window_start'] = pd.to_datetime(win_start_ts, unit='s')
+                row[f'{period}_window_end'] = pd.to_datetime(win_end_ts, unit='s')
+                row[f'{period}_bars'] = seq_len
+                row[f'{period}_close_first'] = round(win_start_close, 1)
+                row[f'{period}_close_last'] = round(win_end_close, 1)
+            else:
+                row[f'{period}_window_start'] = 'INSUFFICIENT_DATA'
+                row[f'{period}_window_end'] = ''
+                row[f'{period}_bars'] = 0
+                row[f'{period}_close_first'] = ''
+                row[f'{period}_close_last'] = ''
+
+        # 上下文特征
+        for j, col in enumerate(CONTEXT_FEATURE_COLS):
+            row[f'ctx_{col}'] = round(X_ctx[i, j], 6)
+
+        # 标签
+        for j, h in enumerate(horizons):
+            row[f'label_{h}m'] = int(y[i, j])
+
+        rows.append(row)
+
+    df_out = pd.DataFrame(rows)
+    df_out.to_csv(output_path, index=False)
+    logger.info(f"CSV已保存: {output_path} ({n}行)")
 
 
 def normalize_datasets(train_data, val_data, test_data):

@@ -82,3 +82,6 @@ API_REQUEST_INTERVAL = 0.5  # API请求间隔(秒)，避免触发限频
 # MeoW消息推送配置 (https://www.chuckfang.com/MeoW/api_doc.html)
 MEOW_NICKNAME = "修远啊"  # 设置你的MeoW昵称，为空字符串时不发送通知
 MEOW_BASE_URL = "https://api.chuckfang.com"  # API基础地址
+
+# ==================== 调试配置 ====================
+DEBUG_EXPORT_CSV = False     # 是否导出数据集样本到CSV供人工核验
