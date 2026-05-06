@@ -28,13 +28,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _strip_module_prefix(state_dict):
+    """移除state_dict中因DataParallel产生的 'module.' 前缀
+
+    Kaggle双T4训练时模型被 DataParallel 包裹, 参数key带 module. 前缀。
+    GitHub Actions单CPU/GPU加载时模型无此前缀, 需要适配。
+    """
+    has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
+    if not has_module_prefix:
+        return state_dict
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_key = k[len('module.'):] if k.startswith('module.') else k
+        new_state_dict[new_key] = v
+    logger.info(f"检测到DataParallel前缀(module.), 已自动移除 ({len(state_dict)} keys)")
+    return new_state_dict
+
+
 def _load_best_fallback(model, device):
     """从best模型加载权重作为初始化的降级方案"""
     try:
         best_ckpt = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
         ckpt_config = best_ckpt.get('config', {})
         if 'timeframe_configs' in ckpt_config:
-            model.load_state_dict(best_ckpt['model_state_dict'])
+            model.load_state_dict(_strip_module_prefix(best_ckpt['model_state_dict']))
             logger.info("从最佳模型加载权重作为初始化")
         else:
             logger.info("检测到旧架构checkpoint，从头训练新模型")
@@ -246,7 +263,7 @@ def train_model():
                                     _rel_ckpt = torch.load(_release_path, map_location=device, weights_only=False)
                                     _rel_cfg = _rel_ckpt.get('config', {})
                                     if _rel_cfg.get('timeframe_configs'):
-                                        model.load_state_dict(_rel_ckpt['model_state_dict'])
+                                        model.load_state_dict(_strip_module_prefix(_rel_ckpt['model_state_dict']))
                                         logger.info(f"Release模型权重已加载 (val_loss={_rel_ckpt.get('val_loss', 'N/A')})")
                                     else:
                                         logger.info("Release模型架构不匹配，从头训练")
@@ -480,7 +497,7 @@ def train_model():
         _best_ckpt = torch.load(_best_across_folds['model_path'], map_location=device, weights_only=False)
     else:
         _best_ckpt = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
-    model.load_state_dict(_best_ckpt['model_state_dict'])
+    model.load_state_dict(_strip_module_prefix(_best_ckpt['model_state_dict']))
     model.eval()
 
     test_loss, test_correct, test_total = 0.0, 0, 0
