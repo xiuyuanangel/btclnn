@@ -6,6 +6,8 @@
 - 标签: 多周期涨跌预测(10分钟/30分钟后的涨跌)
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 import logging
