@@ -9,6 +9,13 @@ on:
       - '*.py'
       - 'requirements.txt'
       - '.github/workflows/train.yml'
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: 'Number of epochs'
+        required: false
+        default: '50'
+        type: string
 
 permissions:
   contents: write

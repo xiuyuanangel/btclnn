@@ -526,6 +526,78 @@ def split_multi_tf_dataset(X_dict, X_ctx, y, train_ratio=None, val_ratio=None):
     )
 
 
+def rolling_cv_split(X_dict, X_ctx, y, n_folds=None, val_ratio=None, test_ratio=None):
+    """滚动时间窗口交叉验证切分 (Expanding Window)
+
+    每折使用从历史起点到折分割点的数据训练, 在紧接的验证窗口上评估。
+    始终保留最后一段作为独立测试集(不参与折内训练)。
+
+    折布局示例 (n_folds=3, val_ratio=0.10, test_ratio=0.05):
+        Fold 1: Train [0:65%]  | Val [65%:75%]   |  (未使用)        | (test)
+        Fold 2: Train [0:75%]  | Val [75%:85%]   |  (未使用)        | (test)
+        Fold 3: Train [0:85%]  | Val [85%:95%]   |  (未使用)        | (test)
+        Test:   (所有折均未使用的最后 5%) ➜ [95%:100%]
+
+    Args:
+        X_dict: dict of {period: np.array (N, seq_len, feat_size)}
+        X_ctx: np.array (N, ctx_size)
+        y: np.array (N, num_horizons)
+        n_folds: 折数
+        val_ratio: 每折验证集占总数比例
+        test_ratio: 保留的独立测试集比例
+
+    Returns:
+        folds: list of [fold_idx, ...], 每项为:
+            (train_data, val_data) 元组, 格式同 split_multi_tf_dataset
+        test_data: 独立测试集元组 (X_dict_test, X_ctx_test, y_test)
+    """
+    n_folds = n_folds or config.CV_N_FOLDS
+    val_ratio = val_ratio or config.CV_VAL_RATIO
+    test_ratio = test_ratio or config.CV_TEST_RATIO
+
+    n = len(y)
+    test_start = int(n * (1.0 - test_ratio))
+
+    # 独立测试集 (最后 test_ratio 部分)
+    test_data = (
+        {p: X_dict[p][test_start:] for p in X_dict},
+        X_ctx[test_start:],
+        y[test_start:],
+    )
+
+    # 剩余数据用于 CV 各折
+    cv_n = test_start
+    fold_val_size = int(cv_n * val_ratio)
+
+    folds = []
+    for fold_idx in range(n_folds):
+        # 第 k 折: train_end 逐渐右移, val 窗口紧随其后
+        val_end_fraction = 1.0 - (n_folds - fold_idx) * val_ratio
+        val_start_fraction = val_end_fraction - val_ratio
+        train_end = int(cv_n * val_start_fraction)
+        val_start = train_end
+        val_end = int(cv_n * val_end_fraction)
+
+        train_data = (
+            {p: X_dict[p][:train_end] for p in X_dict},
+            X_ctx[:train_end],
+            y[:train_end],
+        )
+        val_data_part = (
+            {p: X_dict[p][val_start:val_end] for p in X_dict},
+            X_ctx[val_start:val_end],
+            y[val_start:val_end],
+        )
+        folds.append((train_data, val_data_part))
+
+        logger.info(f"  CV Fold {fold_idx+1}/{n_folds}: "
+                     f"Train [0:{train_end}] ({train_end}条), "
+                     f"Val [{val_start}:{val_end}] ({val_end-val_start}条)")
+
+    logger.info(f"  CV 测试集: [{test_start}:{n}] ({n-test_start}条, 独立保留)")
+    return folds, test_data
+
+
 # ==================== 兼容旧接口 ====================
 def build_dataset(df, seq_length=None):
     """单周期数据集构建(兼容旧接口, 多标签版)"""
