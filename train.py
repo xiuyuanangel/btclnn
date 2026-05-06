@@ -215,6 +215,49 @@ def train_model():
             output_size=_num_horizons,
         ).to(device)
 
+        # 从GitHub Release下载最新模型作为初始化(仅第0折/非CV模式)
+        if fold_idx == 0 or not _use_cv:
+            gh_token = os.environ.get('GH_TOKEN')
+            if gh_token:
+                try:
+                    import subprocess, json as _json
+                    result = subprocess.run(
+                        ['gh', 'release', 'view', '--json', 'tagName'],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    if result.returncode == 0:
+                        tag = _json.loads(result.stdout).get('tagName')
+                        logger.info(f"检测到最新Release: {tag}, 正在下载模型...")
+                        dl = subprocess.run(
+                            ['gh', 'release', 'download', tag,
+                             '--pattern', '*.pth', '--dir', 'checkpoints/',
+                             '--clobber'],
+                            capture_output=True, text=True, timeout=120,
+                        )
+                        if dl.returncode == 0:
+                            logger.info("Release模型下载成功")
+                            # 尝试加载到模型
+                            _release_path = config.MODEL_PATH
+                            if os.path.exists(_release_path):
+                                try:
+                                    _rel_ckpt = torch.load(_release_path, map_location=device, weights_only=False)
+                                    _rel_cfg = _rel_ckpt.get('config', {})
+                                    if _rel_cfg.get('timeframe_configs'):
+                                        model.load_state_dict(_rel_ckpt['model_state_dict'])
+                                        logger.info(f"Release模型权重已加载 (val_loss={_rel_ckpt.get('val_loss', 'N/A')})")
+                                    else:
+                                        logger.info("Release模型架构不匹配，从头训练")
+                                except Exception as e:
+                                    logger.warning(f"加载Release模型失败: {e}")
+                        else:
+                            logger.warning(f"Release模型下载失败: {dl.stderr.strip()}")
+                    else:
+                        logger.info("未找到已有Release")
+                except Exception as e:
+                    logger.warning(f"获取Release信息失败: {e}")
+            else:
+                logger.info("未找到GH_TOKEN, 跳过Release下载")
+
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
 
@@ -247,24 +290,42 @@ def train_model():
             else:
                 _pos_weights.append(1.0)
 
-        class WeightedBCELoss(nn.Module):
-            def __init__(self, per_horizon_weights):
+        class WeightedFocalLoss(nn.Module):
+            """加权 Focal Loss
+
+            在 WeightedBCE 基础上引入 Focal Loss 机制:
+              FL(p_t) = -(1-p_t)^γ * log(p_t)
+            - gamma=0 → 退化为标准 BCE
+            - gamma=2.0 → 关注难分类样本(靠近决策边界的)
+            - 保持 per_horizon pos_weight 做类别平衡
+
+            金融涨跌分类中大量样本模糊不清,
+            Focal Loss 让模型专注于有价值"难例"而非已分类正确的样本。
+            """
+            def __init__(self, per_horizon_weights, gamma=2.0):
                 super().__init__()
+                self.gamma = gamma
                 self.register_buffer(
                     'weights',
                     torch.tensor(per_horizon_weights, dtype=torch.float32),
                 )
+
             def forward(self, pred, target):
-                weight_vec = self.weights.to(target.device)
+                # BCE 基础项
                 bce = F.binary_cross_entropy(pred, target, reduction='none')
-                weight_vec = weight_vec.unsqueeze(0)
+                # 预测置信度: p_t = p if y=1 else 1-p
+                pt = torch.where(target >= 0.5, pred, 1 - pred)
+                # Focal 调制因子: (1-p_t)^γ, 正确高置信样本loss被压制
+                focal = (1 - pt) ** self.gamma
+                # 类别平衡权重
+                weight_vec = self.weights.to(target.device).unsqueeze(0)
                 sample_weights = torch.where(target >= 0.5, weight_vec,
                                               torch.ones_like(target))
-                return (bce * sample_weights).mean()
+                return (bce * focal * sample_weights).mean()
 
-        criterion = WeightedBCELoss(_pos_weights)
+        criterion = WeightedFocalLoss(_pos_weights, gamma=2.0)
         if fold_idx == 0:
-            logger.info(f"使用 WeightedBCELoss, 各窗口pos_weight={_pos_weights}")
+            logger.info(f"使用 WeightedFocalLoss(gamma=2.0), 各窗口pos_weight={_pos_weights}")
 
         # ---- CV 各折训练循环 ----
         _max_epochs = config.EPOCHS

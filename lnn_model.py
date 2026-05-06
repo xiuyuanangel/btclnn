@@ -78,16 +78,22 @@ class LTCCell(nn.Module):
 
 
 class TimeframeEncoder(nn.Module):
-    """单周期LTC编码器
+    """单周期LTC编码器(带注意力池化)
 
     将一个时间周期的序列编码为固定维度的向量表示。
     每个周期有独立的多层LTC单元, 处理原生分辨率的数据。
     层间加入LayerNorm稳定梯度流动。
+
+    输出使用可学习的注意力池化(Attention Pooling)替代取最后一个隐藏状态:
+      收集所有时间步的顶层输出, 通过可学习权重对各时间步加权求和。
+      这样模型可以自动关注序列中信息量最大的时段, 而非只依赖最后一步。
     """
 
-    def __init__(self, input_size, hidden_size, num_layers):
+    def __init__(self, input_size, hidden_size, num_layers, use_attn_pool=True):
         super().__init__()
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.use_attn_pool = use_attn_pool
         self.cells = nn.ModuleList([
             LTCCell(
                 input_size if i == 0 else hidden_size,
@@ -100,11 +106,16 @@ class TimeframeEncoder(nn.Module):
             nn.LayerNorm(hidden_size)
             for _ in range(num_layers)
         ])
+        # 注意力池化: 学习各时间步的重要性权重
+        if self.use_attn_pool:
+            self.attn_pool = nn.Linear(hidden_size, 1)
         self._init_weights()
 
     def _init_weights(self):
         for cell in self.cells:
             cell._init_weights()
+        if self.use_attn_pool:
+            nn.init.xavier_uniform_(self.attn_pool.weight, gain=0.1)  # 小gain使初始权重接近均匀
 
     def forward(self, x):
         """
@@ -112,25 +123,41 @@ class TimeframeEncoder(nn.Module):
             x: (batch, seq_len, input_size)
 
         Returns:
-            h: (batch, hidden_size) 最终隐藏状态
+            h: (batch, hidden_size) 注意力池化后的序列表示
         """
         batch_size, seq_len = x.size(0), x.size(1)
         device = x.device
 
         hidden = [
             torch.zeros(batch_size, self.hidden_size, device=device)
-            for _ in range(len(self.cells))
+            for _ in range(self.num_layers)
         ]
 
-        for t in range(seq_len):
-            inp = x[:, t, :]
-            for i, cell in enumerate(self.cells):
-                hidden[i] = cell(inp, hidden[i])
-                # 层间归一化: 稳定后续层的输入分布
-                hidden[i] = self.layer_norms[i](hidden[i])
-                inp = hidden[i]
+        if self.use_attn_pool:
+            # 收集顶层所有时间步的输出用于注意力池化
+            all_top_outputs = []
+            for t in range(seq_len):
+                inp = x[:, t, :]
+                for i, cell in enumerate(self.cells):
+                    hidden[i] = cell(inp, hidden[i])
+                    hidden[i] = self.layer_norms[i](hidden[i])
+                    inp = hidden[i]
+                all_top_outputs.append(hidden[-1].unsqueeze(1))  # (B, 1, D)
 
-        return hidden[-1]
+            # 注意力池化: (B, seq_len, D) → (B, seq_len, 1) → Softmax → 加权求和
+            all_top_outputs = torch.cat(all_top_outputs, dim=1)  # (B, seq_len, D)
+            attn_scores = self.attn_pool(all_top_outputs)        # (B, seq_len, 1)
+            attn_weights = torch.softmax(attn_scores, dim=1)     # (B, seq_len, 1)
+            return (all_top_outputs * attn_weights).sum(dim=1)   # (B, D)
+        else:
+            # 原始行为: 取最后一个隐藏状态(降级兼容)
+            for t in range(seq_len):
+                inp = x[:, t, :]
+                for i, cell in enumerate(self.cells):
+                    hidden[i] = cell(inp, hidden[i])
+                    hidden[i] = self.layer_norms[i](hidden[i])
+                    inp = hidden[i]
+            return hidden[-1]
 
 
 class CrossTimeframeAttention(nn.Module):
@@ -370,12 +397,13 @@ class MultiTimeframeLNN(nn.Module):
         self.period_names = list(timeframe_configs.keys())
         num_tf = len(timeframe_configs)
 
-        # 每个周期独立的LTC编码器
+        # 每个周期独立的LTC编码器(使用注意力池化)
         self.encoders = nn.ModuleDict({
             period: TimeframeEncoder(
                 input_size=tf_cfg['feature_size'],
                 hidden_size=self.hidden_size,
                 num_layers=self.num_layers,
+                use_attn_pool=True,
             )
             for period, tf_cfg in timeframe_configs.items()
         })
