@@ -57,6 +57,11 @@ EPOCHS = 99999               # 训练轮数(上限, 实际由 MAX_TRAIN_SECONDS 
 MAX_TRAIN_SECONDS = 17640   # 最大训练时长(秒), 默认4.8小时(预留余量给测试+上传)
 PATIENCE = 140               # 早停耐心值(更快截断过拟合)
 
+# ==================== Transformer增强配置 ====================
+USE_TRANSFORMER = True       # 是否启用Transformer增强(融合LTC+Transformer)
+TRANSFORMER_HEADS = 4        # Transformer注意力头数(需整除HIDDEN_SIZE)
+CROSS_ATTN_HEADS = 4         # 跨周期注意力头数
+
 # ==================== 数据存储路径 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data", "cache")

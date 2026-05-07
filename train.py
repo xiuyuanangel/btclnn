@@ -228,6 +228,11 @@ def train_model():
             for p, cfg in config.TIMEFRAMES.items()
         }
 
+        # 获取Transformer配置
+        _use_transformer = getattr(config, 'USE_TRANSFORMER', False)
+        _transformer_heads = getattr(config, 'TRANSFORMER_HEADS', 4)
+        _cross_attn_heads = getattr(config, 'CROSS_ATTN_HEADS', 4)
+
         model = MultiTimeframeLNN(
             timeframe_configs=tf_configs,
             context_feature_size=ctx_size,
@@ -235,7 +240,16 @@ def train_model():
             num_layers=config.NUM_LAYERS,
             dropout=config.DROPOUT,
             output_size=_num_horizons,
+            use_transformer=_use_transformer,
+            transformer_heads=_transformer_heads,
+            cross_attn_heads=_cross_attn_heads,
         ).to(device)
+
+        if fold_idx == 0:
+            logger.info(f"Transformer增强: {'启用' if _use_transformer else '禁用'}")
+            if _use_transformer:
+                logger.info(f"  Transformer头数: {_transformer_heads}")
+                logger.info(f"  跨周期注意力头数: {_cross_attn_heads}")
 
         # 从GitHub Release下载最新模型作为初始化(仅第0折/非CV模式)
         if fold_idx == 0 or not _use_cv:
@@ -474,6 +488,9 @@ def train_model():
                         'dropout': config.DROPOUT,
                         'output_size': _num_horizons,
                         'horizons': config.PREDICTION_HORIZONS,
+                        'use_transformer': _use_transformer,
+                        'transformer_heads': _transformer_heads,
+                        'cross_attn_heads': _cross_attn_heads,
                     },
                 }, _fold_model_path)
                 logger.info(f"  {fold_tag}-> 保存最佳模型(val_loss={val_loss:.4f})")

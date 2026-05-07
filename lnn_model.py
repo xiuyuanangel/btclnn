@@ -372,23 +372,28 @@ class MultiTimeframeLNN(nn.Module):
         output_size=None,  # 默认从config.PREDICTION_HORIZONS读取
         use_cross_attention=True,
         cross_attn_heads=4,
+        use_transformer=False,  # 是否启用Transformer增强
+        transformer_heads=4,    # Transformer注意力头数
     ):
         """
         Args:
             timeframe_configs: dict of {period: {'seq_length': int, 'feature_size': int}}
             context_feature_size: 上下文特征维度
             hidden_size: 隐藏层大小
-            num_layers: 每个编码器的LTC层数
+            num_layers: 每个编码器的层数
             dropout: Dropout比率
             output_size: 输出维度(默认=预测窗口数, 如2表示10min+30min)
             use_cross_attention: 是否启用跨周期注意力(默认True)
             cross_attn_heads: 跨周期注意力的头数
+            use_transformer: 是否启用Transformer增强(融合LTC+Transformer)
+            transformer_heads: Transformer注意力头数
         """
         super().__init__()
         self.hidden_size = hidden_size or config.HIDDEN_SIZE
         self.num_layers = num_layers or config.NUM_LAYERS
         self.dropout_rate = dropout or config.DROPOUT
         self.use_cross_attention = use_cross_attention
+        self.use_transformer = use_transformer
         # 输出维度: 默认为预测窗口数量
         _default_output_size = len(getattr(config, 'PREDICTION_HORIZONS', [10]))
         self.output_size = output_size or _default_output_size
@@ -397,25 +402,50 @@ class MultiTimeframeLNN(nn.Module):
         self.period_names = list(timeframe_configs.keys())
         num_tf = len(timeframe_configs)
 
-        # 每个周期独立的LTC编码器(启用注意力池化, 自动关注序列中信息量最大的时段)
-        self.encoders = nn.ModuleDict({
-            period: TimeframeEncoder(
-                input_size=tf_cfg['feature_size'],
-                hidden_size=self.hidden_size,
-                num_layers=self.num_layers,
-                use_attn_pool=True,
-            )
-            for period, tf_cfg in timeframe_configs.items()
-        })
+        # 根据配置选择编码器类型
+        if self.use_transformer:
+            # 使用融合LTC+Transformer的编码器
+            self.encoders = nn.ModuleDict({
+                period: TimeframeTransformerEncoder(
+                    input_size=tf_cfg['feature_size'],
+                    hidden_size=self.hidden_size,
+                    num_layers=self.num_layers,
+                    num_attn_heads=transformer_heads,
+                    dropout=self.dropout_rate,
+                    use_attn_pool=True,
+                )
+                for period, tf_cfg in timeframe_configs.items()
+            })
+        else:
+            # 使用纯LTC编码器
+            self.encoders = nn.ModuleDict({
+                period: TimeframeEncoder(
+                    input_size=tf_cfg['feature_size'],
+                    hidden_size=self.hidden_size,
+                    num_layers=self.num_layers,
+                    use_attn_pool=True,
+                )
+                for period, tf_cfg in timeframe_configs.items()
+            })
 
         # 跨周期注意力模块(可选)
         if self.use_cross_attention and num_tf > 1:
-            self.cross_attn = CrossTimeframeAttention(
-                hidden_size=self.hidden_size,
-                num_timeframes=num_tf,
-                num_heads=cross_attn_heads,
-                dropout=self.dropout_rate,
-            )
+            if self.use_transformer:
+                # 使用增强版跨周期注意力(带相对位置编码)
+                self.cross_attn = EnhancedCrossTimeframeAttention(
+                    hidden_size=self.hidden_size,
+                    num_timeframes=num_tf,
+                    num_heads=cross_attn_heads,
+                    dropout=self.dropout_rate,
+                )
+            else:
+                # 使用原始跨周期注意力
+                self.cross_attn = CrossTimeframeAttention(
+                    hidden_size=self.hidden_size,
+                    num_timeframes=num_tf,
+                    num_heads=cross_attn_heads,
+                    dropout=self.dropout_rate,
+                )
 
         # 融合层: Gated Residual Fusion (各周期贡献度可学习 + 残差连接)
         self.fusion = GatedResidualFusion(
@@ -527,6 +557,340 @@ class LiquidNeuralNetwork(nn.Module):
                 inp = hidden[i]
         out = self.classifier(hidden[-1])
         return out.view(out.size(0), -1)
+
+
+class RelativePositionEmbedding(nn.Module):
+    """相对位置编码(Relative Position Embedding)
+    
+    参考论文: "Self-Attention with Relative Position Representations" (Shaw et al., 2018)
+    
+    为Transformer的注意力机制提供相对位置信息, 更好地建模时间序列的顺序关系。
+    """
+    
+    def __init__(self, head_dim, max_seq_len=512):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        
+        # 相对位置编码表: 存储所有可能相对位置的编码
+        # 形状: (2*max_seq_len-1, head_dim)
+        self.rel_pos_emb = nn.Parameter(
+            torch.randn(max_seq_len * 2 - 1, head_dim) * 0.01
+        )
+    
+    def forward(self, seq_len):
+        """
+        Args:
+            seq_len: 当前序列长度
+        
+        Returns:
+            rel_pos: (2*seq_len-1, head_dim) 相对位置编码
+        """
+        # 截取所需长度的编码
+        start = self.max_seq_len - seq_len
+        end = self.max_seq_len + seq_len - 1
+        return self.rel_pos_emb[start:end]
+
+
+class TransformerEncoderLayer(nn.Module):
+    """Transformer编码器层(带相对位置编码)
+    
+    结构: LayerNorm → Multi-Head Self-Attention → Residual → LayerNorm → FeedForward → Residual
+    
+    相比标准Transformer的改进:
+    - 支持相对位置编码(简化实现)
+    - 可选的门控机制
+    - 更好的梯度流动设计
+    """
+    
+    def __init__(self, hidden_size, num_heads=4, dropout=0.1, use_gate=True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = math.sqrt(self.head_dim)
+        self.use_gate = use_gate
+        
+        # 多头注意力投影
+        self.W_q = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_k = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_v = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_o = nn.Linear(hidden_size, hidden_size)
+        
+        # 相对位置编码嵌入
+        self.rel_pos_emb = nn.Parameter(
+            torch.randn(self.head_dim) * 0.01
+        )
+        
+        # 门控层(可选)
+        if self.use_gate:
+            self.gate = nn.Sequential(
+                nn.Linear(hidden_size * 2, hidden_size),
+                nn.Sigmoid()
+            )
+        
+        # 前馈网络
+        self.feed_forward = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Dropout(dropout),
+        )
+        
+        # 层归一化
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for W in [self.W_q, self.W_k, self.W_v]:
+            nn.init.xavier_uniform_(W.weight, gain=1.0 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.W_o.weight)
+        for module in self.feed_forward:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, hidden_size)
+            mask: (batch, 1, seq_len) 或 None
+        
+        Returns:
+            output: (batch, seq_len, hidden_size)
+        """
+        batch_size, seq_len = x.size(0), x.size(1)
+        
+        # 残差连接基线
+        residual = x
+        
+        # LayerNorm + 多头注意力
+        x = self.norm1(x)
+        Q = self.W_q(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.W_k(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.W_v(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # 标准注意力分数: Q @ K^T
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        
+        # 添加相对位置偏置(简化版: 基于距离的位置编码)
+        if seq_len > 1:
+            # 创建位置距离矩阵
+            pos_indices = torch.arange(seq_len, device=x.device)
+            pos_dist = torch.abs(pos_indices.unsqueeze(0) - pos_indices.unsqueeze(1))
+            # 将距离转换为位置偏置
+            rel_pos_bias = pos_dist.unsqueeze(0).unsqueeze(0) * self.rel_pos_emb.sum() / self.scale
+            attn_scores = attn_scores + rel_pos_bias
+        
+        # 掩码处理
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+        
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+        
+        # 加权求和
+        context = torch.matmul(attn_probs, V)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        context = self.W_o(context)
+        
+        # 门控残差连接
+        if self.use_gate:
+            gate_input = torch.cat([context, residual], dim=-1)
+            gate = self.gate(gate_input)
+            x = gate * context + (1 - gate) * residual
+        else:
+            x = self.dropout(context) + residual
+        
+        # LayerNorm + 前馈网络
+        residual = x
+        x = self.norm2(x)
+        x = self.feed_forward(x) + residual
+        
+        return x
+
+
+class TimeframeTransformerEncoder(nn.Module):
+    """融合LTC和Transformer的时间周期编码器
+    
+    架构:
+        LTC编码(捕捉时间动态) → Transformer编码(捕捉长程依赖) → 注意力池化
+    
+    优势:
+    - LTC擅长建模连续时间动态和短期依赖
+    - Transformer擅长建模长程依赖和复杂模式
+    - 两者互补，提升模型表达能力
+    """
+    
+    def __init__(self, input_size, hidden_size, num_layers=2, num_attn_heads=4, 
+                 dropout=0.1, use_attn_pool=True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.use_attn_pool = use_attn_pool
+        
+        # LTC层(作为第一层, 捕捉时间动态)
+        self.ltc_cells = nn.ModuleList([
+            LTCCell(
+                input_size if i == 0 else hidden_size,
+                hidden_size,
+            )
+            for i in range(num_layers)
+        ])
+        self.ltc_layer_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_size) for _ in range(num_layers)
+        ])
+        
+        # Transformer层(捕捉长程依赖)
+        self.transformer_layers = nn.ModuleList([
+            TransformerEncoderLayer(
+                hidden_size=hidden_size,
+                num_heads=num_attn_heads,
+                dropout=dropout,
+                use_gate=True,
+            )
+            for _ in range(num_layers)
+        ])
+        
+        # 注意力池化
+        if self.use_attn_pool:
+            self.attn_pool = nn.Linear(hidden_size, 1)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for cell in self.ltc_cells:
+            cell._init_weights()
+        if self.use_attn_pool:
+            nn.init.xavier_uniform_(self.attn_pool.weight, gain=0.1)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, seq_len, input_size)
+        
+        Returns:
+            h: (batch, hidden_size)
+        """
+        batch_size, seq_len = x.size(0), x.size(1)
+        device = x.device
+        
+        # 1. LTC编码: 提取时间动态特征
+        hidden = [
+            torch.zeros(batch_size, self.hidden_size, device=device)
+            for _ in range(self.num_layers)
+        ]
+        
+        ltc_outputs = []
+        for t in range(seq_len):
+            inp = x[:, t, :]
+            for i, cell in enumerate(self.ltc_cells):
+                hidden[i] = cell(inp, hidden[i])
+                hidden[i] = self.ltc_layer_norms[i](hidden[i])
+                inp = hidden[i]
+            ltc_outputs.append(hidden[-1].unsqueeze(1))
+        
+        # (batch, seq_len, hidden_size)
+        ltc_sequence = torch.cat(ltc_outputs, dim=1)
+        
+        # 2. Transformer编码: 捕捉长程依赖
+        transformer_output = ltc_sequence
+        for layer in self.transformer_layers:
+            transformer_output = layer(transformer_output)
+        
+        # 3. 注意力池化
+        if self.use_attn_pool:
+            attn_scores = self.attn_pool(transformer_output)
+            attn_weights = F.softmax(attn_scores, dim=1)
+            return (transformer_output * attn_weights).sum(dim=1)
+        else:
+            return transformer_output[:, -1, :]
+
+
+class EnhancedCrossTimeframeAttention(nn.Module):
+    """增强版跨周期注意力(带相对位置编码)
+    
+    改进:
+    - 添加周期级别的相对位置编码(简化实现)
+    - 支持自适应注意力头数
+    - 改进残差连接设计
+    """
+    
+    def __init__(self, hidden_size, num_timeframes, num_heads=4, dropout=0.1):
+        super().__init__()
+        assert hidden_size % num_heads == 0, \
+            f"hidden_size({hidden_size})必须能被num_heads({num_heads})整除"
+        
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = math.sqrt(self.head_dim)
+        
+        # Q/K/V投影
+        self.W_q = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_k = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_v = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_o = nn.Linear(hidden_size, hidden_size)
+        
+        # 周期相对位置编码参数(简化版)
+        self.period_pos_param = nn.Parameter(
+            torch.randn(self.head_dim) * 0.01
+        )
+        
+        # 层归一化与残差
+        self.norm = nn.LayerNorm(hidden_size)
+        self.attn_dropout = nn.Dropout(dropout)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for W in [self.W_q, self.W_k, self.W_v]:
+            nn.init.xavier_uniform_(W.weight, gain=1.0 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.W_o.weight)
+    
+    def forward(self, encoded_list):
+        """
+        Args:
+            encoded_list: list of (batch, hidden_size)
+        
+        Returns:
+            enhanced_list: list of (batch, hidden_size)
+        """
+        x = torch.stack(encoded_list, dim=1)
+        batch_size, num_tf, _ = x.shape
+        
+        # 投影Q/K/V
+        Q = self.W_q(x).view(batch_size, num_tf, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.W_k(x).view(batch_size, num_tf, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.W_v(x).view(batch_size, num_tf, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # 标准注意力分数
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        
+        # 添加周期相对位置偏置(简化版)
+        if num_tf > 1:
+            pos_indices = torch.arange(num_tf, device=x.device)
+            pos_dist = torch.abs(pos_indices.unsqueeze(0) - pos_indices.unsqueeze(1))
+            rel_pos_bias = pos_dist.unsqueeze(0).unsqueeze(0) * self.period_pos_param.sum() / self.scale
+            attn_scores = attn_scores + rel_pos_bias
+        
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.attn_dropout(attn_probs)
+        
+        # 加权求和
+        context = torch.matmul(attn_probs, V)
+        context = context.transpose(1, 2).contiguous().view(batch_size, num_tf, self.hidden_size)
+        
+        # 输出投影 + 残差 + LayerNorm
+        output = self.W_o(context)
+        output = self.norm(x + output)
+        
+        return [output[:, i, :] for i in range(num_tf)]
 
 
 def count_parameters(model):
