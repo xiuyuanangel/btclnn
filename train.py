@@ -364,7 +364,7 @@ def train_model():
         while epoch < _max_epochs:
             # 时间限制检查(非CV用全局时间, CV用单折时间预算)
             _time_budget = _fold_time_budget or _max_seconds
-            _time_elapsed = time.time() - (fold_start_time if _use_cv else train_start_time)
+            _time_elapsed = time.time() - fold_start_time
             if _time_budget and _time_elapsed >= _time_budget:
                 if _use_cv:
                     logger.info(f"Fold {fold_idx+1} 达到时间预算({_time_budget/3600:.1f}h)")
