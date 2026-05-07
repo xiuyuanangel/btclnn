@@ -397,13 +397,13 @@ class MultiTimeframeLNN(nn.Module):
         self.period_names = list(timeframe_configs.keys())
         num_tf = len(timeframe_configs)
 
-        # 每个周期独立的LTC编码器(暂时禁用注意力池化, 取最后一个hidden state)
+        # 每个周期独立的LTC编码器(启用注意力池化, 自动关注序列中信息量最大的时段)
         self.encoders = nn.ModuleDict({
             period: TimeframeEncoder(
                 input_size=tf_cfg['feature_size'],
                 hidden_size=self.hidden_size,
                 num_layers=self.num_layers,
-                use_attn_pool=False,
+                use_attn_pool=True,
             )
             for period, tf_cfg in timeframe_configs.items()
         })
