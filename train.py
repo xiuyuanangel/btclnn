@@ -172,6 +172,8 @@ def train_model():
     if _max_seconds and _use_cv:
         _fold_time_budget = _max_seconds / _n_folds
         logger.info(f"每折时间预算: {_fold_time_budget/3600:.1f}h")
+    elif _max_seconds:
+        logger.info(f"训练时间限制: {_max_seconds/3600:.1f}h")
 
     _best_across_folds = {
         'val_loss': float('inf'),
@@ -360,12 +362,14 @@ def train_model():
             logger.info("=" * 60)
 
         while epoch < _max_epochs:
-            # 单折时间预算检查
-            if _fold_time_budget and (time.time() - fold_start_time) >= _fold_time_budget:
+            # 时间限制检查(非CV用全局时间, CV用单折时间预算)
+            _time_budget = _fold_time_budget or _max_seconds
+            _time_elapsed = time.time() - (fold_start_time if _use_cv else train_start_time)
+            if _time_budget and _time_elapsed >= _time_budget:
                 if _use_cv:
-                    logger.info(f"Fold {fold_idx+1} 达到时间预算({_fold_time_budget/3600:.1f}h)")
+                    logger.info(f"Fold {fold_idx+1} 达到时间预算({_time_budget/3600:.1f}h)")
                 else:
-                    logger.info(f"达到最大训练时长({_max_seconds/3600:.1f}小时), 停止训练")
+                    logger.info(f"达到最大训练时长({_time_budget/3600:.1f}小时), 停止训练")
                 break
 
             t0 = time.time()
