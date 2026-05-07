@@ -52,7 +52,8 @@ NUM_LAYERS = 2              # 隐藏层数量(减少深度防止梯度消失)
 DROPOUT = 0.6               # 丢弃率(从0.3提升至0.5, 增强正则化)
 LEARNING_RATE = 5e-4        # 学习率(从1e-3降低至5e-4, 更稳定收敛)
 WEIGHT_DECAY = 3e-4         # L2正则化(新增, 进一步抑制过拟合)
-BATCH_SIZE = 512            # 批处理大小
+BATCH_SIZE = 512            # 批处理大小(USE_AUTO_BATCH_SIZE=False时使用)
+USE_AUTO_BATCH_SIZE = True  # 自动调整BATCH_SIZE根据可用内存/显存
 EPOCHS = 99999               # 训练轮数(上限, 实际由 MAX_TRAIN_SECONDS 控制)
 MAX_TRAIN_SECONDS = 17640   # 最大训练时长(秒), 默认4.8小时(预留余量给测试+上传)
 PATIENCE = 140               # 早停耐心值(更快截断过拟合)

@@ -277,7 +277,9 @@ def train_model():
             val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
             test_dataset = MultiTimeframeDataset(cv_test_data[0], cv_test_data[1], cv_test_data[2], periods)
 
-        _effective_batch_size = _auto_batch_size(device)
+        _effective_batch_size = config.BATCH_SIZE if not config.USE_AUTO_BATCH_SIZE else _auto_batch_size(device)
+        if config.USE_AUTO_BATCH_SIZE:
+            logger.info(f"自动BATCH_SIZE: {_effective_batch_size}")
         _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
 
         train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, **_dl_kwargs)
