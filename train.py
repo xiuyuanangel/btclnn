@@ -80,6 +80,54 @@ def train_model():
 
     device = torch.device("cuda" if _use_cuda else "cpu")
     logger.info(f"使用设备: {device}")
+
+    def _get_available_memory_gb(device):
+        if torch.cuda.is_available() and device.type == 'cuda':
+            total_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+            used_gb = torch.cuda.memory_allocated(device) / (1024**3)
+            return total_gb - used_gb
+        try:
+            import psutil
+            return psutil.virtual_memory().available / (1024**3)
+        except ImportError:
+            return 16.0
+
+    def _auto_batch_size(device):
+        free_gb = _get_available_memory_gb(device)
+        base = config.BATCH_SIZE
+        if device.type == 'cuda':
+            if free_gb < 2:
+                logger.warning(f"GPU剩余显存不足{free_gb:.1f}GB，降低BATCH_SIZE至64")
+                return 64
+            elif free_gb < 4:
+                logger.info(f"GPU剩余显存{free_gb:.1f}GB，降低BATCH_SIZE至128")
+                return 128
+            elif free_gb < 6:
+                logger.info(f"GPU剩余显存{free_gb:.1f}GB，降低BATCH_SIZE至256")
+                return 256
+            else:
+                logger.info(f"GPU显存充足({free_gb:.1f}GB可用)，使用BATCH_SIZE={base}")
+                return base
+        else:
+            try:
+                import psutil
+                avail_ram_gb = psutil.virtual_memory().available / (1024**3)
+                if avail_ram_gb < 4:
+                    logger.warning(f"系统可用内存不足{avail_ram_gb:.1f}GB，降低BATCH_SIZE至128")
+                    return 128
+                elif avail_ram_gb < 8:
+                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，降低BATCH_SIZE至256")
+                    return 256
+                elif avail_ram_gb < 16:
+                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，使用BATCH_SIZE=384")
+                    return 384
+                else:
+                    logger.info(f"系统可用内存充足({avail_ram_gb:.1f}GB)，使用BATCH_SIZE={base}")
+                    return base
+            except ImportError:
+                logger.info(f"无法检测系统内存，使用默认BATCH_SIZE={base}")
+                return base
+
     periods = list(config.TIMEFRAMES.keys())
     logger.info(f"多周期融合 {periods}")
 
@@ -214,11 +262,12 @@ def train_model():
             val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
             test_dataset = MultiTimeframeDataset(cv_test_data[0], cv_test_data[1], cv_test_data[2], periods)
 
+        _effective_batch_size = _auto_batch_size(device)
         _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
 
-        train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False, **_dl_kwargs)
-        val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, **_dl_kwargs)
-        test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False, **_dl_kwargs)
+        train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, **_dl_kwargs)
+        val_loader = DataLoader(val_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
+        test_loader = DataLoader(test_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
 
         # ---- 创建模型(每折独立, 防止跨折泄露) ----
         feat_size = len(SEQ_FEATURE_COLS)
