@@ -17,7 +17,7 @@ VAL_RATIO = 0.15            # 验证集比例(非CV模式使用)
 #   Fold 3: Train[0:85%], Val[85%:95%]
 #   Test:   [95%:100%] (始终独立保留)
 # 每折训练独立模型, 选val_loss最低的那折模型做最终测试评估。
-USE_ROLLING_CV = Ture       # 非CV模式: 单次70/15/15切分(当前模型未学到>50%, 先关CV跑满4.8h)
+USE_ROLLING_CV = True       # 非CV模式: 单次70/15/15切分(当前模型未学到>50%, 先关CV跑满4.8h)
 CV_N_FOLDS = 3               # 折数(受时间限制, CPU环境推荐3折)
 CV_VAL_RATIO = 0.10          # 每折验证集占总数比例
 CV_TEST_RATIO = 0.05         # 独立测试集(始终保留, 不参与CV)
