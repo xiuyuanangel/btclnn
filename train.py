@@ -283,16 +283,25 @@ def train_model():
                                         logger.info(f"Release模型权重已加载 (val_loss={_rel_ckpt.get('val_loss', 'N/A')})")
                                     else:
                                         logger.info("Release模型架构不匹配，从头训练")
+                                        logger.info("尝试从checkpoints加载模型...")
+                                        _load_best_fallback(model, device)
                                 except Exception as e:
                                     logger.warning(f"加载Release模型失败: {e}")
+                                    logger.info("尝试从checkpoints加载模型...")
+                                    _load_best_fallback(model, device)
                         else:
                             logger.warning(f"Release模型下载失败: {dl.stderr.strip()}")
+                            logger.info("尝试从checkpoints加载模型...")
+                            _load_best_fallback(model, device)
                     else:
                         logger.info("未找到已有Release")
+                        logger.info("尝试从checkpoints加载模型...")
+                        _load_best_fallback(model, device)
                 except Exception as e:
                     logger.warning(f"获取Release信息失败: {e}")
             else:
-                logger.info("未找到GH_TOKEN, 跳过Release下载")
+                logger.info("未找到GH_TOKEN, 尝试从checkpoints加载模型...")
+                _load_best_fallback(model, device)
 
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
