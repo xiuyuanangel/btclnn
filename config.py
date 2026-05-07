@@ -49,16 +49,16 @@ TIMEFRAMES = {
 # ==================== 模型配置 ====================
 HIDDEN_SIZE = 96            # 隐藏层大小(从96降至64, 配合精简特征降低过拟合风险)
 NUM_LAYERS = 2              # 隐藏层数量(减少深度防止梯度消失)
-DROPOUT = 0.5               # 丢弃率(从0.3提升至0.5, 增强正则化)
+DROPOUT = 0.6               # 丢弃率(从0.3提升至0.5, 增强正则化)
 LEARNING_RATE = 5e-4        # 学习率(从1e-3降低至5e-4, 更稳定收敛)
-WEIGHT_DECAY = 1e-4         # L2正则化(新增, 进一步抑制过拟合)
+WEIGHT_DECAY = 3e-4         # L2正则化(新增, 进一步抑制过拟合)
 BATCH_SIZE = 512            # 批处理大小
 EPOCHS = 99999               # 训练轮数(上限, 实际由 MAX_TRAIN_SECONDS 控制)
 MAX_TRAIN_SECONDS = 17640   # 最大训练时长(秒), 默认4.8小时(预留余量给测试+上传)
 PATIENCE = 140               # 早停耐心值(更快截断过拟合)
 
 # ==================== Transformer增强配置 ====================
-USE_TRANSFORMER = True       # 是否启用Transformer增强(融合LTC+Transformer)
+USE_TRANSFORMER = False       # 是否启用Transformer增强(融合LTC+Transformer)
 TRANSFORMER_HEADS = 4        # Transformer注意力头数(需整除HIDDEN_SIZE)
 CROSS_ATTN_HEADS = 4         # 跨周期注意力头数
 
