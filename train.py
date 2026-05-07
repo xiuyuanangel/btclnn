@@ -105,9 +105,18 @@ def train_model():
             elif free_gb < 6:
                 logger.info(f"GPU剩余显存{free_gb:.1f}GB，降低BATCH_SIZE至256")
                 return 256
+            elif free_gb < 8:
+                logger.info(f"GPU剩余显存{free_gb:.1f}GB，使用BATCH_SIZE=512")
+                return 512
+            elif free_gb < 12:
+                logger.info(f"GPU剩余显存{free_gb:.1f}GB，使用BATCH_SIZE=1024")
+                return 1024
+            elif free_gb < 18:
+                logger.info(f"GPU剩余显存{free_gb:.1f}GB，使用BATCH_SIZE=2048")
+                return 2048
             else:
-                logger.info(f"GPU显存充足({free_gb:.1f}GB可用)，使用BATCH_SIZE={base}")
-                return base
+                logger.info(f"GPU显存充足({free_gb:.1f}GB可用)，使用BATCH_SIZE=3072")
+                return 3072
         else:
             try:
                 import psutil
@@ -119,11 +128,17 @@ def train_model():
                     logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，降低BATCH_SIZE至256")
                     return 256
                 elif avail_ram_gb < 16:
-                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，使用BATCH_SIZE=384")
-                    return 384
+                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，使用BATCH_SIZE=512")
+                    return 512
+                elif avail_ram_gb < 32:
+                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，使用BATCH_SIZE=1024")
+                    return 1024
+                elif avail_ram_gb < 64:
+                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，使用BATCH_SIZE=2048")
+                    return 2048
                 else:
-                    logger.info(f"系统可用内存充足({avail_ram_gb:.1f}GB)，使用BATCH_SIZE={base}")
-                    return base
+                    logger.info(f"系统可用内存充足({avail_ram_gb:.1f}GB)，使用BATCH_SIZE=3072")
+                    return 3072
             except ImportError:
                 logger.info(f"无法检测系统内存，使用默认BATCH_SIZE={base}")
                 return base
