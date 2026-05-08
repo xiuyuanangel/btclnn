@@ -3,6 +3,7 @@
 import os
 import time
 import logging
+import importlib
 
 import numpy as np
 import torch
@@ -438,9 +439,15 @@ def train_model():
             logger.info(f"模型参数: 总计 {total_params:,}, 可训练{trainable_params:,}")
 
         # ---- **模型+数据已在GPU上**, 在此测量剩余显存计算batch ----
-        _effective_batch_size = config.BATCH_SIZE
-        if config.USE_AUTO_BATCH_SIZE:
+        # 重新加载config, 确保运行中修改config.py能即时生效(多折CV后续折)
+        importlib.reload(config)
+        _auto_mode = config.USE_AUTO_BATCH_SIZE
+        if _auto_mode:
             _effective_batch_size = _auto_batch_size(device)
+            logger.info(f"BATCH_SIZE: auto={_auto_mode} → {_effective_batch_size}")
+        else:
+            _effective_batch_size = config.BATCH_SIZE
+            logger.info(f"BATCH_SIZE: auto={_auto_mode} → 配置值={config.BATCH_SIZE}")
         _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
         train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, **_dl_kwargs)
         val_loader = DataLoader(val_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
