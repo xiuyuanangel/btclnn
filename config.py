@@ -17,7 +17,7 @@ VAL_RATIO = 0.15            # 验证集比例(非CV模式使用)
 #   Fold 3: Train[0:85%], Val[85%:95%]
 #   Test:   [95%:100%] (始终独立保留)
 # 每折训练独立模型, 选val_loss最低的那折模型做最终测试评估。
-USE_ROLLING_CV = True         # 启用滚动窗口交叉验证, 使用Expanding Window更贴近真实时序分布
+USE_ROLLING_CV = False         # 启用滚动窗口交叉验证, 使用Expanding Window更贴近真实时序分布
 CV_N_FOLDS = 3               # 折数(受时间限制, CPU环境推荐3折)
 CV_VAL_RATIO = 0.10          # 每折验证集占总数比例
 CV_TEST_RATIO = 0.05         # 独立测试集(始终保留, 不参与CV)
@@ -29,14 +29,13 @@ PREDICTION_HORIZONS = [10, 30]
 # 标签来源: 用5min粒度的close计算各horizon后的价格变化
 LABEL_SOURCE_PERIOD = "5min"  # 标签基于该周期的K线数据计算
 LABEL_SMOOTH_WINDOW = 3       # 未来价格平滑窗口(单位: bar)
-LABEL_MIN_RETURN = 0.0008     # 5min 标签最小收益门限(0.08%)
+LABEL_MIN_RETURN = 0.001     # 5min 标签最小收益门限(0.08%)
 LABEL_DROP_NEUTRAL = True     # 是否丢弃噪声中性样本
 
 # ==================== 多周期配置 ====================
 # 每个周期独立编码, 覆盖微观到宏观的不同时间尺度
 # seq_length: 该周期输入序列长度
 # lookback_days: 该周期获取的历史天数(需满足滚动特征窗口需求)
-#    火币API最多可获取连续2年数据, 5min按730天取满,
 #    长周期(4hour/1day)取更久以支持上下文特征窗口
 TIMEFRAMES = {
     '5min':  {'seq_length': 72,  'lookback_days': 1460},   # 72根×5min = 6小时短期趋势(标签来源, 决定时间范围)
