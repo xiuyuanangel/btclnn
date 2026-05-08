@@ -197,8 +197,8 @@ def predict():
     ctx_tensor = torch.from_numpy(ctx_norm.copy()).float().to(device)
 
     with torch.no_grad():
-        probabilities = model(tf_seqs_tensor, ctx_tensor)  # (1, num_horizons)
-        probabilities = probabilities.cpu().numpy()[0]     # (num_horizons,)
+        logits = model(tf_seqs_tensor, ctx_tensor)  # (1, num_horizons), 输出为logits
+        probabilities = torch.sigmoid(logits).cpu().numpy()[0]  # (num_horizons,)
 
     # 7. 输出结果
     current_price = df_featured['close'].iloc[-1]

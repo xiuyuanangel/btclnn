@@ -455,13 +455,12 @@ class MultiTimeframeLNN(nn.Module):
             dropout_rate=self.dropout_rate,
         )
 
-        # 分类头(多输出)
+        # 分类头(多输出) — 无Sigmoid, 配合 BCEWithLogitsLoss
         self.classifier = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(self.dropout_rate),
             nn.Linear(self.hidden_size // 2, self.output_size),
-            nn.Sigmoid(),  # 各输出独立sigmoid, 支持多标签
         )
         self._init_fusion_and_classifier()
 

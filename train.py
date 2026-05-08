@@ -487,11 +487,10 @@ def train_model():
                 _pos_weights.append(1.0)
 
         class WeightedBCE(nn.Module):
-            """加权二元交叉熵(Weighted BCE)
+            """加权二分类交叉熵(配合 BCEWithLogits, 无Sigmoid)
 
-            移除 Focal 调制(gamma=0), 金融数据信噪比极低,
-            几乎所有样本都靠近决策边界, Focal Loss 会错误压制
-            本应有梯度的"已正确分类"样本, 导致模型坍缩至常数预测。
+            BCEWithLogits 将 Sigmoid + BCE 合并为单一数值稳定操作,
+            避免内部 Sigmoid 饱和导致梯度消失的问题。
             """
             def __init__(self, per_horizon_weights):
                 super().__init__()
@@ -500,8 +499,10 @@ def train_model():
                     torch.tensor(per_horizon_weights, dtype=torch.float32),
                 )
 
-            def forward(self, pred, target):
-                bce = F.binary_cross_entropy(pred, target, reduction='none')
+            def forward(self, logits, target):
+                bce = F.binary_cross_entropy_with_logits(
+                    logits, target, reduction='none'
+                )
                 weight_vec = self.weights.to(target.device).unsqueeze(0)
                 sample_weights = torch.where(target >= 0.5, weight_vec,
                                               torch.ones_like(target))
@@ -558,7 +559,7 @@ def train_model():
 
                 batch_size = labels.size(0)
                 train_loss += loss.item() * batch_size
-                preds = (outputs > 0.5).float()
+                preds = (outputs > 0).float()
                 train_correct += (preds == labels).sum().item()
                 train_total += labels.numel()
                 for h in range(_num_horizons):
@@ -594,7 +595,7 @@ def train_model():
 
                     batch_size = labels.size(0)
                     val_loss += loss.item() * batch_size
-                    preds = (outputs > 0.5).float()
+                    preds = (outputs > 0).float()
                     val_correct += (preds == labels).sum().item()
                     val_total += labels.numel()
                     for h in range(_num_horizons):
@@ -694,7 +695,7 @@ def train_model():
 
             batch_size = labels.size(0)
             test_loss += loss.item() * batch_size
-            preds = (outputs > 0.5).float()
+            preds = (outputs > 0).float()
             test_correct += (preds == labels).sum().item()
             test_total += labels.numel()
             # 各窗口统计
