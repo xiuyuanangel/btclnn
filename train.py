@@ -454,9 +454,17 @@ def train_model():
         test_loader = DataLoader(test_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
 
         # ---- 优化器/学习率调度/损失函数 ----
+        # 根据 Linear Scaling Rule 缩放 LR: 大 batch 配大 LR
+        _scaled_lr = config.get_scaled_learning_rate(_effective_batch_size)
+        if fold_idx == 0:
+            logger.info(
+                f"LR 线性缩放: base_batch={config.BASE_BATCH_SIZE}, "
+                f"target_batch={_effective_batch_size}, "
+                f"LR={config.LEARNING_RATE:.2e} → {_scaled_lr:.2e}"
+            )
         optimizer = torch.optim.Adam(
             model.parameters(),
-            lr=config.LEARNING_RATE,
+            lr=_scaled_lr,
             weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-4),
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

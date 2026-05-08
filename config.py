@@ -90,3 +90,18 @@ MEOW_BASE_URL = "https://api.chuckfang.com"  # API基础地址
 
 # ==================== 调试配置 ====================
 DEBUG_EXPORT_CSV = False     # 是否导出数据集样本到CSV供人工核验
+
+# ==================== Batch Size 适配 ====================
+BASE_BATCH_SIZE = 512  # LR 调优时的基准 batch size
+
+def get_scaled_learning_rate(target_batch_size=None):
+    """Linear Scaling Rule: LR_new = LR * (target_batch / base_batch)
+
+    batch size 放大 k 倍时, LR 也应放大 k 倍以保持梯度更新量级一致。
+    参考: Goyal et al. "Accurate, Large Minibatch SGD" (2017)
+    """
+    if target_batch_size is None:
+        target_batch_size = BATCH_SIZE
+    scale = target_batch_size / BASE_BATCH_SIZE
+    scaled_lr = LEARNING_RATE * scale
+    return scaled_lr
