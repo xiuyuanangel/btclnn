@@ -102,15 +102,20 @@ def train_model():
                     f"计算能力sm_{props.major}{props.minor}")
 
     def _get_available_memory_gb():
-        """获取可用内存/显存(GB). GPU取所有卡的最小值, CPU依次尝试psutil→/proc/meminfo"""
+        """获取可用内存/显存(GB).
+        
+        GPU: 使用 torch.cuda.mem_get_info() 获取驱动层真实剩余显存,
+             替代 memory_allocated (PyTorch内部计数器, 会漏算预留缓存).
+             取所有卡的最小值(瓶颈).
+        CPU: 依次尝试 psutil → /proc/meminfo.
+        """
         if torch.cuda.is_available() and _use_cuda:
             min_free = float('inf')
             for i in range(max(1, _n_gpu)):
-                total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
-                allocated = torch.cuda.memory_allocated(i) / (1024**3)
-                free = total - allocated
-                if free < min_free:
-                    min_free = free
+                free_bytes, total_bytes = torch.cuda.mem_get_info(i)
+                free_gb = free_bytes / (1024**3)
+                if free_gb < min_free:
+                    min_free = free_gb
             return min_free
 
         # CPU: 先试 psutil
@@ -146,37 +151,46 @@ def train_model():
         多GPU (DataParallel) 时全局 batch = per_gpu_batch * n_gpu,
         因为每卡只分摊全局batch的 1/n_gpu 样本.
         """
-        free_gb = _get_available_memory_gb()
         gpu_count = max(1, _n_gpu)
 
         if device.type == 'cuda':
+            # 清空PyTorch缓存后再测量, 得到更准确的驱动层剩余显存
+            torch.cuda.empty_cache()
+            for i in range(gpu_count):
+                torch.cuda.synchronize(i)
+            free_gb = _get_available_memory_gb()
+
+            # 安全裕度: 只用剩余显存的70%, 留30%给激活值/梯度/临时变量
+            SAFETY_FACTOR = 0.7
+            eff_free_gb = free_gb * SAFETY_FACTOR
+
             # 以下为**每块GPU**能安全运行的batch大小
-            if free_gb < 2:
+            if eff_free_gb < 1:
+                per_gpu_batch = 32
+            elif eff_free_gb < 2:
                 per_gpu_batch = 64
-            elif free_gb < 4:
+            elif eff_free_gb < 3:
                 per_gpu_batch = 128
-            elif free_gb < 6:
+            elif eff_free_gb < 5:
                 per_gpu_batch = 256
-            elif free_gb < 8:
+            elif eff_free_gb < 8:
                 per_gpu_batch = 512
-            elif free_gb < 12:
+            elif eff_free_gb < 12:
                 per_gpu_batch = 1024
-            elif free_gb < 18:
-                per_gpu_batch = 2048
             else:
-                per_gpu_batch = 3072
+                per_gpu_batch = 1536
 
             # 全局 batch = 每卡batch * 卡数
             global_batch = per_gpu_batch * gpu_count
 
             logger.info(
-                f"显存: 可用{free_gb:.1f}GB (模型+数据已加载), "
+                f"显存: 驱动层剩余{free_gb:.1f}GB(有效{eff_free_gb:.1f}GB×{SAFETY_FACTOR:.0%}), "
                 f"{gpu_count}卡 → 每卡batch={per_gpu_batch}, "
                 f"全局batch={global_batch}"
             )
             return global_batch
         else:
-            # 使用 _get_available_memory_gb 的检测结果(已包含 psutil→/proc/meminfo 链)
+            free_gb = _get_available_memory_gb()
             if free_gb is None:
                 # 完全无法检测, 用配置默认值
                 logger.info(f"无法检测内存, 使用默认BATCH_SIZE={config.BATCH_SIZE}")
