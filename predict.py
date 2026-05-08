@@ -1,7 +1,7 @@
 """液态神经网络预测脚本 — 多周期多窗口融合版
 
 使用训练好的多周期融合模型，基于最新K线数据预测多个时间窗口后的涨跌。
-默认同时输出10分钟和30分钟后的涨跌概率。
+默认同时输出10分钟、30分钟和60分钟后的涨跌概率。
 """
 
 import os
@@ -265,15 +265,19 @@ def predict():
         # 例如h=10对齐到下一个10min边界, h=30对齐到下一个30min边界
         if h <= 30:
             align_floor = f'{h}min'
+        elif h == 60:
+            align_floor = '1h'
         else:
             align_floor = '1h'
+        # 计算对齐后的等待边界
         next_boundary = now.floor(align_floor) + pd.Timedelta(minutes=h)
         wait = max((next_boundary - now).total_seconds(), 30)
+        # 如果对齐后等待时间仍不足h分钟, 跳过不足的边界, 再等一个完整周期
         if wait < wait_seconds:
-            logger.info(f"对齐到 {next_boundary}, 等待 {wait:.0f}s")
-            time.sleep(wait)
-        else:
-            time.sleep(wait_seconds)
+            next_boundary += pd.Timedelta(minutes=h)
+            wait = max((next_boundary - now).total_seconds(), 30)
+        logger.info(f"对齐到 {next_boundary}, 等待 {wait:.0f}s")
+        time.sleep(wait)
 
         try:
             # 强制刷新缓存获取最新K线数据

@@ -24,8 +24,8 @@ CV_TEST_RATIO = 0.05         # 独立测试集(始终保留, 不参与CV)
 
 # ==================== 多预测周期配置 ====================
 # 同时预测多个时间窗口后的涨跌(分钟)
-# 10min: 短期趋势, 30min: 中期趋势
-PREDICTION_HORIZONS = [10, 30]
+# 10min: 短期趋势, 30min: 中期趋势, 60min: 长期趋势
+PREDICTION_HORIZONS = [10, 30, 60]
 # 标签来源: 用5min粒度的close计算各horizon后的价格变化
 LABEL_SOURCE_PERIOD = "5min"  # 标签基于该周期的K线数据计算
 LABEL_SMOOTH_WINDOW = 3       # 未来价格平滑窗口(单位: bar)
