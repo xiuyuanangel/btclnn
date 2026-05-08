@@ -51,14 +51,39 @@ def compute_rolling_stats(df, windows=(6, 36, 144)):
     return df
 
 
-def compute_rsi(df, windows=(6, 36, 144)):
-    """计算RSI(相对强弱指标)"""
+def compute_rsi(df, windows=(6, 36, 144)):  
+    """计算RSI(相对强弱指标)"""  
+    for w in windows:  
+        delta = df['close'].diff()  
+        gain = delta.where(delta > 0, 0).rolling(window=w, min_periods=1).mean()  
+        loss = (-delta.where(delta < 0, 0)).rolling(window=w, min_periods=1).mean()  
+        rs = gain / (loss + 1e-8)  
+        df[f'rsi_{w}'] = 100 - (100 / (1 + rs))  
+    return df
+
+
+def compute_bollinger_bands(df, windows=(20,), k=2.0):
+    """计算布林带特征
+
+    布林带反映价格相对位置和波动率扩张/收缩:
+      - bb_width: 带宽(上轨-下轨)/中轨, 表示波动率大小(可用于识别布林带收缩)
+      - bb_pct: %B位置 (close-下轨)/(上轨-下轨), 0~1表示价格在带内位置
+
+    Args:
+        df: K线DataFrame
+        windows: 滚动窗口大小列表
+        k: 标准差倍数(默认2)
+    """
+    eps = 1e-8
     for w in windows:
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(window=w, min_periods=1).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=w, min_periods=1).mean()
-        rs = gain / (loss + 1e-8)
-        df[f'rsi_{w}'] = 100 - (100 / (1 + rs))
+        ma = df['close'].rolling(window=w, min_periods=1).mean()
+        std = df['close'].rolling(window=w, min_periods=1).std()
+        upper = ma + k * std
+        lower = ma - k * std
+        # 带宽: (上轨-下轨)/中轨, 归一化波动率
+        df[f'bb_width_{w}'] = (upper - lower) / (ma + eps)
+        # %B: (close-下轨)/(上轨-下轨), 价格在带内的相对位置
+        df[f'bb_pct_{w}'] = (df['close'] - lower) / (upper - lower + eps)
     return df
 
 
@@ -111,13 +136,15 @@ def normalize_sequence_samplewise(tf_seqs):
     return normalized
 
 
-# 序列特征列名(混合方案: 原始OHLCV + 单期收益率, 每个时间步5个特征, 所有周期共享)
+# 序列特征列名(混合方案: 原始OHLCV + 收益率 + 布林带, 每个时间步7个特征, 所有周期共享)
 SEQ_FEATURE_COLS = [
-    'close',      # 核心价格
-    'vol',        # 成交量
-    'return_1',   # 单期收益率（最直接的变化量）
-    'high',       # 最高价
-    'low',        # 最低价
+    'close',        # 核心价格
+    'vol',          # 成交量
+    'return_1',     # 单期收益率（最直接的变化量）
+    'high',         # 最高价
+    'low',          # 最低价
+    'bb_width_20',  # 布林带带宽(波动率扩张/收缩)
+    'bb_pct_20',    # 布林带%B价格位置
 ]
 
 # 上下文特征列名(60天窗口的6个统计特征)
@@ -133,10 +160,11 @@ CONTEXT_FEATURE_COLS = [
 
 def compute_all_features(df):
     """对DataFrame计算序列特征(原地修改)
-    
-    混合方案: 仅计算 return_1, 其余(close/vol/high/low)为原始OHLCV字段
+
+    混合方案: 收益率 + 布林带, 其余(close/vol/high/low)为原始OHLCV字段
     """
     df = compute_returns(df, windows=(1,))
+    df = compute_bollinger_bands(df, windows=(20,))
     return df
 
 
@@ -701,6 +729,7 @@ def build_dataset(df, seq_length=None):
     df = compute_price_features(df)
     df = compute_rolling_stats(df)
     df = compute_rsi(df)
+    df = compute_bollinger_bands(df, windows=(20,))
     context = compute_context_features(df)
     horizons = config.PREDICTION_HORIZONS
     df = compute_labels(df, horizons=horizons)
