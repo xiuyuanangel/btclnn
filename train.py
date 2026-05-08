@@ -81,67 +81,127 @@ def train_model():
     device = torch.device("cuda" if _use_cuda else "cpu")
     logger.info(f"使用设备: {device}")
 
-    def _get_available_memory_gb(device):
-        if torch.cuda.is_available() and device.type == 'cuda':
-            total_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
-            used_gb = torch.cuda.memory_allocated(device) / (1024**3)
-            return total_gb - used_gb
+    # ==================== 多GPU环境检测 ====================
+    _n_gpu = torch.cuda.device_count() if _use_cuda else 0
+    if _n_gpu > 1:
+        logger.info(f"检测到 {_n_gpu} 块GPU, 将使用 DataParallel 自动并行")
+        for i in range(_n_gpu):
+            props = torch.cuda.get_device_properties(i)
+            used = torch.cuda.memory_allocated(i) / (1024**3)
+            free = props.total_memory / (1024**3) - used
+            logger.info(
+                f"  GPU {i}: {props.name}, "
+                f"总显存{props.total_memory/(1024**3):.1f}GB, "
+                f"已用{used:.1f}GB, 可用{free:.1f}GB, "
+                f"计算能力sm_{props.major}{props.minor}"
+            )
+    elif _n_gpu == 1:
+        props = torch.cuda.get_device_properties(0)
+        logger.info(f"GPU: {props.name}, "
+                    f"总显存{props.total_memory/(1024**3):.1f}GB, "
+                    f"计算能力sm_{props.major}{props.minor}")
+
+    def _get_available_memory_gb():
+        """获取可用内存/显存(GB). GPU取所有卡的最小值, CPU依次尝试psutil→/proc/meminfo"""
+        if torch.cuda.is_available() and _use_cuda:
+            min_free = float('inf')
+            for i in range(max(1, _n_gpu)):
+                total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                free = total - allocated
+                if free < min_free:
+                    min_free = free
+            return min_free
+
+        # CPU: 先试 psutil
         try:
             import psutil
             return psutil.virtual_memory().available / (1024**3)
         except ImportError:
-            return 16.0
+            pass
 
-    def _auto_batch_size(device):
-        free_gb = _get_available_memory_gb(device)
-        base = config.BATCH_SIZE
+        # CPU: 再试 /proc/meminfo (Linux, 含GitHub Actions)
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        kb = int(line.split()[1])
+                        return kb / (1024**2)
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if line.startswith('MemFree:'):
+                        kb = int(line.split()[1])
+                        return kb / (1024**2)
+        except (FileNotFoundError, IOError, ValueError):
+            pass
+
+        # CPU: 均失败, 返回None由调用方决定回退策略
+        logger.warning("无法检测系统可用内存, 将使用默认BATCH_SIZE")
+        return None
+
+    def _auto_batch_size(device, data_on_gpu=False):
+        """根据可用显存/内存自动估算全局BATCH_SIZE
+
+        多GPU (DataParallel) 时全局 batch = per_gpu_batch * n_gpu,
+        因为每卡只分摊全局batch的 1/n_gpu 样本.
+        """
+        free_gb = _get_available_memory_gb()
+        gpu_count = max(1, _n_gpu)
+
         if device.type == 'cuda':
-            if free_gb < 2:
-                logger.warning(f"GPU剩余显存不足{free_gb:.1f}GB，降低BATCH_SIZE至64")
-                return 64
-            elif free_gb < 4:
-                logger.info(f"GPU剩余显存{free_gb:.1f}GB，降低BATCH_SIZE至128")
-                return 128
-            elif free_gb < 6:
-                logger.info(f"GPU剩余显存{free_gb:.1f}GB，降低BATCH_SIZE至256")
-                return 256
-            elif free_gb < 8:
-                logger.info(f"GPU剩余显存{free_gb:.1f}GB，使用BATCH_SIZE=512")
-                return 512
-            elif free_gb < 12:
-                logger.info(f"GPU剩余显存{free_gb:.1f}GB，使用BATCH_SIZE=1024")
-                return 1024
-            elif free_gb < 18:
-                logger.info(f"GPU剩余显存{free_gb:.1f}GB，使用BATCH_SIZE=2048")
-                return 2048
+            # 预转数据常驻GPU 0时会吃掉大量显存, 更保守
+            _eff_free = free_gb * (0.5 if data_on_gpu else 1.0)
+
+            # 以下为**每块GPU**能安全运行的batch大小
+            if _eff_free < 2:
+                per_gpu_batch = 64
+            elif _eff_free < 4:
+                per_gpu_batch = 128
+            elif _eff_free < 6:
+                per_gpu_batch = 256
+            elif _eff_free < 8:
+                per_gpu_batch = 512
+            elif _eff_free < 12:
+                per_gpu_batch = 1024
+            elif _eff_free < 18:
+                per_gpu_batch = 2048
             else:
-                logger.info(f"GPU显存充足({free_gb:.1f}GB可用)，使用BATCH_SIZE=3072")
-                return 3072
+                per_gpu_batch = 3072
+
+            # 全局 batch = 每卡batch * 卡数
+            global_batch = per_gpu_batch * gpu_count
+
+            logger.info(
+                f"显存: 瓶颈可用{free_gb:.1f}GB"
+                f"(有效{_eff_free:.1f}GB数据预转), "
+                f"{gpu_count}卡 → 每卡batch={per_gpu_batch}, "
+                f"全局batch={global_batch}"
+            )
+            return global_batch
         else:
-            try:
-                import psutil
-                avail_ram_gb = psutil.virtual_memory().available / (1024**3)
-                if avail_ram_gb < 4:
-                    logger.warning(f"系统可用内存不足{avail_ram_gb:.1f}GB，降低BATCH_SIZE至128")
-                    return 128
-                elif avail_ram_gb < 8:
-                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，降低BATCH_SIZE至256")
-                    return 256
-                elif avail_ram_gb < 16:
-                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，使用BATCH_SIZE=512")
-                    return 512
-                elif avail_ram_gb < 32:
-                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，使用BATCH_SIZE=1024")
-                    return 1024
-                elif avail_ram_gb < 64:
-                    logger.info(f"系统可用内存{avail_ram_gb:.1f}GB，使用BATCH_SIZE=2048")
-                    return 2048
-                else:
-                    logger.info(f"系统可用内存充足({avail_ram_gb:.1f}GB)，使用BATCH_SIZE=3072")
-                    return 3072
-            except ImportError:
-                logger.info(f"无法检测系统内存，使用默认BATCH_SIZE={base}")
-                return base
+            # 使用 _get_available_memory_gb 的检测结果(已包含 psutil→/proc/meminfo 链)
+            if free_gb is None:
+                # 完全无法检测, 用配置默认值
+                logger.info(f"无法检测内存, 使用默认BATCH_SIZE={config.BATCH_SIZE}")
+                return config.BATCH_SIZE
+            if free_gb < 4:
+                logger.warning(f"系统可用内存{free_gb:.1f}GB，降低BATCH_SIZE至128")
+                return 128
+            elif free_gb < 8:
+                logger.info(f"系统可用内存{free_gb:.1f}GB，降低BATCH_SIZE至256")
+                return 256
+            elif free_gb < 16:
+                logger.info(f"系统可用内存{free_gb:.1f}GB，降低BATCH_SIZE至384")
+                return 384
+            elif free_gb < 24:
+                logger.info(f"系统可用内存{free_gb:.1f}GB，使用BATCH_SIZE=512")
+                return 512
+            elif free_gb < 32:
+                logger.info(f"系统可用内存{free_gb:.1f}GB，使用BATCH_SIZE=768")
+                return 768
+            else:
+                logger.info(f"系统可用内存充足({free_gb:.1f}GB)，使用BATCH_SIZE=1024")
+                return 1024
 
     periods = list(config.TIMEFRAMES.keys())
     logger.info(f"多周期融合 {periods}")
@@ -277,9 +337,7 @@ def train_model():
             val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
             test_dataset = MultiTimeframeDataset(cv_test_data[0], cv_test_data[1], cv_test_data[2], periods)
 
-        _effective_batch_size = config.BATCH_SIZE if not config.USE_AUTO_BATCH_SIZE else _auto_batch_size(device)
-        if config.USE_AUTO_BATCH_SIZE:
-            logger.info(f"自动BATCH_SIZE: {_effective_batch_size}")
+        _effective_batch_size = config.BATCH_SIZE if not config.USE_AUTO_BATCH_SIZE else _auto_batch_size(device, data_on_gpu=_use_preconverted)
         _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
 
         train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, **_dl_kwargs)

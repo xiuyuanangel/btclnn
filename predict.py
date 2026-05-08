@@ -165,6 +165,8 @@ def predict():
             pass
     device = torch.device("cuda" if _use_cuda else "cpu")
     logger.info(f"使用设备: {device}")
+    if _use_cuda and torch.cuda.device_count() > 1:
+        logger.info(f"检测到 {torch.cuda.device_count()} 块GPU")
 
     # 1. 加载模型(返回模型和窗口列表)
     model, horizons = load_model(device)
