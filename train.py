@@ -139,9 +139,10 @@ def train_model():
         logger.warning("无法检测系统可用内存, 将使用默认BATCH_SIZE")
         return None
 
-    def _auto_batch_size(device, data_on_gpu=False):
+    def _auto_batch_size(device):
         """根据可用显存/内存自动估算全局BATCH_SIZE
 
+        调用时机: 模型+数据已在GPU上, free_gb 即真正可用于batch的显存.
         多GPU (DataParallel) 时全局 batch = per_gpu_batch * n_gpu,
         因为每卡只分摊全局batch的 1/n_gpu 样本.
         """
@@ -149,21 +150,18 @@ def train_model():
         gpu_count = max(1, _n_gpu)
 
         if device.type == 'cuda':
-            # 预转数据常驻GPU 0时会吃掉大量显存, 更保守
-            _eff_free = free_gb * (0.5 if data_on_gpu else 1.0)
-
             # 以下为**每块GPU**能安全运行的batch大小
-            if _eff_free < 2:
+            if free_gb < 2:
                 per_gpu_batch = 64
-            elif _eff_free < 4:
+            elif free_gb < 4:
                 per_gpu_batch = 128
-            elif _eff_free < 6:
+            elif free_gb < 6:
                 per_gpu_batch = 256
-            elif _eff_free < 8:
+            elif free_gb < 8:
                 per_gpu_batch = 512
-            elif _eff_free < 12:
+            elif free_gb < 12:
                 per_gpu_batch = 1024
-            elif _eff_free < 18:
+            elif free_gb < 18:
                 per_gpu_batch = 2048
             else:
                 per_gpu_batch = 3072
@@ -172,8 +170,7 @@ def train_model():
             global_batch = per_gpu_batch * gpu_count
 
             logger.info(
-                f"显存: 瓶颈可用{free_gb:.1f}GB"
-                f"(有效{_eff_free:.1f}GB数据预转), "
+                f"显存: 可用{free_gb:.1f}GB (模型+数据已加载), "
                 f"{gpu_count}卡 → 每卡batch={per_gpu_batch}, "
                 f"全局batch={global_batch}"
             )
@@ -313,10 +310,9 @@ def train_model():
             logger.info(f"{'='*60}")
             logger.info(f"训练集: {len(train_data[2])} 条, 验证集: {len(val_data[2])} 条")
 
-        # ---- 创建 DataLoader (复用原有逻辑) ----
+        # ---- 创建数据集(预转GPU) ----
         _use_preconverted = False
         if _use_cuda:
-            t_pre = time.time()
             def _to_gpu_tensor_dict(data_tuple):
                 x_d, x_c, y_arr = data_tuple
                 return (
@@ -336,13 +332,6 @@ def train_model():
             train_dataset = MultiTimeframeDataset(train_data[0], train_data[1], train_data[2], periods)
             val_dataset = MultiTimeframeDataset(val_data[0], val_data[1], val_data[2], periods)
             test_dataset = MultiTimeframeDataset(cv_test_data[0], cv_test_data[1], cv_test_data[2], periods)
-
-        _effective_batch_size = config.BATCH_SIZE if not config.USE_AUTO_BATCH_SIZE else _auto_batch_size(device, data_on_gpu=_use_preconverted)
-        _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
-
-        train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, **_dl_kwargs)
-        val_loader = DataLoader(val_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
-        test_loader = DataLoader(test_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
 
         # ---- 创建模型(每折独立, 防止跨折泄露) ----
         feat_size = len(SEQ_FEATURE_COLS)
@@ -433,6 +422,15 @@ def train_model():
         total_params, trainable_params = count_parameters(model)
         if fold_idx == 0:
             logger.info(f"模型参数: 总计 {total_params:,}, 可训练{trainable_params:,}")
+
+        # ---- **模型+数据已在GPU上**, 在此测量剩余显存计算batch ----
+        _effective_batch_size = config.BATCH_SIZE
+        if config.USE_AUTO_BATCH_SIZE:
+            _effective_batch_size = _auto_batch_size(device)
+        _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
+        train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, **_dl_kwargs)
+        val_loader = DataLoader(val_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
+        test_loader = DataLoader(test_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
 
         # ---- 优化器/学习率调度/损失函数 ----
         optimizer = torch.optim.Adam(
