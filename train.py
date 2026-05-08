@@ -486,42 +486,30 @@ def train_model():
             else:
                 _pos_weights.append(1.0)
 
-        class WeightedFocalLoss(nn.Module):
-            """加权 Focal Loss
+        class WeightedBCE(nn.Module):
+            """加权二元交叉熵(Weighted BCE)
 
-            在 WeightedBCE 基础上引入 Focal Loss 机制:
-              FL(p_t) = -(1-p_t)^γ * log(p_t)
-            - gamma=0 → 退化为标准 BCE
-            - gamma=2.0 → 关注难分类样本(靠近决策边界的)
-            - 保持 per_horizon pos_weight 做类别平衡
-
-            金融涨跌分类中大量样本模糊不清,
-            Focal Loss 让模型专注于有价值"难例"而非已分类正确的样本。
+            移除 Focal 调制(gamma=0), 金融数据信噪比极低,
+            几乎所有样本都靠近决策边界, Focal Loss 会错误压制
+            本应有梯度的"已正确分类"样本, 导致模型坍缩至常数预测。
             """
-            def __init__(self, per_horizon_weights, gamma=2.0):
+            def __init__(self, per_horizon_weights):
                 super().__init__()
-                self.gamma = gamma
                 self.register_buffer(
                     'weights',
                     torch.tensor(per_horizon_weights, dtype=torch.float32),
                 )
 
             def forward(self, pred, target):
-                # BCE 基础项
                 bce = F.binary_cross_entropy(pred, target, reduction='none')
-                # 预测置信度: p_t = p if y=1 else 1-p
-                pt = torch.where(target >= 0.5, pred, 1 - pred)
-                # Focal 调制因子: (1-p_t)^γ, 正确高置信样本loss被压制
-                focal = (1 - pt) ** self.gamma
-                # 类别平衡权重
                 weight_vec = self.weights.to(target.device).unsqueeze(0)
                 sample_weights = torch.where(target >= 0.5, weight_vec,
                                               torch.ones_like(target))
-                return (bce * focal * sample_weights).mean()
+                return (bce * sample_weights).mean()
 
-        criterion = WeightedFocalLoss(_pos_weights, gamma=0.5)
+        criterion = WeightedBCE(_pos_weights)
         if fold_idx == 0:
-            logger.info(f"使用 WeightedFocalLoss(gamma=0.5), 各窗口pos_weight={_pos_weights}")
+            logger.info(f"使用 WeightedBCE, 各窗口pos_weight={_pos_weights}")
 
         # ---- CV 各折训练循环 ----
         _max_epochs = config.EPOCHS
@@ -581,6 +569,14 @@ def train_model():
             train_acc = train_correct / train_total
             _train_acc_per_h = [_train_horizon_correct[h] / max(_train_horizon_total[h], 1) for h in range(_num_horizons)]
 
+            # 梯度诊断: 每 epoch 末尾采样一次总梯度范数
+            _total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    _total_norm += p.grad.norm().item() ** 2
+            _total_norm = _total_norm ** 0.5
+            _grad_info = f"grad_norm={_total_norm:.4e}"
+
             # --- 验证 ---
             model.eval()
             val_loss, val_correct, val_total = 0.0, 0, 0
@@ -618,7 +614,7 @@ def train_model():
                 f"{fold_tag}Epoch {epoch:3d}/{_max_epochs} | "
                 f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
                 f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
-                f"LR: {current_lr:.6f} | {elapsed:.1f}s"
+                f"LR: {current_lr:.6f} | {_grad_info} | {elapsed:.1f}s"
             )
             _h_train_str = " | ".join([f"{config.PREDICTION_HORIZONS[h]}m:{_train_acc_per_h[h]:.3f}" for h in range(_num_horizons)])
             _h_val_str = " | ".join([f"{config.PREDICTION_HORIZONS[h]}m:{_val_acc_per_h[h]:.3f}" for h in range(_num_horizons)])
