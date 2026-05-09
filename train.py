@@ -468,14 +468,15 @@ def train_model():
             weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-4),
         )
         steps_per_epoch = len(train_loader)
+        max_epochs = 200  # 限制最大epoch让OneCycleLR正常工作
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=_scaled_lr * 10,
-            epochs=config.EPOCHS,
+            max_lr=_scaled_lr * 3,  # 降低max_lr
+            epochs=max_epochs,
             steps_per_epoch=steps_per_epoch,
             pct_start=0.3,
             anneal_strategy='cos',
-            final_div_factor=_scaled_lr / (1e-7),
+            final_div_factor=10000.0,  # 直接设置合理的div factor
         )
 
         # 类别平衡权重
@@ -494,7 +495,7 @@ def train_model():
                 _pos_weights.append(1.0)
 
         class FocalLoss(nn.Module):
-            def __init__(self, alpha=0.25, gamma=2.0, per_horizon_weights=None):
+            def __init__(self, alpha=1.0, gamma=2.0, per_horizon_weights=None):
                 super().__init__()
                 self.alpha = alpha
                 self.gamma = gamma
@@ -511,18 +512,18 @@ def train_model():
                     logits, target, reduction='none'
                 )
                 pt = torch.exp(-bce)
-                focal_weight = self.alpha * (1 - pt) ** self.gamma
+                focal_weight = (1 - pt) ** self.gamma  # alpha 不再乘到损失上
                 weight_vec = self.weights.to(target.device).unsqueeze(0)
                 sample_weights = torch.where(target >= 0.5, weight_vec,
                                              torch.ones_like(target))
-                return (focal_weight * bce * sample_weights).mean()
+                return (focal_weight * bce * sample_weights * self.alpha).mean()
 
-        criterion = FocalLoss(alpha=0.25, gamma=2.0, per_horizon_weights=_pos_weights)
+        criterion = FocalLoss(alpha=1.0, gamma=2.0, per_horizon_weights=_pos_weights)
         if fold_idx == 0:
-            logger.info(f"使用 FocalLoss(alpha=0.25, gamma=2.0), 各窗口pos_weight={_pos_weights}")
+            logger.info(f"使用 FocalLoss(alpha=1.0, gamma=2.0), 各窗口pos_weight={_pos_weights}")
 
         # ---- CV 各折训练循环 ----
-        _max_epochs = config.EPOCHS
+        _max_epochs = max_epochs
         best_val_loss = float('inf')
         patience_counter = 0
         epoch = 0
