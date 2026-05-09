@@ -37,7 +37,7 @@ class HuobiDataFetcher:
     """火币永续合约数据获取器，支持多节点备用切换"""
 
     def __init__(self, symbol=None, base_url=None):
-        self.symbol = symbol or config.SYMBOL
+        self.symbol = symbol or getattr(config, 'SYMBOL', config.SYMBOLS[0] if hasattr(config, 'SYMBOLS') and config.SYMBOLS else 'BTC-USDT')
         self.base_urls = config.HUOBI_BASE_URLS
         self.base_url = base_url or config.HUOBI_BASE_URL
         self.current_url_index = 0
