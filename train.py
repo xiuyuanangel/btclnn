@@ -674,7 +674,7 @@ def train_model():
         # 加载最佳折的模型用于测试
         _best_ckpt = torch.load(_best_across_folds['model_path'], map_location=device, weights_only=False)
     else:
-        _best_ckpt = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
+        _best_ckpt = torch.load(_best_across_folds['model_path'], map_location=device, weights_only=False)
     model.load_state_dict(_strip_module_prefix(_best_ckpt['model_state_dict']))
     model.eval()
 
