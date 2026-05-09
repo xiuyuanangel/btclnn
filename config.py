@@ -53,9 +53,19 @@ LEARNING_RATE = 5e-4        # 学习率(从1e-3降低至5e-4, 更稳定收敛)
 WEIGHT_DECAY = 3e-4         # L2正则化(新增, 进一步抑制过拟合)
 BATCH_SIZE = 512            # 批处理大小(USE_AUTO_BATCH_SIZE=False时使用)
 USE_AUTO_BATCH_SIZE = False  # 自动调整BATCH_SIZE根据可用内存/显存
-EPOCHS = 99999               # 训练轮数(上限, 实际由 MAX_TRAIN_SECONDS 控制)
+EPOCHS = 200                # 训练轮数(上限, 实际由 MAX_TRAIN_SECONDS 控制，用于OneCycleLR调度)
 MAX_TRAIN_SECONDS = 17640   # 最大训练时长(秒), 默认4.8小时(预留余量给测试+上传)
 PATIENCE = 140               # 早停耐心值(更快截断过拟合)
+
+# ==================== Focal Loss配置 ====================
+FOCAL_ALPHA = 1.0           # Focal Loss alpha参数(正负样本权重平衡)
+FOCAL_GAMMA = 2.0           # Focal Loss gamma参数(难例聚焦程度)
+
+# ==================== OneCycleLR配置 ====================
+ONECYCLE_MAX_LR_SCALE = 3.0  # OneCycleLR最大LR相对于scaled_lr的倍数
+ONECYCLE_PCT_START = 0.3    # OneCycleLR预热阶段占总步数比例
+ONECYCLE_ANNEAL_STRATEGY = 'cos'  # OneCycleLR退火策略('cos'或'linear')
+ONECYCLE_FINAL_DIV_FACTOR = 10000.0  # OneCycleLR最终LR衰减因子
 
 # ==================== Transformer增强配置 ====================
 USE_TRANSFORMER = True       # 是否启用Transformer增强(融合LTC+Transformer)

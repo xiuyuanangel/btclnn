@@ -468,15 +468,14 @@ def train_model():
             weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-4),
         )
         steps_per_epoch = len(train_loader)
-        max_epochs = 200  # 限制最大epoch让OneCycleLR正常工作
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=_scaled_lr * 3,  # 降低max_lr
-            epochs=max_epochs,
+            max_lr=_scaled_lr * config.ONECYCLE_MAX_LR_SCALE,
+            epochs=config.EPOCHS,
             steps_per_epoch=steps_per_epoch,
-            pct_start=0.3,
-            anneal_strategy='cos',
-            final_div_factor=10000.0,  # 直接设置合理的div factor
+            pct_start=config.ONECYCLE_PCT_START,
+            anneal_strategy=config.ONECYCLE_ANNEAL_STRATEGY,
+            final_div_factor=config.ONECYCLE_FINAL_DIV_FACTOR,
         )
 
         # 类别平衡权重
@@ -518,12 +517,16 @@ def train_model():
                                              torch.ones_like(target))
                 return (focal_weight * bce * sample_weights * self.alpha).mean()
 
-        criterion = FocalLoss(alpha=1.0, gamma=2.0, per_horizon_weights=_pos_weights)
+        criterion = FocalLoss(
+            alpha=config.FOCAL_ALPHA,
+            gamma=config.FOCAL_GAMMA,
+            per_horizon_weights=_pos_weights
+        )
         if fold_idx == 0:
-            logger.info(f"使用 FocalLoss(alpha=1.0, gamma=2.0), 各窗口pos_weight={_pos_weights}")
+            logger.info(f"使用 FocalLoss(alpha={config.FOCAL_ALPHA}, gamma={config.FOCAL_GAMMA}), 各窗口pos_weight={_pos_weights}")
 
         # ---- CV 各折训练循环 ----
-        _max_epochs = max_epochs
+        _max_epochs = config.EPOCHS
         best_val_loss = float('inf')
         patience_counter = 0
         epoch = 0
