@@ -39,8 +39,8 @@ LABEL_DROP_NEUTRAL = True     # 是否丢弃噪声中性样本
 #    长周期(4hour/1day)取更久以支持上下文特征窗口
 TIMEFRAMES = {
     '5min':  {'seq_length': 72,  'lookback_days': 1460},   # 72根×5min = 6小时短期趋势(标签来源, 决定时间范围)
-    '15min': {'seq_length': 48,  'lookback_days': 1460},   # 48根×15min = 12小时中期
-    '60min': {'seq_length': 48,  'lookback_days': 1460},   # 48根×60min = 2天长期
+    '15min': {'seq_length': 48,  'lookback_days': 1520},   # 48根×15min = 12小时中期
+    '60min': {'seq_length': 48,  'lookback_days': 1520},   # 48根×60min = 2天长期
     '4hour': {'seq_length': 42,  'lookback_days': 1520},   # 42根×4hour = 7天宏观(context特征来源)
     '1day':  {'seq_length': 60,  'lookback_days': 1800},   # 60根×1day = 60天趋势
 }
