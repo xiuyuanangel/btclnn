@@ -467,8 +467,15 @@ def train_model():
             lr=_scaled_lr,
             weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-4),
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.3, patience=3, min_lr=1e-6,
+        steps_per_epoch = len(train_loader)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=_scaled_lr * 10,
+            epochs=config.EPOCHS,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.3,
+            anneal_strategy='cos',
+            final_div_factor=_scaled_lr / (1e-7),
         )
 
         # 类别平衡权重
@@ -486,31 +493,33 @@ def train_model():
             else:
                 _pos_weights.append(1.0)
 
-        class WeightedBCE(nn.Module):
-            """加权二分类交叉熵(配合 BCEWithLogits, 无Sigmoid)
-
-            BCEWithLogits 将 Sigmoid + BCE 合并为单一数值稳定操作,
-            避免内部 Sigmoid 饱和导致梯度消失的问题。
-            """
-            def __init__(self, per_horizon_weights):
+        class FocalLoss(nn.Module):
+            def __init__(self, alpha=0.25, gamma=2.0, per_horizon_weights=None):
                 super().__init__()
-                self.register_buffer(
-                    'weights',
-                    torch.tensor(per_horizon_weights, dtype=torch.float32),
-                )
+                self.alpha = alpha
+                self.gamma = gamma
+                if per_horizon_weights is not None:
+                    self.register_buffer(
+                        'weights',
+                        torch.tensor(per_horizon_weights, dtype=torch.float32),
+                    )
+                else:
+                    self.register_buffer('weights', torch.ones(_num_horizons))
 
             def forward(self, logits, target):
                 bce = F.binary_cross_entropy_with_logits(
                     logits, target, reduction='none'
                 )
+                pt = torch.exp(-bce)
+                focal_weight = self.alpha * (1 - pt) ** self.gamma
                 weight_vec = self.weights.to(target.device).unsqueeze(0)
                 sample_weights = torch.where(target >= 0.5, weight_vec,
-                                              torch.ones_like(target))
-                return (bce * sample_weights).mean()
+                                             torch.ones_like(target))
+                return (focal_weight * bce * sample_weights).mean()
 
-        criterion = WeightedBCE(_pos_weights)
+        criterion = FocalLoss(alpha=0.25, gamma=2.0, per_horizon_weights=_pos_weights)
         if fold_idx == 0:
-            logger.info(f"使用 WeightedBCE, 各窗口pos_weight={_pos_weights}")
+            logger.info(f"使用 FocalLoss(alpha=0.25, gamma=2.0), 各窗口pos_weight={_pos_weights}")
 
         # ---- CV 各折训练循环 ----
         _max_epochs = config.EPOCHS
@@ -556,6 +565,7 @@ def train_model():
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                scheduler.step()
 
                 batch_size = labels.size(0)
                 train_loss += loss.item() * batch_size
@@ -605,7 +615,6 @@ def train_model():
             val_loss /= val_total
             val_acc = val_correct / val_total
             _val_acc_per_h = [_val_horizon_correct[h] / max(_val_horizon_total[h], 1) for h in range(_num_horizons)]
-            scheduler.step(val_loss)
 
             elapsed = time.time() - t0
             current_lr = optimizer.param_groups[0]['lr']
