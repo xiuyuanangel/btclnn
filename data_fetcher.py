@@ -417,6 +417,37 @@ class HuobiDataFetcher:
                 logger.info(f"  {period}: {len(timeframe_data[period])} 条K线")
         return timeframe_data
 
+    def fetch_all_symbols_data(self, force_refresh=False):
+        """获取所有配置币种的多周期数据
+
+        Returns:
+            dict: {symbol: {period: list_of_kline_dicts}}
+        """
+        all_symbols_data = {}
+        symbols = getattr(config, 'SYMBOLS', [config.SYMBOL]) if hasattr(config, 'SYMBOLS') else [config.SYMBOL]
+
+        for symbol in symbols:
+            logger.info(f"{'='*60}")
+            logger.info(f"开始获取 {symbol} 数据")
+            logger.info(f"{'='*60}")
+
+            symbol_fetcher = HuobiDataFetcher(symbol=symbol)
+            symbol_tf_data = symbol_fetcher.fetch_multi_timeframe(force_refresh=force_refresh)
+
+            # 获取10分钟数据作为目标数据
+            if '5min' in symbol_tf_data and symbol_tf_data['5min']:
+                symbol_10min_data = symbol_fetcher.resample_to_10min(symbol_tf_data['5min'])
+                symbol_tf_data['10min'] = symbol_10min_data
+
+            all_symbols_data[symbol] = symbol_tf_data
+
+        logger.info(f"{'='*60}")
+        logger.info(f"多币种数据获取完成: {len(all_symbols_data)} 个币种")
+        logger.info(f"{'='*60}")
+        for symbol, data in all_symbols_data.items():
+            logger.info(f"  {symbol}: {len(data)} 个周期")
+        return all_symbols_data
+
     def get_dataframe(self, data):
         """将字典列表转换为DataFrame"""
         if not data:

@@ -15,7 +15,7 @@ import config
 from data_fetcher import HuobiDataFetcher
 from notifier import MeoWNotifier
 from features import (
-    build_multi_tf_dataset, split_multi_tf_dataset, rolling_cv_split,
+    build_multi_tf_dataset, build_multi_symbol_dataset, split_multi_tf_dataset, rolling_cv_split,
     normalize_datasets,
     MultiTimeframeDataset, PreConvertedTensorDataset,
     SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
@@ -226,35 +226,19 @@ def train_model():
 
     # ==================== 1. 获取数据 ====================
     logger.info("=" * 60)
-    logger.info("步骤 1: 获取多周期K线数据")
+    logger.info("步骤 1: 获取多币种多周期K线数据")
     logger.info("=" * 60)
 
     fetcher = HuobiDataFetcher()
-    timeframe_data = fetcher.fetch_multi_timeframe()
-
-    # 构建10min目标时间帧(用于样本时间轴对齐)
-    data_10min = fetcher.resample_to_10min(timeframe_data['5min'])
-    target_df = fetcher.get_dataframe(data_10min)
-
-    if target_df.empty or len(target_df) < 100:
-        logger.error("目标时间线数据不足")
-        return None
-
-    # 5min数据作为标签来源(细粒度计算多周期标签)
-    label_source_df = fetcher.get_dataframe(timeframe_data['5min'])
-
-    # 各周期转DataFrame
-    tf_dfs = {}
-    for period, data in timeframe_data.items():
-        tf_dfs[period] = fetcher.get_dataframe(data)
+    all_symbols_data = fetcher.fetch_all_symbols_data()
 
     # ==================== 2. 构建数据集 ====================
     logger.info("=" * 60)
-    logger.info("步骤 2: 多周期特征工程与数据集构建")
+    logger.info("步骤 2: 多币种多周期特征工程与数据集构建")
     logger.info("=" * 60)
 
-    X_dict, X_ctx, y = build_multi_tf_dataset(
-        tf_dfs, target_df, label_source_df=label_source_df,
+    X_dict, X_ctx, y = build_multi_symbol_dataset(
+        all_symbols_data, fetcher,
         export_debug_csv=getattr(config, 'DEBUG_EXPORT_CSV', False),
     )
 

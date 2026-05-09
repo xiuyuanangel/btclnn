@@ -478,6 +478,100 @@ def build_multi_tf_dataset(tf_dfs, target_df, label_source_df=None,
     return X_dict, X_ctx, y
 
 
+def build_multi_symbol_dataset(all_symbols_tf_data, fetcher, export_debug_csv=False):
+    """构建多币种融合数据集，合并所有币种的样本，增加样本数量
+
+    Args:
+        all_symbols_tf_data: dict {symbol: {period: list_of_kline_dicts}}
+        fetcher: HuobiDataFetcher实例，用于转换为DataFrame
+        export_debug_csv: 是否导出调试CSV
+
+    Returns:
+        X_dict_merged: dict of {period: np.array (N, seq_len, feature_size)}
+        X_ctx_merged: np.array (N, context_size)
+        y_merged: np.array (N, num_horizons)
+    """
+    all_X_dicts = []
+    all_X_ctx = []
+    all_y = []
+
+    for symbol, symbol_tf_data in all_symbols_tf_data.items():
+        logger.info(f"{'='*60}")
+        logger.info(f"处理币种: {symbol}")
+        logger.info(f"{'='*60}")
+
+        # 转换为DataFrames
+        tf_dfs = {}
+        for period, data in symbol_tf_data.items():
+            if period == '10min':
+                continue
+            if data:
+                tf_dfs[period] = fetcher.get_dataframe(data)
+
+        # 检查必需周期
+        required_periods = list(config.TIMEFRAMES.keys())
+        missing_periods = [p for p in required_periods if p not in tf_dfs or len(tf_dfs[p]) == 0]
+        if missing_periods:
+            logger.warning(f"{symbol} 缺少必需周期数据: {missing_periods}，跳过该币种")
+            continue
+
+        # 获取目标数据
+        target_df = fetcher.get_dataframe(symbol_tf_data['10min'])
+        label_source_df = fetcher.get_dataframe(symbol_tf_data['5min'])
+
+        if target_df.empty or label_source_df.empty:
+            logger.warning(f"{symbol} 目标数据为空，跳过该币种")
+            continue
+
+        # 构建该币种的数据集
+        try:
+            X_dict, X_ctx, y = build_multi_tf_dataset(
+                tf_dfs, target_df, label_source_df=label_source_df,
+                export_debug_csv=export_debug_csv
+            )
+            if len(y) > 0:
+                all_X_dicts.append(X_dict)
+                all_X_ctx.append(X_ctx)
+                all_y.append(y)
+                logger.info(f"{symbol}: 成功获取 {len(y)} 个样本")
+            else:
+                logger.warning(f"{symbol}: 样本数为0，跳过")
+        except Exception as e:
+            logger.error(f"{symbol}: 构建数据集失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    # 合并所有币种的数据
+    if not all_X_dicts:
+        logger.error("没有有效币种数据，无法构建数据集")
+        return {}, np.array([]), np.array([])
+
+    # 合并各数组
+    merged_X_dict = {}
+    for period in all_X_dicts[0].keys():
+        merged_X_dict[period] = np.concatenate([d[period] for d in all_X_dicts], axis=0)
+
+    merged_X_ctx = np.concatenate(all_X_ctx, axis=0)
+    merged_y = np.concatenate(all_y, axis=0)
+
+    logger.info(f"{'='*60}")
+    logger.info(f"多币种数据集构建完成: {len(all_symbols_tf_data)} 个币种，共 {len(merged_y)} 个样本")
+    logger.info(f"{'='*60}")
+    for period, arr in merged_X_dict.items():
+        logger.info(f"  {period}: {arr.shape}")
+    logger.info(f"  上下文特征: {merged_X_ctx.shape}")
+    logger.info(f"  标签: {merged_y.shape}")
+
+    # 统计合并后各标签窗口的涨跌比例
+    horizons = config.PREDICTION_HORIZONS
+    for i, h in enumerate(horizons):
+        up_ratio = merged_y[:, i].mean()
+        logger.info(f"  标签[{h}m]: 涨={merged_y[:, i].sum():.0f} ({up_ratio:.2%}), "
+                     f"跌={(len(merged_y)-merged_y[:, i].sum()):.0f} ({1-up_ratio:.2%})")
+
+    return merged_X_dict, merged_X_ctx, merged_y
+
+
 def export_dataset_debug_csv(X_dict, X_ctx, y, target_df_with_id, tf_dfs_raw,
                              global_valid_mask, output_path, num_samples=30):
     """导出少量数据集样本到CSV，供人工核验多周期对齐是否正确
