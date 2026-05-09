@@ -424,7 +424,13 @@ class HuobiDataFetcher:
             dict: {symbol: {period: list_of_kline_dicts}}
         """
         all_symbols_data = {}
-        symbols = getattr(config, 'SYMBOLS', [config.SYMBOL]) if hasattr(config, 'SYMBOLS') else [config.SYMBOL]
+        _default_symbol = 'BTC-USDT'
+        if hasattr(config, 'SYMBOLS') and config.SYMBOLS:
+            symbols = config.SYMBOLS
+        elif hasattr(config, 'SYMBOL'):
+            symbols = [config.SYMBOL]
+        else:
+            symbols = [_default_symbol]
 
         for symbol in symbols:
             logger.info(f"{'='*60}")
