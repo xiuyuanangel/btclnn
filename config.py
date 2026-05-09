@@ -59,13 +59,13 @@ PATIENCE = 140               # 早停耐心值(更快截断过拟合)
 
 # ==================== Focal Loss配置 ====================
 FOCAL_ALPHA = 1.0           # Focal Loss alpha参数(正负样本权重平衡)
-FOCAL_GAMMA = 2.0           # Focal Loss gamma参数(难例聚焦程度)
+FOCAL_GAMMA = 0.5           # Focal Loss gamma参数(难例聚焦程度，先设小一点)
 
 # ==================== OneCycleLR配置 ====================
-ONECYCLE_MAX_LR_SCALE = 3.0  # OneCycleLR最大LR相对于scaled_lr的倍数
-ONECYCLE_PCT_START = 0.3    # OneCycleLR预热阶段占总步数比例
+ONECYCLE_MAX_LR_SCALE = 2.0  # OneCycleLR最大LR相对于scaled_lr的倍数
+ONECYCLE_PCT_START = 0.2    # OneCycleLR预热阶段占总步数比例
 ONECYCLE_ANNEAL_STRATEGY = 'cos'  # OneCycleLR退火策略('cos'或'linear')
-ONECYCLE_FINAL_DIV_FACTOR = 10000.0  # OneCycleLR最终LR衰减因子
+ONECYCLE_FINAL_DIV_FACTOR = 1000.0  # OneCycleLR最终LR衰减因子
 
 # ==================== Transformer增强配置 ====================
 USE_TRANSFORMER = True       # 是否启用Transformer增强(融合LTC+Transformer)

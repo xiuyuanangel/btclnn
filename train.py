@@ -478,7 +478,7 @@ def train_model():
                 _pos_weights.append(1.0)
 
         class FocalLoss(nn.Module):
-            def __init__(self, alpha=1.0, gamma=2.0, per_horizon_weights=None):
+            def __init__(self, alpha=1.0, gamma=0.5, per_horizon_weights=None):
                 super().__init__()
                 self.alpha = alpha
                 self.gamma = gamma
@@ -495,11 +495,11 @@ def train_model():
                     logits, target, reduction='none'
                 )
                 pt = torch.exp(-bce)
-                focal_weight = (1 - pt) ** self.gamma  # alpha 不再乘到损失上
+                focal_weight = (1 - pt) ** self.gamma
                 weight_vec = self.weights.to(target.device).unsqueeze(0)
                 sample_weights = torch.where(target >= 0.5, weight_vec,
                                              torch.ones_like(target))
-                return (focal_weight * bce * sample_weights * self.alpha).mean()
+                return (bce * sample_weights * self.alpha).mean()
 
         criterion = FocalLoss(
             alpha=config.FOCAL_ALPHA,
