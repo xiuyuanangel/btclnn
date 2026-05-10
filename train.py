@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 def _strip_module_prefix(state_dict):
     """移除state_dict中因DataParallel产生的 'module.' 前缀
 
-    Kaggle双T4训练时模型被 DataParallel 包裹, 参数key带 module. 前缀。
-    GitHub Actions单CPU/GPU加载时模型无此前缀, 需要适配。
+    仅在单GPU/CPU加载时需要。双GPU环境模型本身就是DataParallel包装的，
+    保存时已经带了module.前缀，加载时如果再次strip会导致key不匹配错误。
     """
     has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
     if not has_module_prefix:
@@ -46,13 +46,44 @@ def _strip_module_prefix(state_dict):
     return new_state_dict
 
 
+def _safe_load_state_dict(model, state_dict, device):
+    """安全加载state_dict，自动处理DataParallel前缀问题
+
+    根据模型和checkpoint的key前缀情况，自动决定是否需要strip/add前缀。
+    """
+    model_key_prefix = ''
+    if isinstance(model, nn.DataParallel):
+        model_key_prefix = 'module.'
+    elif hasattr(model, 'module'):
+        model_key_prefix = 'module.'
+
+    ckpt_keys = list(state_dict.keys())
+    has_ckpt_prefix = any(k.startswith('module.') for k in ckpt_keys)
+
+    model_keys = set(model.state_dict().keys())
+    ckpt_keys_set = set(state_dict.keys())
+
+    if model_key_prefix and not has_ckpt_prefix:
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = f'module.{k}'
+            new_state_dict[new_key] = v
+        state_dict = new_state_dict
+        logger.info(f"为checkpoint添加module.前缀以匹配DataParallel模型")
+    elif has_ckpt_prefix and not model_key_prefix:
+        state_dict = _strip_module_prefix(state_dict)
+        logger.info(f"移除checkpoint的module.前缀以匹配非DataParallel模型")
+
+    model.load_state_dict(state_dict)
+
+
 def _load_best_fallback(model, device):
     """从best模型加载权重作为初始化的降级方案"""
     try:
         best_ckpt = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
         ckpt_config = best_ckpt.get('config', {})
         if 'timeframe_configs' in ckpt_config:
-            model.load_state_dict(_strip_module_prefix(best_ckpt['model_state_dict']))
+            _safe_load_state_dict(model, best_ckpt['model_state_dict'], device)
             logger.info("从最佳模型加载权重作为初始化")
         else:
             logger.info("检测到旧架构checkpoint，从头训练新模型")
@@ -285,13 +316,28 @@ def train_model():
         cv_test_data = test_data
 
     # ==================== 开始训练(支持多折CV) ====================
+    _stop_mode = getattr(config, 'TRAIN_STOP_MODE', 'both')
     _max_seconds = getattr(config, 'MAX_TRAIN_SECONDS', None)
+    _max_epochs = config.EPOCHS
+
+    _use_epoch_limit = _stop_mode in ('epochs_only', 'both')
+    _use_time_limit = _stop_mode in ('time_only', 'both')
+
+    if _stop_mode == 'infinite':
+        logger.info("训练模式: 无限训练(仅靠早停停止)")
+    elif _stop_mode == 'epochs_only':
+        logger.info(f"训练模式: 仅EPOCHS限制 ({_max_epochs} epochs)")
+    elif _stop_mode == 'time_only':
+        logger.info(f"训练模式: 仅时间限制 ({_max_seconds/3600:.1f}h)")
+    else:
+        logger.info(f"训练模式: 双重限制 (epochs={_max_epochs}, time={_max_seconds/3600:.1f}h)")
+
     _n_folds = len(cv_folds_normalized)
     _fold_time_budget = None
-    if _max_seconds and _use_cv:
+    if _use_time_limit and _max_seconds and _use_cv:
         _fold_time_budget = _max_seconds / _n_folds
         logger.info(f"每折时间预算: {_fold_time_budget/3600:.1f}h")
-    elif _max_seconds:
+    elif _use_time_limit and _max_seconds:
         logger.info(f"训练时间限制: {_max_seconds/3600:.1f}h")
 
     _best_across_folds = {
@@ -391,7 +437,7 @@ def train_model():
                                     _rel_ckpt = torch.load(_release_path, map_location=device, weights_only=False)
                                     _rel_cfg = _rel_ckpt.get('config', {})
                                     if _rel_cfg.get('timeframe_configs'):
-                                        model.load_state_dict(_strip_module_prefix(_rel_ckpt['model_state_dict']))
+                                        _safe_load_state_dict(model, _rel_ckpt['model_state_dict'], device)
                                         logger.info(f"Release模型权重已加载 (val_loss={_rel_ckpt.get('val_loss', 'N/A')})")
                                     else:
                                         logger.info("Release模型架构不匹配，从头训练")
@@ -510,27 +556,34 @@ def train_model():
             logger.info(f"使用 FocalLoss(alpha={config.FOCAL_ALPHA}, gamma={config.FOCAL_GAMMA}), 各窗口pos_weight={_pos_weights}")
 
         # ---- CV 各折训练循环 ----
-        _max_epochs = config.EPOCHS
         best_val_loss = float('inf')
         patience_counter = 0
         epoch = 0
         fold_start_time = time.time()
 
         if fold_idx == 0:
+            _log_epochs = f"epochs={_max_epochs}" if _use_epoch_limit else "∞"
+            _log_time = f"time={_max_seconds/3600:.1f}h" if (_use_time_limit and _max_seconds) else "∞"
             logger.info("=" * 60)
-            logger.info(f"步骤 4: 开始训练(上限{_max_epochs} epochs)")
+            logger.info(f"步骤 4: 开始训练 ({_log_epochs}, {_log_time})")
             logger.info("=" * 60)
 
-        while epoch < _max_epochs:
-            # 时间限制检查(非CV用全局时间, CV用单折时间预算)
-            _time_budget = _fold_time_budget or _max_seconds
-            _time_elapsed = time.time() - fold_start_time
-            if _time_budget and _time_elapsed >= _time_budget:
-                if _use_cv:
-                    logger.info(f"Fold {fold_idx+1} 达到时间预算({_time_budget/3600:.1f}h)")
-                else:
-                    logger.info(f"达到最大训练时长({_time_budget/3600:.1f}小时), 停止训练")
+        while True:
+            # 停止条件检查
+            if _use_epoch_limit and epoch >= _max_epochs:
+                if fold_idx == 0:
+                    logger.info(f"达到最大epoch数 ({_max_epochs}), 停止训练")
                 break
+
+            if _use_time_limit and _max_seconds:
+                _time_budget = _fold_time_budget or _max_seconds
+                _time_elapsed = time.time() - fold_start_time
+                if _time_elapsed >= _time_budget:
+                    if _use_cv:
+                        logger.info(f"Fold {fold_idx+1} 达到时间预算({_time_budget/3600:.1f}h)")
+                    else:
+                        logger.info(f"达到最大训练时长({_time_budget/3600:.1f}h), 停止训练")
+                    break
 
             t0 = time.time()
             epoch += 1
@@ -672,7 +725,7 @@ def train_model():
         _best_ckpt = torch.load(_best_across_folds['model_path'], map_location=device, weights_only=False)
     else:
         _best_ckpt = torch.load(_best_across_folds['model_path'], map_location=device, weights_only=False)
-    model.load_state_dict(_strip_module_prefix(_best_ckpt['model_state_dict']))
+    _safe_load_state_dict(model, _best_ckpt['model_state_dict'], device)
     model.eval()
 
     test_loss, test_correct, test_total = 0.0, 0, 0

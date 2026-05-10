@@ -53,9 +53,14 @@ LEARNING_RATE = 5e-4        # 学习率(从1e-3降低至5e-4, 更稳定收敛)
 WEIGHT_DECAY = 3e-4         # L2正则化(新增, 进一步抑制过拟合)
 BATCH_SIZE = 512            # 批处理大小(USE_AUTO_BATCH_SIZE=False时使用)
 USE_AUTO_BATCH_SIZE = False  # 自动调整BATCH_SIZE根据可用内存/显存
-EPOCHS = 200                # 训练轮数(上限, 实际由 MAX_TRAIN_SECONDS 控制，用于OneCycleLR调度)
+EPOCHS = 200                # 训练轮数上限
 MAX_TRAIN_SECONDS = 17640   # 最大训练时长(秒), 默认4.8小时(预留余量给测试+上传)
-PATIENCE = 140               # 早停耐心值(更快截断过拟合)
+TRAIN_STOP_MODE = 'both'    # 训练停止模式: 'epochs_only', 'time_only', 'both', 'infinite'
+                            # - 'epochs_only': 仅由EPOCHS控制
+                            # - 'time_only': 仅由MAX_TRAIN_SECONDS控制
+                            # - 'both': 两者任一达到即停止
+                            # - 'infinite': 无限训练(仅靠早停PATIENCE停止)
+PATIENCE = 140              # 早停耐心值(更快截断过拟合)
 
 # ==================== Focal Loss配置 ====================
 FOCAL_ALPHA = 1.0           # Focal Loss alpha参数(正负样本权重平衡)

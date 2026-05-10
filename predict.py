@@ -63,6 +63,31 @@ def normalize_with_stats(tf_seqs_raw, ctx_raw, norm_data):
     return tf_seqs, ctx
 
 
+def _rename_state_dict_keys(state_dict):
+    """重命名checkpoint中的旧版key以兼容新版模型架构
+
+    模型架构变更历史:
+    - v1: cells, layer_norms (无前缀)
+    - v2: ltc_cells, ltc_layer_norms (增加ltc_前缀区分)
+    """
+    key_mapping = {}
+    for old_key in list(state_dict.keys()):
+        new_key = old_key
+        if '.cells.' in old_key and '.ltc_cells.' not in old_key:
+            new_key = old_key.replace('.cells.', '.ltc_cells.')
+        if '.layer_norms.' in old_key and '.ltc_layer_norms.' not in old_key:
+            new_key = old_key.replace('.layer_norms.', '.ltc_layer_norms.')
+        if new_key != old_key:
+            key_mapping[old_key] = new_key
+
+    if key_mapping:
+        logger.info(f"检测到旧版模型key，转换 {len(key_mapping)} 个key")
+        for old_key, new_key in key_mapping.items():
+            state_dict[new_key] = state_dict.pop(old_key)
+
+    return state_dict
+
+
 def load_model(device):
     """加载训练好的多周期融合模型(多标签版)"""
     if not os.path.exists(config.MODEL_PATH):
@@ -87,7 +112,10 @@ def load_model(device):
         output_size=_output_size,
     ).to(device)
 
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # 处理模型权重key不兼容问题(旧版checkpoint或DataParallel前缀)
+    state_dict = checkpoint['model_state_dict']
+    state_dict = _rename_state_dict_keys(state_dict)
+    model.load_state_dict(state_dict)
     model.eval()
 
     logger.info(
