@@ -5,6 +5,7 @@
 """
 
 import os
+import json
 import time
 import logging
 
@@ -213,6 +214,57 @@ def prepare_multi_tf_features(timeframe_data):
     return tf_seqs, ctx, target_df
 
 
+def save_pending_verifications(prediction_time, current_price, results):
+    """将预测结果保存为待验证状态，供下次 Actions 运行时的 verify_predictions.py 处理
+
+    Args:
+        prediction_time: 预测时间字符串
+        current_price: 当前价格
+        results: list of dict, 每个 horizon 的预测结果
+    """
+    prediction_ts = int(pd.Timestamp(prediction_time).timestamp())
+
+    pending = []
+    for r in results:
+        h = r['horizon']
+        pending.append({
+            'prediction_time': str(prediction_time),
+            'prediction_ts': prediction_ts,
+            'price': float(current_price),
+            'horizon': h,
+            'direction': r['direction'],
+            'probability': r['probability'],
+            'confidence': r['confidence'],
+            'verify_after_ts': prediction_ts + h * 60,
+        })
+
+    # 加载已有的待验证记录并合并
+    existing = []
+    if os.path.exists(config.PENDING_VERIFICATIONS_PATH):
+        try:
+            with open(config.PENDING_VERIFICATIONS_PATH, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"加载已有待验证记录失败: {e}")
+
+    # 合并后去重: 同一预测时间+同一窗口的只保留一条
+    seen = set()
+    deduped = []
+    for rec in existing + pending:
+        key = (rec.get('prediction_ts', 0), rec['horizon'])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(rec)
+
+    os.makedirs(os.path.dirname(config.PENDING_VERIFICATIONS_PATH), exist_ok=True)
+    with open(config.PENDING_VERIFICATIONS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(deduped, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"已保存 {len(pending)} 条新预测到待验证队列 "
+                 f"(合并去重后共 {len(deduped)} 条, 移除 {len(existing) + len(pending) - len(deduped)} 条重复)")
+
+
 def predict():
     """执行预测: 基于多周期数据判断多个时间窗口后的涨跌"""
     # 检测CUDA兼容性(同train.py)
@@ -309,120 +361,8 @@ def predict():
         except Exception as e:
             logger.warning(f"通知推送失败: {e}")
 
-    # 8. 分阶段验证各窗口预测
-    verify_results = {}
-    sorted_horizons = sorted(horizons)  # 按时间从小到大排序
-
-    for h in sorted_horizons:
-        # 找到对应的result
-        h_result = next(r for r in results if r['horizon'] == h)
-        h_prob = h_result['probability']
-        h_direction = h_result['direction']
-
-        wait_seconds = h * 60  # 等待h分钟
-
-        logger.info(f"等待{h}分钟验证{h}min窗口的预测...")
-        now = pd.Timestamp.now()
-
-        # 对齐到下一个整h分钟边界
-        # 例如h=10对齐到下一个10min边界, h=30对齐到下一个30min边界
-        if h <= 30:
-            align_floor = f'{h}min'
-        elif h == 60:
-            align_floor = '1h'
-        else:
-            align_floor = '1h'
-        # 计算对齐后的等待边界
-        next_boundary = now.floor(align_floor) + pd.Timedelta(minutes=h)
-        wait = max((next_boundary - now).total_seconds(), 30)
-        # 如果对齐后等待时间仍不足h分钟, 跳过不足的边界, 再等一个完整周期
-        if wait < wait_seconds:
-            next_boundary += pd.Timedelta(minutes=h)
-            wait = max((next_boundary - now).total_seconds(), 30)
-        logger.info(f"对齐到 {next_boundary}, 等待 {wait:.0f}s")
-        time.sleep(wait)
-
-        try:
-            # 强制刷新缓存获取最新K线数据
-            verify_data = fetcher.fetch_multi_timeframe(force_refresh=True)
-
-            # 用5min聚合为对应粒度的数据进行验证
-            if h % 5 == 0:
-                shift_bars = h // 5
-                verify_df = fetcher.get_dataframe(verify_data['5min'])
-            elif h % 10 == 0:
-                verify_10min = fetcher.resample_to_10min(verify_data['5min'])
-                verify_df = fetcher.get_dataframe(verify_10min)
-                shift_bars = h // 10
-            else:
-                verify_5min = fetcher.get_dataframe(verify_data['5min'])
-                verify_df = verify_5min
-                shift_bars = h // 5
-
-            if verify_df.empty or len(verify_df) < shift_bars + 1:
-                logger.warning(f"验证阶段({h}m): 数据不足, 跳过")
-                verify_results[h] = {'verified': False, 'reason': 'data_insufficient'}
-                continue
-
-            # 用shift后的价格作为验证价格
-            verify_price_idx = min(shift_bars, len(verify_df) - 1)
-            verify_price = verify_df['close'].iloc[-1]
-            # 取shift_bars前的当前价格进行对比
-            base_price_for_verify = verify_df['close'].iloc[-(shift_bars + 1)] if len(verify_df) > shift_bars else current_price
-
-            verify_time = pd.Timestamp.now()
-
-            actual_direction = "涨 (UP)" if verify_price > base_price_for_verify else "跌 (DOWN)"
-            is_correct = (h_prob > 0.5) == (verify_price > base_price_for_verify)
-            price_change = (verify_price - float(base_price_for_verify)) / float(base_price_for_verify) * 100
-
-            result_mark = "✅ 正确" if is_correct else "❌ 错误"
-            print("-" * 50)
-            print(f"  📊 [{h}分钟窗口] 预测验证结果 [{result_mark}]")
-            print("-" * 50)
-            print(f"  预测时间:   {prediction_time} | 价格: {current_price:.2f}")
-            print(f"  验证时间:   {verify_time} | 价格: {verify_price:.2f}")
-            print(f"  预测方向:   {h_direction}")
-            print(f"  实际方向:   {actual_direction}")
-            print(f"  价格变化:   {price_change:+.2f}%")
-            print("=" * 50)
-            print()
-
-            logger.info(
-                f"[{h}m验证] {'正确' if is_correct else '错误'}, "
-                f"预测{h_direction}, 实际{actual_direction}, 变化{price_change:+.2f}%"
-            )
-
-            verify_results[h] = {
-                'verified': True,
-                'is_correct': is_correct,
-                'verify_time': str(verify_time),
-                'verify_price': float(verify_price),
-                'base_price': float(base_price_for_verify),
-                'price_change_pct': price_change,
-                'actual_direction': actual_direction,
-            }
-
-            # 推送验证结果通知
-            if config.MEOW_NICKNAME:
-                try:
-                    notifier = MeoWNotifier(config.MEOW_NICKNAME)
-                    notifier.send_prediction_verify(
-                        direction=h_direction,
-                        actual_direction=actual_direction,
-                        is_correct=is_correct,
-                        current_price=float(current_price),
-                        verify_price=float(verify_price),
-                        price_change_pct=price_change,
-                        horizon=h,
-                    )
-                except Exception as e:
-                    logger.warning(f"{h}m验证通知推送失败: {e}")
-
-        except Exception as e:
-            logger.warning(f"验证阶段({h}m)获取数据失败: {e}")
-            print(f"⚠️  [{h}分钟窗口] 无法获取验证数据，跳过预测验证")
-            verify_results[h] = {'verified': False, 'reason': str(e)}
+    # 8. 保存预测结果到待验证队列（供下次 Actions 运行时验证）
+    save_pending_verifications(prediction_time, current_price, results)
 
     # 9. 汇总返回所有结果
     final_result = {
@@ -430,7 +370,6 @@ def predict():
         'price': float(current_price),
         'horizons': [r['horizon'] for r in results],
         'predictions': results,
-        'verifications': verify_results,
     }
     return final_result
 

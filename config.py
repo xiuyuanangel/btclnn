@@ -54,7 +54,7 @@ WEIGHT_DECAY = 3e-4         # L2正则化(新增, 进一步抑制过拟合)
 BATCH_SIZE = 512            # 批处理大小(USE_AUTO_BATCH_SIZE=False时使用)
 USE_AUTO_BATCH_SIZE = False  # 自动调整BATCH_SIZE根据可用内存/显存
 EPOCHS = 200                # 训练轮数上限
-MAX_TRAIN_SECONDS = 14400   # 最大训练时长(秒), 默认4小时(预留余量给测试+上传)
+MAX_TRAIN_SECONDS = 18000   # 最大训练时长(秒), 默认5小时(预留余量给测试+上传)
 TRAIN_STOP_MODE = 'time_only'    # 训练停止模式: 'epochs_only', 'time_only', 'both', 'infinite'
                             # - 'epochs_only': 仅由EPOCHS控制
                             # - 'time_only': 仅由MAX_TRAIN_SECONDS控制
@@ -102,6 +102,10 @@ API_REQUEST_INTERVAL = 0.5  # API请求间隔(秒)，避免触发限频
 # MeoW消息推送配置 (https://www.chuckfang.com/MeoW/api_doc.html)
 MEOW_NICKNAME = "修远啊"  # 设置你的MeoW昵称，为空字符串时不发送通知
 MEOW_BASE_URL = "https://api.chuckfang.com"  # API基础地址
+
+# ==================== 待验证预测存储 ====================
+PENDING_VERIFICATIONS_PATH = os.path.join(BASE_DIR, "data", "pending_verifications.json")
+VERIFICATION_STATS_PATH = os.path.join(BASE_DIR, "data", "verification_stats.json")
 
 # ==================== 调试配置 ====================
 DEBUG_EXPORT_CSV = False     # 是否导出数据集样本到CSV供人工核验

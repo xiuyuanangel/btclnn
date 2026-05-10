@@ -62,36 +62,9 @@ jobs:
           restore-keys: |
               lnn-model-
 
-      # - name: 🖥️ Hardware Detection & System Info
-      #   run: |
-      #     echo "============================================"
-      #     echo "  🔍 HARDWARE DETECTION"
-      #     echo "============================================"
-      #     echo ""
-      #     echo "📋 CPU Info:"
-      #     echo "  Cores: $(nproc)"
-      #     cat /proc/cpuinfo | grep "model name" | sort | uniq -c | awk '{print "  Models:", $1, "x"$2}'
-      #     echo "  Architecture: $(uname -m)"
-      #     echo "  Thread(s) per core: $(lscpu | grep 'thread(s)' | head -1 | awk '{print $4}')"
-      #     echo ""
-      #     echo "💾 Memory (RAM):"
-      #     free -h
-      #     echo ""
-      #     if command -v nvidia-smi &>/dev/null; then
-      #       echo "🎮 GPU Info:"
-      #       nvidia-smi --query-gpu=index,name,memory.total,memory.free,driver_version,persistence_mode --format=csv,noheader 2>/dev/null || true
-      #       nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader 2>/dev/null | awk -F',' 'NF>=4{gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+/, "", $2); gsub(/^[ \t]+|[ \t]+/, "", $3); gsub(/^[ \t]+|[ \t]+/, "", $4); printf "  GPU[%s] %s | Total: %sMB | Free: %sMB\n", $1, $2, $3, $4}' || true
-      #     else
-      #       echo "  No GPU detected"
-      #     fi
-      #     echo ""
-      #     echo "💾 Disk Usage:"
-      #     df -h /
-      #     echo ""
-      #     echo "📊 OS Info:"
-      #     cat /etc/os-release | head -3
-      #     uname -a
-      #     echo ""
+      - name: Verify previous predictions
+        if: success()
+        run: python verify_predictions.py
 
       - name: Fetch data and train model
         env:

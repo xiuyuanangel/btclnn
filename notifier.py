@@ -285,9 +285,9 @@ class MeoWNotifier:
     def send_prediction_verify(self, direction: str, actual_direction: str,
                                 is_correct: bool, current_price: float,
                                 verify_price: float, price_change_pct: float,
-                                horizon: int = None) -> bool:
+                                horizon: int = None, stats: dict = None) -> bool:
         """
-        发送预测验证结果通知
+        发送预测验证结果通知（含累积统计信息）
 
         Args:
             direction: 预测方向
@@ -297,6 +297,11 @@ class MeoWNotifier:
             verify_price: 验证时价格
             price_change_pct: 价格变化百分比
             horizon: 预测窗口(分钟), 可选
+            stats: 累积统计字典, 可选, 包含:
+                - overall_accuracy: 总正确率
+                - total_verified: 总验证次数
+                - by_horizon: 各窗口统计 dict[horizon] = {'correct': int, 'total': int, 'accuracy': float}
+                - last_updated: 最后更新时间
 
         Returns:
             bool: 是否发送成功
@@ -304,19 +309,38 @@ class MeoWNotifier:
         mark = "✅" if is_correct else "❌"
         h_label = f"[{horizon}min]" if horizon else ""
         title = f"{mark} BTC预测验证{h_label} - {'正确' if is_correct else '错误'}"
+        stats_html_height = 0
 
-        msg = (
-            f'<div style="font-size:40px;line-height:1.8">'
-            f'<b>预测窗口:</b> {horizon or 10}分钟<br>'
-            f'<b>预测方向:</b> {direction}<br>'
-            f'<b>实际方向:</b> {actual_direction}<br>'
-            f'<b>结果:</b> {"正确 ✅" if is_correct else "错误 ❌"}<br>'
-            f'<br>'
-            f'<b>预测价格:</b> {current_price:.2f} USDT<br>'
-            f'<b>验证价格:</b> {verify_price:.2f} USDT<br>'
-            f'<b>价格变化:</b> {price_change_pct:+.2f}%</div>'
-        )
-        return self.send(title, msg, msg_type="html", html_height=220)
+        lines = [
+            f'<b>预测窗口:</b> {horizon or 10}分钟',
+            f'<b>预测方向:</b> {direction}',
+            f'<b>实际方向:</b> {actual_direction}',
+            f'<b>结果:</b> {"正确 ✅" if is_correct else "错误 ❌"}',
+            f'<br>',
+            f'<b>预测价格:</b> {current_price:.2f} USDT',
+            f'<b>验证价格:</b> {verify_price:.2f} USDT',
+            f'<b>价格变化:</b> {price_change_pct:+.2f}%',
+        ]
+
+        # 追加累积统计信息
+        if stats:
+            lines.append('<br>')
+            lines.append(f'<b>━━━ 累积统计 ━━━</b>')
+            lines.append(f'<b>总正确率:</b> {stats.get("overall_accuracy", 0)*100:.1f}% '
+                         f'({stats.get("total_verified", 0)}次)')
+
+            by_horizon = stats.get('by_horizon', {})
+            for h_key in sorted(by_horizon.keys(), key=int):
+                h_stat = by_horizon[h_key]
+                lines.append(
+                    f'<b>[{h_key}min]</b> {h_stat["accuracy"]*100:.1f}% '
+                    f'({h_stat["correct"]}/{h_stat["total"]})'
+                )
+            stats_html_height = 40 + len(by_horizon) * 30
+
+        msg = '<div style="font-size:40px;line-height:1.8">' + "<br>".join(lines) + '</div>'
+        html_h = 220 + stats_html_height
+        return self.send(title, msg, msg_type="html", html_height=html_h)
 
     def send_multi_horizon_prediction(self, time: str, price: float,
                                        horizons_results: list) -> bool:
