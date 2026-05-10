@@ -102,6 +102,11 @@ def load_model(device):
     # 从checkpoint或config获取输出维度
     _output_size = model_cfg.get('output_size', len(getattr(config, 'PREDICTION_HORIZONS', [10])))
     _horizons = model_cfg.get('horizons', getattr(config, 'PREDICTION_HORIZONS', [10]))
+    
+    # 从checkpoint获取Transformer配置
+    _use_transformer = model_cfg.get('use_transformer', False)
+    _transformer_heads = model_cfg.get('transformer_heads', 4)
+    _cross_attn_heads = model_cfg.get('cross_attn_heads', 4)
 
     model = MultiTimeframeLNN(
         timeframe_configs=model_cfg['timeframe_configs'],
@@ -110,18 +115,48 @@ def load_model(device):
         num_layers=model_cfg.get('num_layers', config.NUM_LAYERS),
         dropout=model_cfg.get('dropout', config.DROPOUT),
         output_size=_output_size,
+        use_transformer=_use_transformer,
+        transformer_heads=_transformer_heads,
+        cross_attn_heads=_cross_attn_heads,
     ).to(device)
 
-    # 处理模型权重key不兼容问题(旧版checkpoint或DataParallel前缀)
+    # 处理模型权重key不兼容问题(旧版checkpoint)
     state_dict = checkpoint['model_state_dict']
     state_dict = _rename_state_dict_keys(state_dict)
+    
+    # 处理DataParallel前缀问题
+    model_key_prefix = ''
+    if isinstance(model, torch.nn.DataParallel):
+        model_key_prefix = 'module.'
+    elif hasattr(model, 'module'):
+        model_key_prefix = 'module.'
+
+    ckpt_keys = list(state_dict.keys())
+    has_ckpt_prefix = any(k.startswith('module.') for k in ckpt_keys)
+
+    if model_key_prefix and not has_ckpt_prefix:
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = f'module.{k}'
+            new_state_dict[new_key] = v
+        state_dict = new_state_dict
+        logger.info(f"为checkpoint添加module.前缀以匹配DataParallel模型")
+    elif has_ckpt_prefix and not model_key_prefix:
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = k[len('module.'):] if k.startswith('module.') else k
+            new_state_dict[new_key] = v
+        state_dict = new_state_dict
+        logger.info(f"移除checkpoint的module.前缀以匹配非DataParallel模型")
+    
     model.load_state_dict(state_dict)
     model.eval()
 
     logger.info(
         f"模型加载成功 (Epoch {checkpoint['epoch']}, "
         f"Val Loss: {checkpoint['val_loss']:.4f}, "
-        f"输出维度: {_output_size} 窗口={_horizons})"
+        f"输出维度: {_output_size} 窗口={_horizons}, "
+        f"Transformer: {'启用' if _use_transformer else '禁用'})"
     )
     return model, _horizons
 

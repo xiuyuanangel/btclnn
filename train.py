@@ -78,17 +78,64 @@ def _safe_load_state_dict(model, state_dict, device):
 
 
 def _load_best_fallback(model, device):
-    """从best模型加载权重作为初始化的降级方案"""
+    """从best模型加载权重作为初始化的降级方案
+    
+    依次尝试:
+    1. 加载 lnn_best.pth (最终最佳模型)
+    2. 加载各折模型 lnn_best_fold{idx}.pth (如果存在)
+    """
+    import glob
+    
+    # 尝试1: 加载最终best模型
     try:
         best_ckpt = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
         ckpt_config = best_ckpt.get('config', {})
         if 'timeframe_configs' in ckpt_config:
             _safe_load_state_dict(model, best_ckpt['model_state_dict'], device)
             logger.info("从最佳模型加载权重作为初始化")
+            return
         else:
-            logger.info("检测到旧架构checkpoint，从头训练新模型")
+            logger.info("检测到旧架构checkpoint，尝试其他模型...")
+    except FileNotFoundError:
+        logger.info(f"未找到 {config.MODEL_PATH}，尝试加载折模型...")
     except Exception as e:
-        logger.warning(f"加载best checkpoint也失败，从头训练: {e}")
+        logger.warning(f"加载best checkpoint失败: {e}，尝试其他模型...")
+    
+    # 尝试2: 加载各折模型
+    fold_pattern = config.MODEL_PATH.replace('.pth', '_fold*.pth')
+    fold_files = sorted(glob.glob(fold_pattern))
+    
+    if fold_files:
+        # 选择最后一个折模型（通常是性能最好的）
+        fold_path = fold_files[-1]
+        try:
+            fold_ckpt = torch.load(fold_path, map_location=device, weights_only=False)
+            ckpt_config = fold_ckpt.get('config', {})
+            if 'timeframe_configs' in ckpt_config:
+                _safe_load_state_dict(model, fold_ckpt['model_state_dict'], device)
+                logger.info(f"从折模型 {fold_path} 加载权重作为初始化")
+                return
+            else:
+                logger.info(f"折模型 {fold_path} 架构不匹配")
+        except Exception as e:
+            logger.warning(f"加载折模型 {fold_path} 失败: {e}")
+    
+    # 尝试3: 加载最终模型
+    try:
+        final_ckpt = torch.load(config.MODEL_PATH_FINAL, map_location=device, weights_only=False)
+        ckpt_config = final_ckpt.get('config', {})
+        if 'timeframe_configs' in ckpt_config:
+            _safe_load_state_dict(model, final_ckpt['model_state_dict'], device)
+            logger.info(f"从最终模型 {config.MODEL_PATH_FINAL} 加载权重作为初始化")
+            return
+        else:
+            logger.info(f"最终模型架构不匹配")
+    except FileNotFoundError:
+        logger.info(f"未找到 {config.MODEL_PATH_FINAL}")
+    except Exception as e:
+        logger.warning(f"加载最终模型失败: {e}")
+    
+    logger.info("未找到可加载的模型，从头训练新模型")
 
 
 def train_model():
