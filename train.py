@@ -52,9 +52,7 @@ def _safe_load_state_dict(model, state_dict, device):
     根据模型和checkpoint的key前缀情况，自动决定是否需要strip/add前缀。
     """
     model_key_prefix = ''
-    if isinstance(model, nn.DataParallel):
-        model_key_prefix = 'module.'
-    elif hasattr(model, 'module'):
+    if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
         model_key_prefix = 'module.'
 
     ckpt_keys = list(state_dict.keys())

@@ -126,9 +126,7 @@ def load_model(device):
     
     # 处理DataParallel前缀问题
     model_key_prefix = ''
-    if isinstance(model, torch.nn.DataParallel):
-        model_key_prefix = 'module.'
-    elif hasattr(model, 'module'):
+    if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
         model_key_prefix = 'module.'
 
     ckpt_keys = list(state_dict.keys())
