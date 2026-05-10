@@ -72,10 +72,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python train.py
 
-      - name: Run prediction
-        if: success()
-        run: python predict.py
-
       - name: Upload model artifact
         if: success()
         uses: actions/upload-artifact@v4
@@ -101,3 +97,7 @@ jobs:
             --title "Model $TAG" \
             --notes "BTC LNN Multi-Timeframe Model (run #${{ github.run_number }})" \
             --latest
+
+      - name: Run prediction
+        if: success()
+        run: python predict.py
