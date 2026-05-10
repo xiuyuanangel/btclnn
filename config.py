@@ -55,7 +55,7 @@ BATCH_SIZE = 512            # 批处理大小(USE_AUTO_BATCH_SIZE=False时使用
 USE_AUTO_BATCH_SIZE = False  # 自动调整BATCH_SIZE根据可用内存/显存
 EPOCHS = 200                # 训练轮数上限
 MAX_TRAIN_SECONDS = 17640   # 最大训练时长(秒), 默认4.8小时(预留余量给测试+上传)
-TRAIN_STOP_MODE = 'both'    # 训练停止模式: 'epochs_only', 'time_only', 'both', 'infinite'
+TRAIN_STOP_MODE = 'time_only'    # 训练停止模式: 'epochs_only', 'time_only', 'both', 'infinite'
                             # - 'epochs_only': 仅由EPOCHS控制
                             # - 'time_only': 仅由MAX_TRAIN_SECONDS控制
                             # - 'both': 两者任一达到即停止
