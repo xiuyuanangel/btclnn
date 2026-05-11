@@ -815,9 +815,9 @@ def train_rl(rl_cfg: RLConfig):
     logger.info("测试集评估结果:")
     logger.info(f"  平均收益率: {test_results['avg_return_rate']*100:+5.2f}%")
     logger.info(f"  平均胜率:   {test_results['avg_win_rate']:.2%}")
-    logger.info(f"  平均交易数: {test_results['avg_trades']:.0f}")
+    logger.info(f"  平均交易数: {test_results['avg_total_trades']:.0f}")
     logger.info(f"  平均夏普:   {test_results['avg_sharpe']:.2f}")
-    logger.info(f"  平均最大回撤: {test_results['avg_drawdown']:.2%}")
+    logger.info(f"  平均最大回撤: {test_results['avg_max_drawdown']:.2%}")
     logger.info("=" * 60)
 
     return agent, test_results
