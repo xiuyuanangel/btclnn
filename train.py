@@ -523,6 +523,13 @@ def train_model():
         else:
             _effective_batch_size = config.BATCH_SIZE
             logger.info(f"BATCH_SIZE: auto={_auto_mode} → 配置值={config.BATCH_SIZE}")
+        _accum_steps = getattr(config, 'GRADIENT_ACCUMULATION_STEPS', 1)
+        _effective_batch_size_accum = _effective_batch_size * _accum_steps
+        if fold_idx == 0 and _accum_steps > 1:
+            logger.info(
+                f"梯度累积: {_accum_steps} 步, "
+                f"等效batch_size={_effective_batch_size} × {_accum_steps} = {_effective_batch_size_accum}"
+            )
         _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
         train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, **_dl_kwargs)
         val_loader = DataLoader(val_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
@@ -542,7 +549,8 @@ def train_model():
             lr=_scaled_lr,
             weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-4),
         )
-        steps_per_epoch = len(train_loader)
+        # steps_per_epoch 按 optimizer 步数计（非 micro-batch）
+        steps_per_epoch = max(1, len(train_loader) // _accum_steps)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=_scaled_lr * config.ONECYCLE_MAX_LR_SCALE,
@@ -639,21 +647,21 @@ def train_model():
             _train_horizon_correct = [0] * _num_horizons
             _train_horizon_total = [0] * _num_horizons
 
-            for tf_seqs, ctx, labels in train_loader:
+            optimizer.zero_grad()
+            for batch_idx, (tf_seqs, ctx, labels) in enumerate(train_loader):
                 if not _use_preconverted:
                     tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
                     ctx = ctx.to(device)
                     labels = labels.to(device)
 
-                optimizer.zero_grad()
                 outputs = model(tf_seqs, ctx)
                 loss = criterion(outputs, labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
+                # 梯度累积: loss 除以累积步数，使等效 batch 的梯度量级一致
+                scaled_loss = loss / _accum_steps
+                scaled_loss.backward()
 
                 batch_size = labels.size(0)
+                # 记录原始（未缩放）的 loss 用于日志
                 train_loss += loss.item() * batch_size
                 preds = (outputs > 0).float()
                 train_correct += (preds == labels).sum().item()
@@ -661,6 +669,13 @@ def train_model():
                 for h in range(_num_horizons):
                     _train_horizon_correct[h] += (preds[:, h] == labels[:, h]).sum().item()
                     _train_horizon_total[h] += labels[:, h].size(0)
+
+                # 每 _accum_steps 个 micro-batch 执行一次 optimizer 步
+                if (batch_idx + 1) % _accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
             train_loss /= train_total
             train_acc = train_correct / train_total
