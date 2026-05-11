@@ -64,7 +64,7 @@ jobs:
 
       - name: Verify previous predictions
         if: success()
-        run: python verify_predictions.py
+        run: python verify_predictions.py --reverify
 
       - name: Fetch data and train model
         env:

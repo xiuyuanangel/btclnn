@@ -169,12 +169,11 @@ def update_stats(stats, horizon, is_correct):
 # 单条验证
 # ==============================
 
-def verify_single(pred, stats=None):
+def verify_single(pred):
     """验证单条预测记录
 
     Args:
         pred: dict, 包含 prediction_time, price, horizon, direction, probability 等字段
-        stats: dict 或 None, 当前累积统计(用于通知), 不传入则不发送统计
 
     Returns:
         dict 或 None: 验证结果, None 表示跳过(数据不足等)
@@ -198,9 +197,21 @@ def verify_single(pred, stats=None):
             logger.warning(f"验证阶段({h}m): 数据不足, 跳过")
             return None
 
-        # 计算验证价格: 预测时的价格 vs 当前最新收盘价
-        verify_price = verify_df['close'].iloc[-1]
-        verify_time = pd.Timestamp.now()
+        # 计算目标验证时间 = 预测时间 + 预测窗口(分钟)
+        prediction_ts = pred.get('prediction_ts', 0)
+        verify_target_ts = prediction_ts + h * 60
+        verify_target_time = pd.to_datetime(verify_target_ts, unit='s')
+
+        # 找到覆盖目标时间的5min K线, 用其收盘价作为验证价格
+        # df.index 是K线开盘时间, close 是收盘价(开盘+5min时刻)
+        mask = verify_df.index <= verify_target_time
+        if mask.any():
+            verify_candle = verify_df[mask].iloc[-1]
+        else:
+            # 保护: 目标时间早于最早K线
+            verify_candle = verify_df.iloc[0]
+        verify_price = float(verify_candle['close'])
+        verify_time = verify_target_time
 
         actual_direction = "涨 (UP)" if verify_price > pred_price else "跌 (DOWN)"
         is_correct = (pred_prob > 0.5) == (verify_price > pred_price)
@@ -223,23 +234,6 @@ def verify_single(pred, stats=None):
             f"预测{pred_direction}, 实际{actual_direction}, 变化{price_change:+.2f}%"
         )
 
-        # 发送验证通知（带累积统计）
-        if config.MEOW_NICKNAME:
-            try:
-                notifier = MeoWNotifier(config.MEOW_NICKNAME)
-                notifier.send_prediction_verify(
-                    direction=pred_direction,
-                    actual_direction=actual_direction,
-                    is_correct=is_correct,
-                    current_price=float(pred_price),
-                    verify_price=float(verify_price),
-                    price_change_pct=price_change,
-                    horizon=h,
-                    stats=stats,  # 传入累积统计
-                )
-            except Exception as e:
-                logger.warning(f"{h}m验证通知推送失败: {e}")
-
         return {
             'verified': True,
             'is_correct': is_correct,
@@ -260,8 +254,11 @@ def verify_single(pred, stats=None):
 # 主入口
 # ==============================
 
-def verify_all():
+def verify_all(reverify_all=False):
     """处理所有到期的待验证预测
+
+    Args:
+        reverify_all: 是否强制重新验证所有记录(忽略 verify_after_ts 检查)
 
     返回:
         dict: {'verified': int, 'skipped': int, 'pending': int}
@@ -280,20 +277,38 @@ def verify_all():
     verified_count = 0
     skipped_count = 0
 
+    # 创建通知器(在循环外复用)
+    notifier = MeoWNotifier(config.MEOW_NICKNAME) if config.MEOW_NICKNAME else None
+
     for pred in pending:
         verify_after_ts = pred.get('verify_after_ts', pred.get('prediction_ts', 0) + pred['horizon'] * 60)
 
-        if now_ts < verify_after_ts:
+        if not reverify_all and now_ts < verify_after_ts:
             # 还没到验证时间，保留
             still_pending.append(pred)
             continue
 
-        # 到验证时间了，执行验证（传入 stats 用于通知显示）
-        result = verify_single(pred, stats=stats)
+        # 到验证时间了，执行验证
+        result = verify_single(pred)
         if result is not None:
             verified_count += 1
-            # 更新累积统计
+            # 先更新累积统计(后续通知将包含本次结果)
             update_stats(stats, pred['horizon'], result['is_correct'])
+
+            if notifier:
+                try:
+                    notifier.send_prediction_verify(
+                        direction=pred['direction'],
+                        actual_direction=result['actual_direction'],
+                        is_correct=result['is_correct'],
+                        current_price=float(pred['price']),
+                        verify_price=result['verify_price'],
+                        price_change_pct=result['price_change_pct'],
+                        horizon=pred['horizon'],
+                        stats=stats,  # 已包含本次验证结果
+                    )
+                except Exception as e:
+                    logger.warning(f"{pred['horizon']}m验证通知推送失败: {e}")
         else:
             skipped_count += 1
         # 无论验证成功与否，都从待验证队列移除(单次尝试)
@@ -320,4 +335,10 @@ def verify_all():
 
 
 if __name__ == "__main__":
-    verify_all()
+    import sys
+    reverify = '--reverify' in sys.argv
+    if reverify:
+        logger.info("=" * 50)
+        logger.info("强制重新验证模式: 将处理所有待验证记录")
+        logger.info("=" * 50)
+    verify_all(reverify_all=reverify)
