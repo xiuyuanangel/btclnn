@@ -8,6 +8,7 @@ import os
 import json
 import time
 import logging
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -89,22 +90,76 @@ def _rename_state_dict_keys(state_dict):
     return state_dict
 
 
-def load_model(device):
-    """加载训练好的多周期融合模型(多标签版)"""
-    if not os.path.exists(config.MODEL_PATH):
-        raise FileNotFoundError(
-            f"模型文件不存在: {config.MODEL_PATH}\n"
-            f"请先运行 train.py 训练模型"
-        )
+def download_release_model():
+    """从最新的GitHub Release下载.pth模型到checkpoints目录
 
-    checkpoint = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
+    仅在GH_TOKEN存在时尝试（通常是CI环境或已登录gh CLI的环境）。
+    下载后的文件会覆盖本地同名文件。
+
+    Returns:
+        bool: 是否成功下载任意模型文件
+    """
+    gh_token = os.environ.get('GH_TOKEN')
+    if not gh_token:
+        logger.info("未找到GH_TOKEN, 跳过Release下载")
+        return False
+
+    try:
+        # 获取最新Release的tag
+        result = subprocess.run(
+            ['gh', 'release', 'view', '--json', 'tagName', '--jq', '.tagName'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.info(f"未找到已有Release")
+            return False
+
+        tag = result.stdout.strip()
+        logger.info(f"检测到最新Release: {tag}, 正在下载模型...")
+        dl = subprocess.run(
+            ['gh', 'release', 'download', tag,
+             '--pattern', '*.pth', '--dir', config.CHECKPOINT_DIR,
+             '--clobber'],
+            capture_output=True, text=True, timeout=120,
+        )
+        if dl.returncode == 0:
+            logger.info("Release模型下载成功")
+            # 确认文件已存在
+            for p in [config.MODEL_PATH, config.MODEL_PATH_FINAL]:
+                if os.path.exists(p):
+                    logger.info(f"  ✓ {os.path.basename(p)} ({os.path.getsize(p)/(1024**2):.1f}MB)")
+            return os.path.exists(config.MODEL_PATH) or os.path.exists(config.MODEL_PATH_FINAL)
+        else:
+            logger.warning(f"Release模型下载失败: {dl.stderr.strip()}")
+            return False
+    except Exception as e:
+        logger.warning(f"Release下载异常: {e}")
+        return False
+
+
+def _load_checkpoint_model(device, checkpoint_path, label):
+    """尝试从指定路径加载模型权重"""
+    try:
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        ckpt_config = ckpt.get('config', {})
+        if 'timeframe_configs' not in ckpt_config:
+            logger.info(f"{label} 架构不匹配(缺少timeframe_configs)")
+            return None
+        return ckpt
+    except FileNotFoundError:
+        logger.info(f"未找到 {os.path.basename(checkpoint_path)}")
+        return None
+    except Exception as e:
+        logger.warning(f"加载 {label} 失败: {e}")
+        return None
+
+
+def _build_model_from_checkpoint(device, checkpoint):
+    """从checkpoint构建并加载模型"""
     model_cfg = checkpoint['config']
 
-    # 从checkpoint或config获取输出维度
     _output_size = model_cfg.get('output_size', len(getattr(config, 'PREDICTION_HORIZONS', [10])))
     _horizons = model_cfg.get('horizons', getattr(config, 'PREDICTION_HORIZONS', [10]))
-    
-    # 从checkpoint获取Transformer配置
     _use_transformer = model_cfg.get('use_transformer', False)
     _transformer_heads = model_cfg.get('transformer_heads', 4)
     _cross_attn_heads = model_cfg.get('cross_attn_heads', 4)
@@ -124,7 +179,7 @@ def load_model(device):
     # 处理模型权重key不兼容问题(旧版checkpoint)
     state_dict = checkpoint['model_state_dict']
     state_dict = _rename_state_dict_keys(state_dict)
-    
+
     # 处理DataParallel前缀问题
     model_key_prefix = ''
     if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
@@ -139,15 +194,15 @@ def load_model(device):
             new_key = f'module.{k}'
             new_state_dict[new_key] = v
         state_dict = new_state_dict
-        logger.info(f"为checkpoint添加module.前缀以匹配DataParallel模型")
+        logger.info("为checkpoint添加module.前缀以匹配DataParallel模型")
     elif has_ckpt_prefix and not model_key_prefix:
         new_state_dict = {}
         for k, v in state_dict.items():
             new_key = k[len('module.'):] if k.startswith('module.') else k
             new_state_dict[new_key] = v
         state_dict = new_state_dict
-        logger.info(f"移除checkpoint的module.前缀以匹配非DataParallel模型")
-    
+        logger.info("移除checkpoint的module.前缀以匹配非DataParallel模型")
+
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -158,6 +213,32 @@ def load_model(device):
         f"Transformer: {'启用' if _use_transformer else '禁用'})"
     )
     return model, _horizons
+
+
+def load_model(device):
+    """加载训练好的多周期融合模型(多标签版)
+
+    直接从checkpoints加载:
+    1. 最佳模型 lnn_best.pth (val_loss最低)
+    2. 最终模型 lnn_final.pth (最后训练保存, 降级方案)
+    """
+    # 优先级1: 最佳模型 (val_loss最低)
+    best_ckpt = _load_checkpoint_model(device, config.MODEL_PATH, "最佳模型")
+    if best_ckpt is not None:
+        return _build_model_from_checkpoint(device, best_ckpt)
+
+    # 优先级2: 最终模型 (降级)
+    final_ckpt = _load_checkpoint_model(device, config.MODEL_PATH_FINAL, "最终模型")
+    if final_ckpt is not None:
+        return _build_model_from_checkpoint(device, final_ckpt)
+
+    # 均不存在
+    raise FileNotFoundError(
+        f"未找到任何可用模型文件\n"
+        f"  最佳模型: {config.MODEL_PATH}\n"
+        f"  最终模型: {config.MODEL_PATH_FINAL}\n"
+        f"请先运行 train.py 训练模型"
+    )
 
 
 def prepare_multi_tf_features(timeframe_data):

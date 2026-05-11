@@ -76,15 +76,31 @@ def _safe_load_state_dict(model, state_dict, device):
 
 
 def _load_best_fallback(model, device):
-    """从best模型加载权重作为初始化的降级方案
-    
-    依次尝试:
-    1. 加载 lnn_best.pth (最终最佳模型)
-    2. 加载各折模型 lnn_best_fold{idx}.pth (如果存在)
+    """从checkpoints加载权重作为初始化的降级方案
+
+    加载优先级:
+    1. 最终模型 lnn_final.pth (最后训练保存的完整状态)
+    2. 最佳模型 lnn_best.pth (val_loss最低)
+    3. 各折模型 lnn_best_fold{idx}.pth
     """
     import glob
-    
-    # 尝试1: 加载最终best模型
+
+    # 尝试1: 加载最终模型 (最后保存, 带完整状态)
+    try:
+        final_ckpt = torch.load(config.MODEL_PATH_FINAL, map_location=device, weights_only=False)
+        ckpt_config = final_ckpt.get('config', {})
+        if 'timeframe_configs' in ckpt_config:
+            _safe_load_state_dict(model, final_ckpt['model_state_dict'], device)
+            logger.info(f"从最终模型 {config.MODEL_PATH_FINAL} 加载权重作为初始化")
+            return
+        else:
+            logger.info("最终模型架构不匹配")
+    except FileNotFoundError:
+        logger.info(f"未找到 {config.MODEL_PATH_FINAL}")
+    except Exception as e:
+        logger.warning(f"加载最终模型失败: {e}")
+
+    # 尝试2: 加载最佳模型 (val_loss最低)
     try:
         best_ckpt = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
         ckpt_config = best_ckpt.get('config', {})
@@ -98,14 +114,13 @@ def _load_best_fallback(model, device):
         logger.info(f"未找到 {config.MODEL_PATH}，尝试加载折模型...")
     except Exception as e:
         logger.warning(f"加载best checkpoint失败: {e}，尝试其他模型...")
-    
-    # 尝试2: 加载各折模型
+
+    # 尝试3: 加载各折模型
     fold_pattern = config.MODEL_PATH.replace('.pth', '_fold*.pth')
     fold_files = sorted(glob.glob(fold_pattern))
-    
+
     if fold_files:
-        # 选择最后一个折模型（通常是性能最好的）
-        fold_path = fold_files[-1]
+        fold_path = fold_files[-1]  # 最后一个折模型（通常是性能最好的）
         try:
             fold_ckpt = torch.load(fold_path, map_location=device, weights_only=False)
             ckpt_config = fold_ckpt.get('config', {})
@@ -117,22 +132,7 @@ def _load_best_fallback(model, device):
                 logger.info(f"折模型 {fold_path} 架构不匹配")
         except Exception as e:
             logger.warning(f"加载折模型 {fold_path} 失败: {e}")
-    
-    # 尝试3: 加载最终模型
-    try:
-        final_ckpt = torch.load(config.MODEL_PATH_FINAL, map_location=device, weights_only=False)
-        ckpt_config = final_ckpt.get('config', {})
-        if 'timeframe_configs' in ckpt_config:
-            _safe_load_state_dict(model, final_ckpt['model_state_dict'], device)
-            logger.info(f"从最终模型 {config.MODEL_PATH_FINAL} 加载权重作为初始化")
-            return
-        else:
-            logger.info(f"最终模型架构不匹配")
-    except FileNotFoundError:
-        logger.info(f"未找到 {config.MODEL_PATH_FINAL}")
-    except Exception as e:
-        logger.warning(f"加载最终模型失败: {e}")
-    
+
     logger.info("未找到可加载的模型，从头训练新模型")
 
 
@@ -456,55 +456,12 @@ def train_model():
 
         # 从GitHub Release下载最新模型作为初始化(仅第0折/非CV模式)
         if fold_idx == 0 or not _use_cv:
-            gh_token = os.environ.get('GH_TOKEN')
-            if gh_token:
-                try:
-                    import subprocess, json as _json
-                    result = subprocess.run(
-                        ['gh', 'release', 'view', '--json', 'tagName'],
-                        capture_output=True, text=True, timeout=30,
-                    )
-                    if result.returncode == 0:
-                        tag = _json.loads(result.stdout).get('tagName')
-                        logger.info(f"检测到最新Release: {tag}, 正在下载模型...")
-                        dl = subprocess.run(
-                            ['gh', 'release', 'download', tag,
-                             '--pattern', '*.pth', '--dir', 'checkpoints/',
-                             '--clobber'],
-                            capture_output=True, text=True, timeout=120,
-                        )
-                        if dl.returncode == 0:
-                            logger.info("Release模型下载成功")
-                            # 尝试加载到模型
-                            _release_path = config.MODEL_PATH
-                            if os.path.exists(_release_path):
-                                try:
-                                    _rel_ckpt = torch.load(_release_path, map_location=device, weights_only=False)
-                                    _rel_cfg = _rel_ckpt.get('config', {})
-                                    if _rel_cfg.get('timeframe_configs'):
-                                        _safe_load_state_dict(model, _rel_ckpt['model_state_dict'], device)
-                                        logger.info(f"Release模型权重已加载 (val_loss={_rel_ckpt.get('val_loss', 'N/A')})")
-                                    else:
-                                        logger.info("Release模型架构不匹配，从头训练")
-                                        logger.info("尝试从checkpoints加载模型...")
-                                        _load_best_fallback(model, device)
-                                except Exception as e:
-                                    logger.warning(f"加载Release模型失败: {e}")
-                                    logger.info("尝试从checkpoints加载模型...")
-                                    _load_best_fallback(model, device)
-                        else:
-                            logger.warning(f"Release模型下载失败: {dl.stderr.strip()}")
-                            logger.info("尝试从checkpoints加载模型...")
-                            _load_best_fallback(model, device)
-                    else:
-                        logger.info("未找到已有Release")
-                        logger.info("尝试从checkpoints加载模型...")
-                        _load_best_fallback(model, device)
-                except Exception as e:
-                    logger.warning(f"获取Release信息失败: {e}")
+            from predict import download_release_model as _dl_release
+            if _dl_release():
+                logger.info("尝试加载Release下载的模型...")
             else:
-                logger.info("未找到GH_TOKEN, 尝试从checkpoints加载模型...")
-                _load_best_fallback(model, device)
+                logger.info("尝试从checkpoints加载模型...")
+            _load_best_fallback(model, device)
 
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
