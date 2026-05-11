@@ -561,13 +561,14 @@ def prepare_rl_dataset() -> Tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     # 获取多周期数据
     timeframe_data = fetcher.fetch_multi_timeframe()
 
-    # 转换为DataFrames
+    # 转换为DataFrames (所有周期纳入tf_dfs, target_df固定用5min)
     tf_dfs = {}
+    target_df = None
     for period, data in timeframe_data.items():
-        if period == '10min':
-            target_df = fetcher.get_dataframe(data)
-        elif period != '5min':
-            tf_dfs[period] = fetcher.get_dataframe(data)
+        df = fetcher.get_dataframe(data)
+        tf_dfs[period] = df
+        if period == '5min':
+            target_df = df
 
     label_source_df = fetcher.get_dataframe(timeframe_data['5min'])
 
