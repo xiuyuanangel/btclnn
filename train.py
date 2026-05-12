@@ -425,6 +425,9 @@ def train_model():
 
         # ---- 创建模型(每折独立, 防止跨折泄露) ----
         feat_size = len(SEQ_FEATURE_COLS)
+        _dual_norm = getattr(config, 'USE_DUAL_NORMALIZATION', False)
+        if _dual_norm:
+            feat_size *= 2  # 双标准化: [局部K线形态 || 绝对价格位置]
         ctx_size = len(CONTEXT_FEATURE_COLS)
         tf_configs = {
             p: {'seq_length': cfg['seq_length'], 'feature_size': feat_size}
@@ -435,6 +438,11 @@ def train_model():
         _use_transformer = getattr(config, 'USE_TRANSFORMER', False)
         _transformer_heads = getattr(config, 'TRANSFORMER_HEADS', 4)
         _cross_attn_heads = getattr(config, 'CROSS_ATTN_HEADS', 4)
+
+        if fold_idx == 0:
+            _norm_desc = f" (双标准化) ×2={feat_size}" if _dual_norm else ""
+            logger.info(f"序列特征维度: {len(SEQ_FEATURE_COLS)}{_norm_desc}")
+            logger.info(f"上下文特征维度: {ctx_size}")
 
         model = MultiTimeframeLNN(
             timeframe_configs=tf_configs,

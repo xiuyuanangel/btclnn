@@ -433,8 +433,26 @@ def build_multi_tf_dataset(tf_dfs, target_df, label_source_df=None,
         all_sequences[period] = sequences
         all_valid_masks[period] = valid_mask
 
-    # 4.5 每个样本序列级别归一化，强调同一序列内部结构关系
-    all_sequences = normalize_sequence_samplewise(all_sequences)
+    # 4.5 Dual normalization: 同时保留全局和局部标准化，特征维度翻倍
+    #    - 通道1 (前7维): 滚动窗口内Z-Score (保留局部K线形态)
+    #    - 通道2 (后7维): 原始值 (保留绝对量级, 后续global Z-Score标准化)
+    #    让模型既能识别"近期6根K线是看涨吞没形态"(通道1),
+    #    又能知道"当前价格位于历史高位"(通道2)。
+    if getattr(config, 'USE_DUAL_NORMALIZATION', False):
+        # 先创建全局标准化副本（保留原始量级，将在normalize_datasets中做global Z-Score）
+        all_sequences_global = {p: seqs.copy() for p, seqs in all_sequences.items()}
+        # 再对原序列做样本内归一化（保留局部相对形态）
+        all_sequences = normalize_sequence_samplewise(all_sequences)
+        # 拼接: feature_size翻倍, [local_pattern || global_level]
+        all_sequences = {
+            p: np.concatenate([all_sequences[p], all_sequences_global[p]], axis=-1)
+            for p in all_sequences
+        }
+        logger.info("双标准化已启用: 特征维度翻倍 (局部形态 + 全局位置)")
+        for p, arr in all_sequences.items():
+            logger.info(f"  {p}: {arr.shape} (最后{arr.shape[-1]//2}维为全局标准化通道)")
+    else:
+        all_sequences = normalize_sequence_samplewise(all_sequences)
 
     # 5. 取所有周期有效对齐的交集(只保留所有周期都有真实数据的样本)
     global_valid = np.ones(len(target_timestamps), dtype=bool)

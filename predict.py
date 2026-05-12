@@ -381,10 +381,24 @@ def predict():
         logger.error(str(e))
         return None
 
-    # 5. 应用序列级别归一化 + 与训练一致的Z-Score标准化
+    # 5. 应用双标准化: 滚动窗口内归一化(局部形态) + 全局Z-Score(绝对位置)
+    _dual_norm = getattr(config, 'USE_DUAL_NORMALIZATION', False)
     from features import normalize_sequence_samplewise
-    tf_seqs_raw = normalize_sequence_samplewise(tf_seqs_raw)
-    tf_seqs_norm, ctx_norm = normalize_with_stats(tf_seqs_raw, ctx_raw, norm_data)
+    if _dual_norm:
+        # 保留全局副本（保留绝对量级，后续应用global Z-Score）
+        tf_seqs_global = {p: v.copy() for p, v in tf_seqs_raw.items()}
+        # 序列内归一化（保留局部K线形态）
+        tf_seqs_local = normalize_sequence_samplewise(tf_seqs_raw)
+        # 拼接: feature_size翻倍, [local_pattern || global_level]
+        tf_seqs_dual = {
+            p: np.concatenate([tf_seqs_local[p], tf_seqs_global[p]], axis=-1)
+            for p in tf_seqs_raw
+        }
+        tf_seqs_norm, ctx_norm = normalize_with_stats(tf_seqs_dual, ctx_raw, norm_data)
+        logger.info("双标准化已启用: 序列特征维度翻倍 (局部形态 + 全局位置)")
+    else:
+        tf_seqs_raw = normalize_sequence_samplewise(tf_seqs_raw)
+        tf_seqs_norm, ctx_norm = normalize_with_stats(tf_seqs_raw, ctx_raw, norm_data)
 
     # 6. 模型推理
     tf_seqs_tensor = {p: torch.from_numpy(v.copy()).float().to(device) for p, v in tf_seqs_norm.items()}
