@@ -100,6 +100,17 @@ class RLConfig:
         os.makedirs(self.save_dir, exist_ok=True)
 
 
+@dataclass
+class Position:
+    """持仓记录（训练/实时交易共用）"""
+    horizon_idx: int           # 0=10min, 1=30min, 2=60min
+    horizon_minutes: int       # 周期（分钟）
+    direction: int             # 0=做多, 1=做空
+    bet: float                 # 投入本金
+    entry_idx: int             # 开仓时的步数索引（训练用）
+    exit_idx: int              # 结算时的步数索引（训练用）
+
+
 # =============================================================================
 # 环境: TradingEnv
 # =============================================================================
@@ -134,6 +145,7 @@ class TradingEnv:
         # 当前状态
         self.initial_balance = rl_cfg.initial_balance
         self.balance = self.initial_balance
+        self.open_positions: Dict[int, List[Position]] = {}  # exit_idx -> [Position]
         self.current_idx = 0
         self.last_returns = np.zeros(rl_cfg.state_returns_window, dtype=np.float32)
         self.episode_returns = []   # 记录每步盈亏
@@ -216,50 +228,97 @@ class TradingEnv:
         min_start = max(0, self.cfg.state_returns_window + 5)
         self.current_idx = np.random.randint(min_start, max_start)
         self.balance = self.initial_balance
+        self.open_positions.clear()
         self.episode_returns = []
         self.episode_actions = []
         self.episode_idx += 1
         return self._compute_state(self.current_idx)
 
     def step(self, action_idx: int) -> Tuple[np.ndarray, float, bool, dict]:
-        """执行一步交易"""
-        horizon, direction, bet = self.decode_action(action_idx)
-        idx = self.current_idx
+        """执行一步交易
 
-        # 确保本金不超过当前余额
+        每步先结算到期的持仓，再执行新动作。
+        开仓时从余额扣除本金，到期按方向+实际涨跌结算盈亏。
+        """
+        idx = self.current_idx
+        horizon, direction, bet = self.decode_action(action_idx)
+
+        # ============================================================
+        # 1. 结算到期持仓 (exit_idx == idx)
+        # ============================================================
+        settlement_reward = 0.0
+        if idx in self.open_positions:
+            for pos in self.open_positions.pop(idx):
+                actual_up = self.labels[pos.entry_idx, pos.horizon_idx]
+                if (pos.direction == 0 and actual_up == 1) or (pos.direction == 1 and actual_up == 0):
+                    # 预测正确: 返还本金 + 收益
+                    payout = pos.bet * (1 + self.cfg.profit_rates[pos.horizon_minutes])
+                    self.balance += payout
+                    pnl = pos.bet * self.cfg.profit_rates[pos.horizon_minutes]
+                else:
+                    # 预测错误: 本金已扣除，不再返还
+                    pnl = -pos.bet
+                settlement_reward += pnl
+
+        # ============================================================
+        # 2. 执行新动作
+        # ============================================================
         if horizon is not None:
             bet = min(bet, max(0, self.balance))
 
         if horizon is None or bet <= 0:
             # skip 或无资金
-            reward = 0.0
-            info = {'action': 'skip', 'bet': 0, 'pnl': 0.0, 'balance': self.balance}
+            new_reward = 0.0
+            info = {'action': 'skip', 'bet': 0, 'pnl': settlement_reward, 'balance': self.balance}
         else:
+            # 从余额扣除本金
+            self.balance -= bet
+
             h_idx = {10: 0, 30: 1, 60: 2}[horizon]
-            actual_up = self.labels[idx, h_idx]  # 1=涨, 0=跌
+            # 计算到期步数 (每个step=10分钟)
+            horizon_steps = max(1, horizon // 10)
+            exit_idx = idx + horizon_steps
 
-            # 根据方向和实际涨跌计算盈亏
-            if (direction == 0 and actual_up == 1) or (direction == 1 and actual_up == 0):
-                # 预测正确: 获得收益
-                reward = bet * self.cfg.profit_rates[horizon]
-                result = 'win'
+            # 注册持仓，到期结算
+            pos = Position(
+                horizon_idx=h_idx,
+                horizon_minutes=horizon,
+                direction=direction,
+                bet=bet,
+                entry_idx=idx,
+                exit_idx=exit_idx,
+            )
+            self.open_positions.setdefault(exit_idx, []).append(pos)
+            # 新开仓立即奖励为0（利润在到期时结算）
+            new_reward = 0.0
+
+            # 如果到期索引超出数据范围，立即按照当前标签强行结算
+            if exit_idx >= self.num_steps:
+                actual_up = self.labels[idx, h_idx]
+                if (direction == 0 and actual_up == 1) or (direction == 1 and actual_up == 0):
+                    payout = bet * (1 + self.cfg.profit_rates[horizon])
+                    self.balance += payout
+                    new_reward = bet * self.cfg.profit_rates[horizon]
+                    result = 'win'
+                else:
+                    new_reward = -bet
+                    result = 'lose'
+                self.open_positions.pop(exit_idx, None)
             else:
-                # 预测错误: 亏损本金
-                reward = -bet
-                result = 'lose'
+                result = 'open'
 
-            self.balance += reward
             info = {
                 'action': f'{horizon}min_{"long" if direction == 0 else "short"}',
                 'bet': bet,
-                'pnl': reward,
+                'pnl': new_reward + settlement_reward,
                 'balance': self.balance,
                 'result': result,
                 'prob': float(self.predictions[idx, h_idx]),
                 'prob_dir': 'up' if self.predictions[idx, h_idx] > 0.5 else 'down',
-                'actual': 'up' if actual_up == 1 else 'down',
+                'actual': 'up' if result == 'win' else ('down' if result == 'lose' else 'unknown'),
             }
 
+        reward = settlement_reward + new_reward
         self.episode_returns.append(reward)
         self.episode_actions.append(action_idx)
         self.current_idx += 1
@@ -880,6 +939,67 @@ def evaluate(
 # 实时交易
 # =============================================================================
 
+def _settle_expired_positions(
+    open_positions: list,
+    current_price: float,
+    current_time_ts: float,
+    rl_cfg: RLConfig,
+) -> tuple:
+    """结算已到期的持仓
+
+    Args:
+        open_positions: 当前所有未平仓持仓列表
+        current_price: 当前价格
+        current_time_ts: 当前时间戳
+        rl_cfg: 配置
+
+    Returns:
+        (still_open, total_amount, total_pnl, settled_count) 剩余持仓、应返还总金额、净盈亏、结算数量
+    """
+    still_open = []
+    total_pnl = 0.0
+    total_amount = 0.0
+    settled_count = 0
+
+    for pos in open_positions:
+        elapsed_min = (current_time_ts - pos['open_time']) / 60
+        if elapsed_min >= pos['horizon']:
+            # 到期结算
+            entry_price = pos['entry_price']
+            price_change = (current_price - entry_price) / entry_price
+            if pos['direction'] == 0:  # 做多
+                won = price_change > 0
+            else:  # 做空
+                won = price_change < 0
+
+            if won:
+                # 预测正确：返还本金+收益
+                # 开仓时 total_balance 已扣除 bet，此处加回 bet * (1 + rate)
+                amount_to_add = pos['bet'] * (1 + pos['profit_rate'])
+                net_return = pos['bet'] * pos['profit_rate']
+            else:
+                # 预测错误：本金不再返还（开仓时已扣除）
+                amount_to_add = 0.0
+                net_return = -pos['bet']
+
+            total_pnl += net_return
+            total_amount += amount_to_add
+            settled_count += 1
+
+            # 记录结算日志
+            dir_str = "做多" if pos['direction'] == 0 else "做空"
+            result_str = "✅ 盈利" if won else "❌ 亏损"
+            logger.info(
+                f"  持仓到期: {pos['horizon']}分钟{dir_str} {result_str} | "
+                f"开仓价={entry_price:.2f} 平仓价={current_price:.2f} | "
+                f"投入={pos['bet']:.1f} USDT 盈亏={net_return:+.1f} USDT"
+            )
+        else:
+            still_open.append(pos)
+
+    return still_open, total_amount, total_pnl, settled_count
+
+
 def live_trade(rl_cfg: RLConfig):
     """使用训练好的RL智能体进行实时交易"""
     device = _detect_device()
@@ -922,18 +1042,40 @@ def live_trade(rl_cfg: RLConfig):
     logger.info("=" * 60)
 
     fetcher = HuobiDataFetcher()
-    balance = rl_cfg.initial_balance
+    total_balance = rl_cfg.initial_balance       # 总资产 = 可用 + 持仓冻结
+    open_positions = []  # list of dict: {open_time, entry_price, horizon, direction, bet, profit_rate, pred_prob}
     trade_history = []
 
     try:
         while True:
             try:
-                # 1. 获取最新多周期数据
+                # ============================================================
+                # 0. 获取最新数据，用于结算和决策
+                # ============================================================
                 logger.info("获取最新K线数据...")
                 timeframe_data = fetcher.fetch_multi_timeframe()
+                target_df = fetcher.get_dataframe(timeframe_data['5min'])
+                current_price = float(target_df['close'].iloc[-1])
+                current_time_ts = time.time()
 
+                # ============================================================
+                # 1. 结算到期持仓
+                # ============================================================
+                open_positions, settled_amount, settled_pnl, settled_count = _settle_expired_positions(
+                    open_positions, current_price, current_time_ts, rl_cfg)
+                if settled_count > 0:
+                    total_balance += settled_amount  # 返还本金+收益
+                    logger.info(f"  本轮结算 {settled_count} 笔, 盈亏合计: {settled_pnl:+.1f} USDT | "
+                                 f"总资产: {total_balance:.2f} USDT")
+
+                # 计算可用余额（总资产 - 持仓冻结）
+                locked_balance = sum(p['bet'] for p in open_positions)
+                available_balance = total_balance - locked_balance
+
+                # ============================================================
                 # 2. 计算特征和模型预测
-                tf_seqs_raw, ctx_raw, target_df = _prepare_live_features(
+                # ============================================================
+                tf_seqs_raw, ctx_raw, _ = _prepare_live_features(
                     timeframe_data, fetcher)
                 tf_seqs_raw = normalize_sequence_samplewise(tf_seqs_raw)
                 tf_seqs_norm, ctx_norm = _normalize_with_stats(tf_seqs_raw, ctx_raw, norm_data)
@@ -949,28 +1091,46 @@ def live_trade(rl_cfg: RLConfig):
                     logits = model(tf_tensors, ctx_tensor)
                     probs = torch.sigmoid(logits).cpu().numpy()[0]  # (3,)
 
-                current_price = float(target_df['close'].iloc[-1])
-                current_time = pd.Timestamp.now()
-
-                logger.info(f"当前时间: {current_time}")
+                current_time_str = pd.Timestamp.now()
+                logger.info(f"当前时间: {current_time_str}")
                 logger.info(f"当前价格: {current_price:.2f} USDT")
-                logger.info(f"余额: {balance:.2f} USDT")
+                logger.info(f"总资产: {total_balance:.2f} USDT | "
+                             f"可用: {available_balance:.2f} USDT | "
+                             f"持仓冻结: {locked_balance:.2f} USDT")
 
-                # 4. 构建状态
+                # ============================================================
+                # 4. 构建状态（使用真实收益率和可用余额）
+                # ============================================================
                 confs = np.abs(probs - 0.5) * 2.0
-                # 简化: 用最近5个10min return (无历史时用0填充)
-                fake_rets = np.zeros(rl_cfg.state_returns_window, dtype=np.float32)
+
+                # 从价格数据计算最近收益率
+                close_arr = target_df['close'].values.astype(np.float32)
+                rets = np.diff(np.log(close_arr))
+                if len(rets) >= rl_cfg.state_returns_window:
+                    recent_rets = rets[-rl_cfg.state_returns_window:]
+                elif len(rets) > 0:
+                    recent_rets = np.pad(rets, (rl_cfg.state_returns_window - len(rets), 0), 'constant')
+                else:
+                    recent_rets = np.zeros(rl_cfg.state_returns_window, dtype=np.float32)
+
+                # 波动率
+                vol = float(np.std(rets[-20:])) if len(rets) >= 20 else 0.0
+
                 state = np.concatenate([
                     probs, confs,
-                    [balance / rl_cfg.initial_balance],
-                    fake_rets, [0.0], [0.0],
+                    [available_balance / rl_cfg.initial_balance],
+                    recent_rets, [vol], [0.0],  # progress=0 for live
                 ]).astype(np.float32)
 
+                # ============================================================
                 # 5. RL智能体决策
+                # ============================================================
                 action = agent.select_action(state, eval_mode=True)
                 horizon, direction, bet = dummy_env.decode_action(action)
 
-                # 6. 输出决策
+                # ============================================================
+                # 6. 输出决策并执行交易
+                # ============================================================
                 print()
                 print("=" * 60)
                 print(f"  LNN预测:")
@@ -981,28 +1141,62 @@ def live_trade(rl_cfg: RLConfig):
 
                 if horizon is None:
                     print(f"  RL决策: 不交易 (skip)")
+                    new_rec = None
+                elif bet > available_balance:
+                    print(f"  RL决策: 可用余额不足 (需{bet:.1f} USDT, 可用{available_balance:.1f} USDT), 跳过")
+                    logger.warning(f"可用余额不足: 需{bet:.1f} USDT, 可用{available_balance:.1f} USDT, 跳过")
+                    new_rec = None
                 else:
                     dir_str = "做多" if direction == 0 else "做空"
-                    risk_pct = bet / balance * 100 if balance > 0 else 0
+                    risk_pct = bet / (available_balance + locked_balance) * 100 if (available_balance + locked_balance) > 0 else 0
                     potential_profit = bet * rl_cfg.profit_rates[horizon]
                     print(f"  RL决策: {horizon}分钟 {dir_str}")
-                    print(f"  投入本金: {bet:.1f} USDT ({risk_pct:.1f}% 余额)")
+                    print(f"  投入本金: {bet:.1f} USDT ({risk_pct:.1f}% 总资产)")
                     print(f"  潜在收益: +{potential_profit:.1f} USDT | 潜在亏损: -{bet:.1f} USDT")
+
+                    # 执行开仓：从可用余额扣除本金
+                    # 注意：资金从 total_balance 中扣减（进入持仓冻结）
+                    # total_balance 在结算时恢复
+                    open_positions.append({
+                        'open_time': current_time_ts,
+                        'entry_price': current_price,
+                        'horizon': horizon,
+                        'direction': direction,
+                        'bet': bet,
+                        'profit_rate': rl_cfg.profit_rates[horizon],
+                        'pred_prob': float(probs[{10: 0, 30: 1, 60: 2}[horizon]]),
+                    })
+                    total_balance -= bet
+                    locked_balance += bet
+                    available_balance = total_balance - locked_balance
+
+                    new_rec = {
+                        'action': f'{horizon}min_{dir_str}',
+                        'bet': bet,
+                        'locked': locked_balance,
+                    }
 
                 print("=" * 60)
                 print()
 
+                # ============================================================
                 # 7. 记录交易
+                # ============================================================
                 trade_record = {
-                    'time': str(current_time),
+                    'time': str(current_time_str),
                     'price': current_price,
-                    'balance': balance,
+                    'total_balance': total_balance,
+                    'available_balance': available_balance,
+                    'locked_balance': locked_balance,
                     'probs_10m': float(probs[0]),
                     'probs_30m': float(probs[1]),
                     'probs_60m': float(probs[2]),
                     'action': horizon,
                     'direction': direction,
                     'bet': bet,
+                    'settled_pnl': settled_pnl if settled_count > 0 else None,
+                    'settled_amount': settled_amount if settled_count > 0 else None,
+                    'open_positions': len(open_positions),
                 }
                 trade_history.append(trade_record)
 
@@ -1025,6 +1219,11 @@ def live_trade(rl_cfg: RLConfig):
         with open(history_path, 'w') as f:
             json.dump(trade_history, f, ensure_ascii=False, indent=2)
         logger.info(f"交易历史已保存 -> {history_path}")
+        # 若有未结算持仓，记录损失
+        if open_positions:
+            logger.warning(f"停止时有 {len(open_positions)} 笔未结算持仓，本金已亏损")
+            lost_bet = sum(p['bet'] for p in open_positions)
+            logger.warning(f"  未结算本金合计: {lost_bet:.2f} USDT")
 
 
 def _prepare_live_features(timeframe_data, fetcher):
