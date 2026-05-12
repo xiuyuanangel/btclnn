@@ -253,17 +253,28 @@ class HuobiDataFetcher:
 
         # 2. 计算需要获取的时间范围
         if cached_data:
-            # 需要获取: 比缓存最早的更早数据 + 比缓存最晚的更新的数据
-            fetch_start = min(start_ts, cached_data[0].get("id", now_ts)) - 3600
+            # 缓存已有时: 只获取比最新缓存更新的数据(加1小时重叠)
+            # 避免从最早的缓存开始全范围重拉, 大量小块并发但几乎全是缓存命中
+            fetch_start = max(start_ts, cached_data[-1].get("id", start_ts)) - 3600
             fetch_end = now_ts
+            cache_oldest = pd.to_datetime(cached_data[0]['id'], unit='s')
+            cache_newest = pd.to_datetime(cached_data[-1]['id'], unit='s')
+            logger.info(
+                f"缓存 {len(cached_data)} 条 [{cache_oldest} ~ {cache_newest}], "
+                f"仅补充尾段: {pd.to_datetime(fetch_start, unit='s')} ~ now"
+            )
         else:
             fetch_start = start_ts
             fetch_end = now_ts
 
-        # 3. 按周期动态分块(确保每块不超过API的2000条限制)
-        # 5min周期: 2000 * 300s ≈ 6.9天(7天=2016根会超限)
-        max_candles_per_chunk = 1500  # 留buffer
-        chunk_seconds = max_candles_per_chunk * minutes_per_candle * 60
+        # 3. 自适应分块(目标 ~16 块, 避免大量小块增加并发开销)
+        # API 限制单次请求最多约 2000 条, 每块保留余量
+        total_seconds = fetch_end - fetch_start
+        target_chunks = max(8, min(total_seconds // (3600 * 24), 32))  # 8~32 块
+        adaptive_chunk_seconds = max(total_seconds // target_chunks, 3600)  # 每块至少1小时
+        # 不超过 API 单次限制(1800 根K线, 保留余量)
+        max_chunk_seconds = 1800 * minutes_per_candle * 60
+        chunk_seconds = min(adaptive_chunk_seconds, max_chunk_seconds)
         
         # 生成时间块列表
         chunks = []
@@ -273,7 +284,7 @@ class HuobiDataFetcher:
             chunks.append((chunk_start, chunk_end))
             chunk_start = chunk_end
         
-        logger.info(f"{period} 数据分块: {len(chunks)} 个时间块，每块约 {minutes_per_candle * max_candles_per_chunk} 根K线")
+        logger.info(f"{period} 数据分块: {len(chunks)} 个时间块，每块约 {chunk_seconds // (minutes_per_candle * 60)} 根K线")
         
         # 4. 并发获取所有时间块数据(全局信号量已限制总并发数)
         all_new_data = []
