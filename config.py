@@ -108,13 +108,6 @@ MEOW_BASE_URL = "https://api.chuckfang.com"  # API基础地址
 PENDING_VERIFICATIONS_PATH = os.path.join(BASE_DIR, "data", "pending_verifications.json")
 VERIFICATION_STATS_PATH = os.path.join(BASE_DIR, "data", "verification_stats.json")
 
-# ==================== 双标准化配置 ====================
-# 启用后, 序列特征维度翻倍 (feature_size × 2):
-#   - 通道1 (前7维): 滚动窗口标准化 (局部K线形态)
-#   - 通道2 (后7维): 全局标准化 (绝对价格位置)
-# 让模型同时学会识别K线形态和理解当前价格相对于历史水平的相对位置
-USE_DUAL_NORMALIZATION = True
-
 # ==================== 调试配置 ====================
 DEBUG_EXPORT_CSV = False     # 是否导出数据集样本到CSV供人工核验
 

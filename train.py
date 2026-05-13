@@ -424,10 +424,7 @@ def train_model():
             test_dataset = MultiTimeframeDataset(cv_test_data[0], cv_test_data[1], cv_test_data[2], periods)
 
         # ---- 创建模型(每折独立, 防止跨折泄露) ----
-        feat_size = len(SEQ_FEATURE_COLS)
-        _dual_norm = getattr(config, 'USE_DUAL_NORMALIZATION', False)
-        if _dual_norm:
-            feat_size *= 2  # 双标准化: [局部K线形态 || 绝对价格位置]
+        feat_size = len(SEQ_FEATURE_COLS)  # 9维: close,vol,return_1,high,low,bb_width,bb_pct,close_ratio,vol_ratio
         ctx_size = len(CONTEXT_FEATURE_COLS)
         tf_configs = {
             p: {'seq_length': cfg['seq_length'], 'feature_size': feat_size}
@@ -440,8 +437,7 @@ def train_model():
         _cross_attn_heads = getattr(config, 'CROSS_ATTN_HEADS', 4)
 
         if fold_idx == 0:
-            _norm_desc = f" (双标准化) ×2={feat_size}" if _dual_norm else ""
-            logger.info(f"序列特征维度: {len(SEQ_FEATURE_COLS)}{_norm_desc}")
+            logger.info(f"序列特征维度: {feat_size} ({len(SEQ_FEATURE_COLS)}个原始特征)")
             logger.info(f"上下文特征维度: {ctx_size}")
 
         model = MultiTimeframeLNN(

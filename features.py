@@ -136,7 +136,9 @@ def normalize_sequence_samplewise(tf_seqs):
     return normalized
 
 
-# 序列特征列名(混合方案: 原始OHLCV + 收益率 + 布林带, 每个时间步7个特征, 所有周期共享)
+# 序列特征列名(9维: 原始OHLCV + 收益率 + 布林带 + 均线比率)
+# close_ratio/vol_ratio 使用价格/成交量与144-bar均线的比率,
+# 使得BTC=60k和ETH=3k在同一尺度下可比(ratio=1.05含义完全相同)。
 SEQ_FEATURE_COLS = [
     'close',        # 核心价格
     'vol',          # 成交量
@@ -145,6 +147,8 @@ SEQ_FEATURE_COLS = [
     'low',          # 最低价
     'bb_width_20',  # 布林带带宽(波动率扩张/收缩)
     'bb_pct_20',    # 布林带%B价格位置
+    'close_ratio',  # 价格/均线比率, 跨币种可比的相对价格位置
+    'vol_ratio',    # 成交量/均线比率, 跨币种可比的相对成交量水平
 ]
 
 # 上下文特征列名(60天窗口的6个统计特征)
@@ -158,13 +162,42 @@ CONTEXT_FEATURE_COLS = [
 ]
 
 
+
+
+def compute_position_features(df, window=144):
+    """计算价格/成交量的长期位置比率特征（跨币种可比）
+
+    使用 close/ma(close) 和 vol/ma(vol) 代替原始绝对值，
+    使得 BTC=60k 和 ETH=3k 在同一个尺度下可比：
+      ratio=1.05 意味着"价格高于长期均线5%"。
+
+    Args:
+        df: K线DataFrame(需含close/vol列)
+        window: 滚动窗口大小(默认144), 各周期代表不同时间长度但语义一致
+
+    Returns:
+        原地修改的DataFrame, 添加'close_ratio'和'vol_ratio'列
+    """
+    eps = 1e-8
+    # 价格比率: close / 长期均线,  >1 = 高于均值, <1 = 低于均值
+    close_ma = df['close'].rolling(window=window, min_periods=1).mean()
+    df['close_ratio'] = df['close'] / (close_ma + eps)
+
+    # 成交量比率: vol / 长期均量,  >1 = 放量, <1 = 缩量
+    vol_ma = df['vol'].rolling(window=window, min_periods=1).mean()
+    df['vol_ratio'] = df['vol'] / (vol_ma + eps)
+
+    return df
+
+
 def compute_all_features(df):
     """对DataFrame计算序列特征(原地修改)
 
-    混合方案: 收益率 + 布林带, 其余(close/vol/high/low)为原始OHLCV字段
+    混合方案: 收益率 + 布林带 + 位置比率, 其余(close/vol/high/low)为原始OHLCV字段
     """
     df = compute_returns(df, windows=(1,))
     df = compute_bollinger_bands(df, windows=(20,))
+    df = compute_position_features(df)
     return df
 
 
@@ -433,26 +466,8 @@ def build_multi_tf_dataset(tf_dfs, target_df, label_source_df=None,
         all_sequences[period] = sequences
         all_valid_masks[period] = valid_mask
 
-    # 4.5 Dual normalization: 同时保留全局和局部标准化，特征维度翻倍
-    #    - 通道1 (前7维): 滚动窗口内Z-Score (保留局部K线形态)
-    #    - 通道2 (后7维): 原始值 (保留绝对量级, 后续global Z-Score标准化)
-    #    让模型既能识别"近期6根K线是看涨吞没形态"(通道1),
-    #    又能知道"当前价格位于历史高位"(通道2)。
-    if getattr(config, 'USE_DUAL_NORMALIZATION', False):
-        # 先创建全局标准化副本（保留原始量级，将在normalize_datasets中做global Z-Score）
-        all_sequences_global = {p: seqs.copy() for p, seqs in all_sequences.items()}
-        # 再对原序列做样本内归一化（保留局部相对形态）
-        all_sequences = normalize_sequence_samplewise(all_sequences)
-        # 拼接: feature_size翻倍, [local_pattern || global_level]
-        all_sequences = {
-            p: np.concatenate([all_sequences[p], all_sequences_global[p]], axis=-1)
-            for p in all_sequences
-        }
-        logger.info("双标准化已启用: 特征维度翻倍 (局部形态 + 全局位置)")
-        for p, arr in all_sequences.items():
-            logger.info(f"  {p}: {arr.shape} (最后{arr.shape[-1]//2}维为全局标准化通道)")
-    else:
-        all_sequences = normalize_sequence_samplewise(all_sequences)
+    # 4.5 每个样本序列级别归一化，强调同一序列内部结构关系
+    all_sequences = normalize_sequence_samplewise(all_sequences)
 
     # 5. 取所有周期有效对齐的交集(只保留所有周期都有真实数据的样本)
     global_valid = np.ones(len(target_timestamps), dtype=bool)
