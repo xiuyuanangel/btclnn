@@ -128,6 +128,7 @@ class TradingEnv:
         self,
         dataset_dict: dict,
         predictions: np.ndarray,   # (N, 3) 模型预测的上涨概率
+        hidden_states: np.ndarray, # (N, hidden_size) 融合层隐状态
         close_prices: np.ndarray,  # (N,) 每个时间步的收盘价
         rl_cfg: RLConfig,
         seed: Optional[int] = None,
@@ -135,6 +136,8 @@ class TradingEnv:
         self.cfg = rl_cfg
         self.labels = dataset_dict['labels']           # (N, 3)
         self.predictions = predictions                  # (N, 3) 上涨概率
+        self.hidden_states = hidden_states              # (N, hidden_size) 隐状态
+        self.hidden_size = hidden_states.shape[1]
         self.close_prices = close_prices                 # (N,)
 
         self.num_steps = len(self.labels)
@@ -165,7 +168,8 @@ class TradingEnv:
             1 +                   # 余额比例
             rl_cfg.state_returns_window +  # 最近收益率
             1 +                   # 波动率
-            1                     # 已用步数比例
+            1 +                   # 已用步数比例
+            self.hidden_size      # LNN融合层隐状态 (方案A)
         )
 
     def _precompute_returns(self):
@@ -192,7 +196,7 @@ class TradingEnv:
         return h, d, b
 
     def _compute_state(self, idx: int) -> np.ndarray:
-        """计算当前状态向量"""
+        """计算当前状态向量 (含LNN融合层隐状态)"""
         probs = self.predictions[idx]                 # (3,)
         confs = np.abs(probs - 0.5) * 2.0             # (3,)
         balance_ratio = self.balance / self.initial_balance
@@ -212,6 +216,9 @@ class TradingEnv:
         # 进度
         progress = idx / max(self.num_steps - 1, 1)
 
+        # LNN融合层隐状态 (方案A)
+        hidden = self.hidden_states[idx]
+
         return np.concatenate([
             probs,                # 3
             confs,                # 3
@@ -219,6 +226,7 @@ class TradingEnv:
             recent_rets,          # state_returns_window
             [vol],                # 1
             [progress],           # 1
+            hidden,               # hidden_size
         ]).astype(np.float32)
 
     def reset(self) -> np.ndarray:
@@ -665,8 +673,8 @@ def precompute_predictions(
     dataset_tuple: tuple,
     device: torch.device,
     batch_size: int = 512,
-) -> np.ndarray:
-    """在数据集上批量计算模型预测的上涨概率
+) -> Tuple[np.ndarray, np.ndarray]:
+    """在数据集上批量计算模型预测的上涨概率和融合层隐状态
 
     Args:
         model: 预训练LNN模型 (eval模式)
@@ -674,12 +682,14 @@ def precompute_predictions(
 
     Returns:
         predictions: (N, 3) 上涨概率 [p_10m, p_30m, p_60m]
+        hidden_states: (N, hidden_size) 融合层隐状态, hidden_size=config.HIDDEN_SIZE(64)
     """
     X_dict, X_ctx, _ = dataset_tuple
     model.eval()
 
     n = X_ctx.shape[0]
     all_probs = []
+    all_hidden = []
 
     with torch.no_grad():
         for i in range(0, n, batch_size):
@@ -692,11 +702,12 @@ def precompute_predictions(
             }
             batch_ctx = torch.FloatTensor(X_ctx[i:end]).to(device)
 
-            logits = model(batch_seqs, batch_ctx)
+            logits, hidden = model(batch_seqs, batch_ctx, return_hidden=True)
             probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.append(probs)
+            all_hidden.append(hidden.cpu().numpy())
 
-    return np.concatenate(all_probs, axis=0)
+    return np.concatenate(all_probs, axis=0), np.concatenate(all_hidden, axis=0)
 
 
 # =============================================================================
@@ -729,16 +740,17 @@ def train_rl(rl_cfg: RLConfig):
 
     # 3. 预计算LNN预测
     logger.info("预计算LNN模型预测 (训练集)...")
-    train_preds = precompute_predictions(model, train_data, device)
-    logger.info(f"训练集预测完成: {train_preds.shape}")
+    train_preds, train_hidden = precompute_predictions(model, train_data, device)
+    logger.info(f"训练集预测完成: {train_preds.shape}, 隐状态: {train_hidden.shape}")
 
     logger.info("预计算LNN模型预测 (验证集)...")
-    val_preds = precompute_predictions(model, val_data, device)
+    val_preds, val_hidden = precompute_predictions(model, val_data, device)
 
     # 4. 创建环境和智能体
     train_env = TradingEnv(
         dataset_dict={'labels': train_data[2], 'tf_sequences': train_data[0], 'context': train_data[1]},
         predictions=train_preds,
+        hidden_states=train_hidden,
         close_prices=close_prices[:n_train],
         rl_cfg=rl_cfg,
     )
@@ -746,6 +758,7 @@ def train_rl(rl_cfg: RLConfig):
     val_env = TradingEnv(
         dataset_dict={'labels': val_data[2], 'tf_sequences': val_data[0], 'context': val_data[1]},
         predictions=val_preds,
+        hidden_states=val_hidden,
         close_prices=close_prices[n_train:n_train + n_val] if len(close_prices) >= n_train + n_val else close_prices[n_train:],
         rl_cfg=rl_cfg,
     )
@@ -859,11 +872,12 @@ def train_rl(rl_cfg: RLConfig):
 
     # 预计算测试集预测
     logger.info("预计算LNN模型预测 (测试集)...")
-    test_preds = precompute_predictions(model, test_data, device)
+    test_preds, test_hidden = precompute_predictions(model, test_data, device)
 
     test_env = TradingEnv(
         dataset_dict={'labels': test_data[2], 'tf_sequences': test_data[0], 'context': test_data[1]},
         predictions=test_preds,
+        hidden_states=test_hidden,
         close_prices=close_prices[n_train + n_val:] if len(close_prices) >= n_train + n_val else close_prices[-len(test_data[2]):],
         rl_cfg=rl_cfg,
     )
@@ -1014,9 +1028,11 @@ def live_trade(rl_cfg: RLConfig):
 
     # 创建RL环境(只需状态维度)
     # 先构建一个最小的环境来获取state_dim
+    hidden_size = config.HIDDEN_SIZE
     dummy_env = TradingEnv(
         dataset_dict={'labels': np.zeros((10, 3)), 'tf_sequences': {}, 'context': np.zeros((10, 6))},
         predictions=np.zeros((10, 3)),
+        hidden_states=np.zeros((10, hidden_size)),
         close_prices=np.ones(10) * 50000,
         rl_cfg=rl_cfg,
     )
@@ -1088,8 +1104,9 @@ def live_trade(rl_cfg: RLConfig):
                 ctx_tensor = torch.from_numpy(ctx_norm.copy()).float().to(device)
 
                 with torch.no_grad():
-                    logits = model(tf_tensors, ctx_tensor)
+                    logits, hidden = model(tf_tensors, ctx_tensor, return_hidden=True)
                     probs = torch.sigmoid(logits).cpu().numpy()[0]  # (3,)
+                    hidden_state = hidden.cpu().numpy()[0]          # (hidden_size,)
 
                 current_time_str = pd.Timestamp.now()
                 logger.info(f"当前时间: {current_time_str}")
@@ -1120,6 +1137,7 @@ def live_trade(rl_cfg: RLConfig):
                     probs, confs,
                     [available_balance / rl_cfg.initial_balance],
                     recent_rets, [vol], [0.0],  # progress=0 for live
+                    hidden_state,               # 融合层隐状态
                 ]).astype(np.float32)
 
                 # ============================================================
@@ -1307,13 +1325,14 @@ def main():
         device = _detect_device()
         model, _ = _load_model_and_horizons(device)
         _, _, test_data, close_prices = prepare_rl_dataset()
-        test_preds = precompute_predictions(model, test_data, device)
+        test_preds, test_hidden = precompute_predictions(model, test_data, device)
 
         env = TradingEnv(
             dataset_dict={'labels': test_data[2],
                           'tf_sequences': test_data[0],
                           'context': test_data[1]},
             predictions=test_preds,
+            hidden_states=test_hidden,
             close_prices=close_prices[-len(test_data[2]):],
             rl_cfg=rl_cfg,
         )

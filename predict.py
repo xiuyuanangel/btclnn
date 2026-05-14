@@ -71,21 +71,55 @@ def _rename_state_dict_keys(state_dict):
     模型架构变更历史:
     - v1: cells, layer_norms (无前缀)
     - v2: ltc_cells, ltc_layer_norms (增加ltc_前缀区分)
+    - v3: classifier.* → heads.*.* (独立多分类头)
     """
     key_mapping = {}
     for old_key in list(state_dict.keys()):
         new_key = old_key
+
+        # v1 → v2: LTC cell/layer_norm 前缀
         if '.cells.' in old_key and '.ltc_cells.' not in old_key:
             new_key = old_key.replace('.cells.', '.ltc_cells.')
         if '.layer_norms.' in old_key and '.ltc_layer_norms.' not in old_key:
             new_key = old_key.replace('.layer_norms.', '.ltc_layer_norms.')
+
+        # v2 → v3: 共享分类器 → 独立分类头
+        # 旧: classifier.0.weight → 映射到 heads.0.0.weight (所有窗口共享旧权重作初始化)
+        if 'classifier.' in old_key and 'heads.' not in old_key:
+            parts = old_key.split('.')
+            if len(parts) == 3:  # classifier.0.weight
+                layer_idx = parts[1]  # 0=Linear(64→32), 3=Linear(32→3) 
+                param_name = parts[2]  # weight 或 bias
+                if layer_idx == '3':
+                    # v2 classifier.3 = Linear(32→3), weight shape (3,32)
+                    # 拆成3个独立的 Linear(32→1): heads.0.3, heads.1.3, heads.2.3
+                    _w = state_dict[old_key]
+                    if _w.shape[0] == 3:  # 确认是3输出分类器
+                        for h in range(3):
+                            target_key = f'heads.{h}.3.{param_name}'
+                            if param_name == 'weight':
+                                key_mapping[old_key] = target_key
+                                # 权重需要reshape: 从(3,32)取第h行→(1,32)
+                                state_dict[target_key] = _w[h:h+1].clone()
+                            else:  # bias
+                                key_mapping[old_key] = target_key
+                                state_dict[target_key] = _w[h:h+1].clone()
+                        continue  # 跳过默认key_mapping逻辑
+                else:
+                    # classifier.0 = Linear(64→32), 直接复制到每个head的layer 0
+                    for h in range(3):
+                        target_key = f'heads.{h}.{layer_idx}.{param_name}'
+                        key_mapping[old_key] = target_key
+                        state_dict[target_key] = state_dict[old_key].clone()
+
         if new_key != old_key:
             key_mapping[old_key] = new_key
 
     if key_mapping:
         logger.info(f"检测到旧版模型key，转换 {len(key_mapping)} 个key")
         for old_key, new_key in key_mapping.items():
-            state_dict[new_key] = state_dict.pop(old_key)
+            if old_key in state_dict:
+                state_dict[new_key] = state_dict.pop(old_key)
 
     return state_dict
 

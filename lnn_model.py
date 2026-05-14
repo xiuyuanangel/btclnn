@@ -455,31 +455,39 @@ class MultiTimeframeLNN(nn.Module):
             dropout_rate=self.dropout_rate,
         )
 
-        # 分类头(多输出) — 无Sigmoid, 配合 BCEWithLogitsLoss
-        self.classifier = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(self.dropout_rate),
-            nn.Linear(self.hidden_size // 2, self.output_size),
-        )
+        # 分类头(独立多输出) — 每个预测窗口独立的分类器, 无Sigmoid, 配合 BCEWithLogitsLoss
+        # 共享融合向量 → 各窗口独立 Linear(64→32) → ReLU → Dropout → Linear(32→1)
+        # 这样 10min/30min/60min 可以学习各自独立的决策边界和方向
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.hidden_size, self.hidden_size // 2),
+                nn.ReLU(),
+                nn.Dropout(self.dropout_rate),
+                nn.Linear(self.hidden_size // 2, 1),
+            )
+            for _ in range(output_size)
+        ])
         self._init_fusion_and_classifier()
 
     def _init_fusion_and_classifier(self):
         # GatedResidualFusion 内部已自行初始化, 无需重复处理
-        for module in self.classifier:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        for head in self.heads:
+            for module in head:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
 
-    def forward(self, tf_sequences, context_features):
+    def forward(self, tf_sequences, context_features, return_hidden=False):
         """
         Args:
             tf_sequences: dict of {period: (batch, seq_len, feature_size)}
             context_features: (batch, context_size)
+            return_hidden: 若为True, 同时返回融合层输出的隐状态 (batch, hidden_size)
 
         Returns:
-            output: (batch, num_horizons) 各预测窗口的上涨概率
+            output: (batch, num_horizons) 各预测窗口的上涨logits
+            (optional) hidden: (batch, hidden_size) 融合层隐状态 (仅 return_hidden=True 时返回)
         """
         # 1. 各周期独立编码(保持固定顺序)
         encoded = []
@@ -494,9 +502,15 @@ class MultiTimeframeLNN(nn.Module):
         # 3. Gated Residual Fusion: 可学习的周期贡献度 + 残差连接
         #    各周期编码输出 → 门控加权聚合 → 残差(均值基线+上下文) → LayerNorm投影
         fused = self.fusion(encoded, context_features)
-        out = self.classifier(fused)
-        # 显式reshape保证输出维度始终为(batch, output_size), 避免squeeze(-1)在batch=1时塌陷
-        return out.view(out.size(0), self.output_size)
+
+        # 4. 各预测窗口独立分类 (不同窗口可学习不同方向)
+        #    每个 head 输出 (batch, 1), 沿最后一维拼接为 (batch, output_size)
+        outputs = [head(fused) for head in self.heads]
+        out = torch.cat(outputs, dim=-1)
+
+        if return_hidden:
+            return out, fused
+        return out
 
 
 class LiquidNeuralNetwork(nn.Module):
