@@ -53,32 +53,121 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# TPU 设备检测
+# TPU 兼容层 — 平滑处理 torch_xla 新旧 API 差异
+#
+# torch_xla 2.9+ 移除了 xla_device() / xrt_world_size():
+#   旧: xm.xla_device()          → 新: torch_xla.device()
+#   旧: xm.xrt_world_size()      → 新: torch_xla.runtime.world_size()
+#   旧: xm.is_master_ordinal()   → 新: torch_xla.runtime.global_ordinal() == 0
+#   旧: xm.get_ordinal()         → 新: torch_xla.runtime.global_ordinal()
+#
+# xm.optimizer_step / xm.all_reduce / xm.save / xm.rendezvous 等 2.9 仍兼容。
 # =============================================================================
 
-def _detect_device():
-    """检测并返回 TPU 设备；无 TPU 时回退 CPU
+class _TPUCompat:
+    """统一 TPU 操作接口，处理新旧 API 差异"""
 
-    Returns:
-        (device, is_tpu, xm, xmp, pl):
-            - device: torch.device
-            - is_tpu: bool
-            - xm/xmp/pl: torch_xla 模块或 None
-    """
-    try:
-        import torch_xla.core.xla_model as _xm
-        import torch_xla.distributed.xla_multiprocessing as _xmp
-        import torch_xla.distributed.parallel_loader as _pl
+    def __init__(self):
+        self.available = False
+        self.device = torch.device("cpu")
+        self.world_size = 1
+        self.is_master = True
 
-        device = _xm.xla_device()
-        logger.info(f"使用 TPU 设备: {device}")
-        logger.info(f"TPU 核心数量: {_xm.xrt_world_size()}")
-        return device, True, _xm, _xmp, _pl
+        try:
+            import torch_xla
+            import torch_xla.core.xla_model as _xm
+            import torch_xla.distributed.parallel_loader as _pl
 
-    except (ImportError, RuntimeError, AttributeError) as e:
-        logger.warning(f"torch_xla 不可用 ({e})，回退到 CPU 训练")
-        device = torch.device("cpu")
-        return device, False, None, None, None
+            # --- 获取设备 (新API优先) ---
+            if hasattr(torch_xla, 'device'):
+                self.device = torch_xla.device()
+            else:
+                self.device = _xm.xla_device()
+
+            # --- 获取核心数 (新API优先) ---
+            if hasattr(torch_xla, 'runtime') and hasattr(torch_xla.runtime, 'world_size'):
+                self.world_size = torch_xla.runtime.world_size()
+            elif hasattr(_xm, 'xrt_world_size'):
+                self.world_size = _xm.xrt_world_size()
+            else:
+                self.world_size = 1
+
+            # --- Master 判断 (新API优先) ---
+            if hasattr(torch_xla, 'runtime') and hasattr(torch_xla.runtime, 'global_ordinal'):
+                self.is_master = torch_xla.runtime.global_ordinal() == 0
+            elif hasattr(_xm, 'is_master_ordinal'):
+                self.is_master = _xm.is_master_ordinal()
+
+            self._xm = _xm
+            self._pl = _pl
+            self.available = True
+
+            logger.info(f"使用 TPU 设备: {self.device}")
+            logger.info(f"TPU 核心数: {self.world_size}")
+
+        except (ImportError, RuntimeError, AttributeError) as e:
+            err_msg = str(e)
+            if 'vfio' in err_msg or 'busy' in err_msg.lower():
+                logger.warning(
+                    f"TPU 设备忙 ({err_msg.split(':')[0].strip()})。\n"
+                    f"  >>> 修复方法: 运行时 → 恢复出厂设置 (Factory reset runtime)，然后重新运行 <<<")
+            else:
+                logger.warning(f"torch_xla 不可用 ({e})，回退到 CPU")
+            self.available = False
+            self.device = torch.device("cpu")
+            self._xm = None
+            self._pl = None
+
+    # ---------- 以下方法映射到 xm.*，在 torch_xla 2.9 中仍然兼容 ----------
+
+    def optimizer_step(self, optimizer, barrier=True):
+        if self._xm is not None:
+            self._xm.optimizer_step(optimizer, barrier=barrier)
+
+    def all_reduce(self, reduce_type, tensor, scale=1.0):
+        if self._xm is not None:
+            return self._xm.all_reduce(reduce_type, tensor, scale=scale)
+        return tensor
+
+    def save(self, obj, path):
+        if self._xm is not None:
+            self._xm.save(obj, path)
+        else:
+            torch.save(obj, path)
+
+    def rendezvous(self, tag):
+        if self._xm is not None:
+            self._xm.rendezvous(tag)
+
+    def mark_step(self):
+        if self._xm is not None:
+            self._xm.mark_step()
+
+    def MpDeviceLoader(self, loader):
+        """包装 DataLoader 为 TPU 并行加载器"""
+        if self._pl is not None and self.available:
+            return self._pl.MpDeviceLoader(loader, self.device)
+        return loader
+
+    @property
+    def REDUCE_SUM(self):
+        if self._xm is not None:
+            return self._xm.REDUCE_SUM
+        return None
+
+    # ---------- AMP (bfloat16) ----------
+
+    def get_amp_context(self):
+        """返回 bfloat16 autocast context manager，不支持的版本返回 dummy"""
+        try:
+            from torch_xla.amp import autocast
+            return autocast
+        except ImportError:
+            return None
+
+
+# 全局兼容层实例
+_tpu = _TPUCompat()
 
 
 # =============================================================================
@@ -201,57 +290,48 @@ def _compute_pos_weights(train_labels, num_horizons):
 
 
 # =============================================================================
-# TPU 训练主流程 — 单进程版 (供 xmp.spawn 启动)
+# TPU 训练主流程 — 单进程版 (使用 _tpu 兼容层)
 # =============================================================================
 
-def _train_worker(index=None):
-    """TPU 训练工作进程
+def _train_worker():
+    """TPU 训练工作进程 (单进程模式，PJRT 自动管理多 core)
 
-    当通过 xmp.spawn 启动时，每个 TPU core 运行一个实例；
-    直接调用 (index=None) 时以单进程 CPU/TPU 模式运行。
+    使用全局 _tpu 兼容层，自动适配 torch_xla 2.9+ / 旧版 / CPU 回退。
     """
-    # --- 设备检测 ---
-    device, is_tpu, xm, xmp_mod, pl = _detect_device()
-
-    # --- 合并配置 ---
+    device = _tpu.device
     cfg = tpu_config.get_training_config()
+
     batch_size = cfg['BATCH_SIZE']
     accum_steps = cfg['GRADIENT_ACCUMULATION_STEPS']
-    use_bf16 = is_tpu and cfg.get('USE_BF16', False)
+    use_bf16 = _tpu.available and cfg.get('USE_BF16', False)
     max_epochs = project_config.EPOCHS
     max_seconds = cfg['MAX_TRAIN_SECONDS']
     stop_mode = cfg['TRAIN_STOP_MODE']
     patience = cfg['PATIENCE']
-    _ = cfg  # keep reference
 
-    _use_epoch_limit = stop_mode in ('epochs_only', 'both')
     _use_time_limit = stop_mode in ('time_only', 'both')
-
     periods = list(project_config.TIMEFRAMES.keys())
     _num_horizons = len(project_config.PREDICTION_HORIZONS)
 
-    # --- 主进程日志 (仅 rank 0 打印) ---
+    # --- 主进程日志 (仅 rank 0) ---
     def master_log(msg):
-        if is_tpu:
-            if xm.is_master_ordinal():
-                logger.info(msg)
-        else:
+        if _tpu.is_master:
             logger.info(msg)
 
     master_log("=" * 60)
     master_log(f"TPU 训练启动 | batch={batch_size} | accum={accum_steps} | "
-               f"bf16={'ON' if use_bf16 else 'OFF'}")
+               f"bf16={'ON' if use_bf16 else 'OFF'} | "
+               f"core={_tpu.world_size}")
     master_log(f"周期: {periods} | 窗口: {project_config.PREDICTION_HORIZONS}")
     master_log("=" * 60)
 
-    # --- 通知器 (仅 rank 0) ---
+    # --- 通知器 ---
     notifier = None
-    if not is_tpu or xm.is_master_ordinal():
-        if project_config.MEOW_NICKNAME:
-            notifier = MeoWNotifier(project_config.MEOW_NICKNAME)
-            notifier.send_training_start(max_epochs)
+    if _tpu.is_master and project_config.MEOW_NICKNAME:
+        notifier = MeoWNotifier(project_config.MEOW_NICKNAME)
+        notifier.send_training_start(max_epochs)
 
-    # ==================== 1. 获取数据 (CPU 侧) ====================
+    # ==================== 1. 获取数据 ====================
     master_log("步骤 1: 获取多币种多周期 K 线数据...")
     fetcher = HuobiDataFetcher()
     all_symbols_data = fetcher.fetch_all_symbols_data()
@@ -262,52 +342,34 @@ def _train_worker(index=None):
         all_symbols_data, fetcher,
         export_debug_csv=project_config.DEBUG_EXPORT_CSV,
     )
-
     if len(y) < 100:
-        msg = f"有效样本不足: {len(y)} 个"
-        master_log(f"错误: {msg}")
+        master_log(f"错误: 有效样本不足 ({len(y)})")
         if notifier:
-            notifier.send_training_error(msg)
+            notifier.send_training_error(f"有效样本不足: {len(y)}")
         return None
 
     # ==================== 3. 切分 + 标准化 ====================
-    train_data, val_data, test_data = split_multi_tf_dataset(
-        X_dict, X_ctx, y)
+    train_data, val_data, test_data = split_multi_tf_dataset(X_dict, X_ctx, y)
     master_log(f"数据划分 -> 训练: {len(train_data[2])}, "
                f"验证: {len(val_data[2])}, 测试: {len(test_data[2])}")
+    train_data, val_data, test_data = normalize_datasets(train_data, val_data, test_data)
 
-    train_data, val_data, test_data = normalize_datasets(
-        train_data, val_data, test_data)
+    # ==================== 4. Dataset + DataLoader ====================
+    _make_dataset = lambda d: MultiTimeframeDataset(d[0], d[1], d[2], periods)
+    train_dataset = _make_dataset(train_data)
+    val_dataset = _make_dataset(val_data)
+    test_dataset = _make_dataset(test_data)
 
-    # ==================== 4. 创建 Dataset + DataLoader ====================
-    # TPU 无法使用 PreConvertedTensorDataset，统一使用 MultiTimeframeDataset
-    train_dataset = MultiTimeframeDataset(
-        train_data[0], train_data[1], train_data[2], periods)
-    val_dataset = MultiTimeframeDataset(
-        val_data[0], val_data[1], val_data[2], periods)
-    test_dataset = MultiTimeframeDataset(
-        test_data[0], test_data[1], test_data[2], periods)
-
-    # DataLoader 基础配置
-    _dl_kw = {'num_workers': 4, 'pin_memory': True} if not is_tpu else {}
-    train_loader_raw = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, drop_last=False,
-        **_dl_kw)
-    val_loader_raw = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, **_dl_kw)
-    test_loader_raw = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, **_dl_kw)
-
-    # TPU 模式包装 MpDeviceLoader
-    if is_tpu and pl is not None:
-        train_loader = pl.MpDeviceLoader(train_loader_raw, device)
-        val_loader = pl.MpDeviceLoader(val_loader_raw, device)
-        test_loader = pl.MpDeviceLoader(test_loader_raw, device)
+    # TPU 上 MpDeviceLoader 需要 num_workers=0；CPU 可用多 worker
+    _dl_kw = {} if _tpu.available else {'num_workers': 4, 'pin_memory': True}
+    train_loader = _tpu.MpDeviceLoader(DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, **_dl_kw))
+    val_loader = _tpu.MpDeviceLoader(DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, **_dl_kw))
+    test_loader = _tpu.MpDeviceLoader(DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, **_dl_kw))
+    if _tpu.available:
         master_log("使用 MpDeviceLoader 包装 DataLoader")
-    else:
-        train_loader = train_loader_raw
-        val_loader = val_loader_raw
-        test_loader = test_loader_raw
 
     # ==================== 5. 创建模型 ====================
     feat_size = len(SEQ_FEATURE_COLS)
@@ -317,59 +379,41 @@ def _train_worker(index=None):
             'feature_size': feat_size}
         for p in periods
     }
-
     model = MultiTimeframeLNN(
         timeframe_configs=tf_configs,
-        context_feature_size=ctx_size,
-        hidden_size=project_config.HIDDEN_SIZE,
-        num_layers=project_config.NUM_LAYERS,
-        dropout=project_config.DROPOUT,
+        context_feature_size=ctx_size, hidden_size=project_config.HIDDEN_SIZE,
+        num_layers=project_config.NUM_LAYERS, dropout=project_config.DROPOUT,
         output_size=_num_horizons,
         use_transformer=project_config.USE_TRANSFORMER,
         transformer_heads=project_config.TRANSFORMER_HEADS,
         cross_attn_heads=project_config.CROSS_ATTN_HEADS,
     ).to(device)
+    master_log(f"模型参数: {count_parameters(model)[0]:,} | "
+               f"特征: {feat_size}seq+{ctx_size}ctx | "
+               f"Transformer: {'ON' if project_config.USE_TRANSFORMER else 'OFF'}")
 
-    master_log(f"模型参数: 总计 {count_parameters(model)[0]:,}")
-    master_log(f"序列特征维度: {feat_size} | 上下文: {ctx_size}")
-    master_log(f"Transformer: {'启用' if project_config.USE_TRANSFORMER else '禁用'}")
-
-    # 尝试加载已有权重
     from predict import download_release_model as _dl_release
     _dl_release()
     _load_fallback(model, device)
 
     # ==================== 6. 优化器 + 调度器 + 损失 ====================
     scaled_lr = project_config.get_scaled_learning_rate(batch_size)
-    master_log(f"LR 缩放: base_batch={project_config.BASE_BATCH_SIZE}, "
-               f"target={batch_size}, LR={project_config.LEARNING_RATE:.2e} → {scaled_lr:.2e}")
-
+    master_log(f"LR 缩放: base={project_config.BASE_BATCH_SIZE}→target={batch_size}, "
+               f"LR={project_config.LEARNING_RATE:.2e}→{scaled_lr:.2e}")
     optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=scaled_lr,
-        weight_decay=project_config.WEIGHT_DECAY,
-    )
-
+        model.parameters(), lr=scaled_lr, weight_decay=project_config.WEIGHT_DECAY)
     steps_per_epoch = max(1, len(train_loader) // accum_steps)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=scaled_lr * project_config.ONECYCLE_MAX_LR_SCALE,
-        epochs=max_epochs,
-        steps_per_epoch=steps_per_epoch,
+        optimizer, max_lr=scaled_lr * project_config.ONECYCLE_MAX_LR_SCALE,
+        epochs=max_epochs, steps_per_epoch=steps_per_epoch,
         pct_start=project_config.ONECYCLE_PCT_START,
         anneal_strategy=project_config.ONECYCLE_ANNEAL_STRATEGY,
-        final_div_factor=project_config.ONECYCLE_FINAL_DIV_FACTOR,
-    )
-
+        final_div_factor=project_config.ONECYCLE_FINAL_DIV_FACTOR)
     pos_weights = _compute_pos_weights(train_data[2], _num_horizons)
-    master_log(f"正样本权重: {pos_weights}")
-
-    criterion = FocalLoss(
-        alpha=project_config.FOCAL_ALPHA,
-        gamma=project_config.FOCAL_GAMMA,
-        per_horizon_weights=pos_weights,
-        num_horizons=_num_horizons,
-    )
+    criterion = FocalLoss(alpha=project_config.FOCAL_ALPHA,
+                          gamma=project_config.FOCAL_GAMMA,
+                          per_horizon_weights=pos_weights,
+                          num_horizons=_num_horizons)
 
     # ==================== 7. 训练循环 ====================
     master_log("=" * 60)
@@ -379,49 +423,33 @@ def _train_worker(index=None):
     best_val_loss = float('inf')
     patience_counter = 0
     train_start_time = time.time()
-    global_step = 0
 
-    # AMP autocast (TPU bf16)
-    amp_ctx = None
-    if use_bf16 and xm is not None:
-        try:
-            from torch_xla.amp import autocast
-            amp_ctx = autocast
-            master_log("启用 bfloat16 混合精度")
-        except ImportError:
-            amp_ctx = None
-            master_log("torch_xla.amp 不可用，禁用混合精度")
+    amp_ctx = _tpu.get_amp_context() if use_bf16 else None
+    if use_bf16:
+        master_log("启用 bfloat16 混合精度" if amp_ctx else "torch_xla.amp 不可用")
+
+    def _batch_to_device(batch):
+        """TPU: batch 已在设备上；CPU: 手动搬运"""
+        if _tpu.available:
+            return batch
+        return ({p: v.to(device) for p, v in batch[0].items()},
+                batch[1].to(device), batch[2].to(device))
 
     for epoch in range(1, max_epochs + 1):
-        # --- 停止条件 ---
-        if _use_time_limit:
-            elapsed = time.time() - train_start_time
-            if elapsed >= max_seconds:
-                master_log(f"达到最大训练时长 ({max_seconds/3600:.1f}h)，停止")
-                break
+        if _use_time_limit and (time.time() - train_start_time) >= max_seconds:
+            master_log(f"达到最大训练时长 ({max_seconds/3600:.1f}h)，停止")
+            break
 
-        # ========== 训练阶段 ==========
+        # --- 训练 ---
         model.train()
-        train_loss_sum = 0.0
-        train_total = 0
-        train_correct = 0
-        train_h_correct = [0] * _num_horizons
-        train_h_total = [0] * _num_horizons
-
+        t_loss, t_correct, t_total = 0.0, 0, 0
+        t_h_correct = [0] * _num_horizons
+        t_h_total = [0] * _num_horizons
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(train_loader):
-            if is_tpu:
-                # MpDeviceLoader 返回的 batch 已在 TPU 上
-                tf_seqs, ctx, labels = batch
-            else:
-                # CPU 模式: 手动搬运
-                tf_seqs = {p: v.to(device) for p, v in batch[0].items()}
-                ctx = batch[1].to(device)
-                labels = batch[2].to(device)
-
-            # 前向 (bf16 autocast)
-            if amp_ctx is not None:
+            tf_seqs, ctx, labels = _batch_to_device(batch)
+            if amp_ctx:
                 with amp_ctx():
                     outputs = model(tf_seqs, ctx)
                     loss = criterion(outputs, labels)
@@ -429,128 +457,101 @@ def _train_worker(index=None):
                 outputs = model(tf_seqs, ctx)
                 loss = criterion(outputs, labels)
 
-            scaled_loss = loss / accum_steps
-            scaled_loss.backward()
-
-            # 统计 (使用 detach 避免图追踪)
+            (loss / accum_steps).backward()
             bs = labels.size(0)
-            train_loss_sum += loss.detach() * bs
+            t_loss += loss.detach() * bs
             preds = (outputs.detach() > 0).float()
-            train_correct += (preds == labels).sum()
-            train_total += labels.numel()
+            t_correct += (preds == labels).sum()
+            t_total += labels.numel()
             for h in range(_num_horizons):
-                train_h_correct[h] += (preds[:, h] == labels[:, h]).sum()
-                train_h_total[h] += labels[:, h].size(0)
+                t_h_correct[h] += (preds[:, h] == labels[:, h]).sum()
+                t_h_total[h] += labels[:, h].size(0)
 
-            # 梯度累积步
             if (batch_idx + 1) % accum_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if is_tpu and xm is not None:
-                    xm.optimizer_step(optimizer, barrier=True)
-                else:
-                    optimizer.step()
+                _tpu.optimizer_step(optimizer)
                 scheduler.step()
                 optimizer.zero_grad()
-                global_step += 1
 
-        # epoch 统计归约 (TPU: 跨核心聚合)
-        if is_tpu and xm is not None:
-            train_loss_sum = xm.all_reduce(xm.REDUCE_SUM, train_loss_sum)
-            train_correct = xm.all_reduce(xm.REDUCE_SUM, train_correct)
-            train_total = xm.all_reduce(xm.REDUCE_SUM,
-                                        torch.tensor(train_total, device=device)).item()
+        # 跨核心归约
+        if _tpu.available:
+            t_loss = _tpu.all_reduce(_tpu.REDUCE_SUM, t_loss)
+            t_correct = _tpu.all_reduce(_tpu.REDUCE_SUM, t_correct)
+            t_total = _tpu.all_reduce(_tpu.REDUCE_SUM,
+                                       torch.tensor(t_total, device=device)).item()
             for h in range(_num_horizons):
-                train_h_correct[h] = xm.all_reduce(xm.REDUCE_SUM, train_h_correct[h])
-                train_h_total[h] = xm.all_reduce(xm.REDUCE_SUM,
-                                                torch.tensor(train_h_total[h], device=device)).item()
+                t_h_correct[h] = _tpu.all_reduce(_tpu.REDUCE_SUM, t_h_correct[h])
+                t_h_total[h] = _tpu.all_reduce(_tpu.REDUCE_SUM,
+                                               torch.tensor(t_h_total[h], device=device)).item()
 
-        train_loss_avg = train_loss_sum.item() / max(train_total, 1)
-        train_acc = train_correct.item() / max(train_total, 1)
+        train_loss = t_loss.item() / max(t_total, 1)
+        train_acc = t_correct.item() / max(t_total, 1)
 
-        # ========== 验证阶段 ==========
+        # --- 验证 ---
         model.eval()
-        val_loss_sum = 0.0
-        val_correct = 0
-        val_total = 0
-        val_h_correct = [0] * _num_horizons
-        val_h_total = [0] * _num_horizons
-
+        v_loss, v_correct, v_total = 0.0, 0, 0
+        v_h_correct = [0] * _num_horizons
+        v_h_total = [0] * _num_horizons
         with torch.no_grad():
             for batch in val_loader:
-                if is_tpu:
-                    tf_seqs, ctx, labels = batch
-                else:
-                    tf_seqs = {p: v.to(device) for p, v in batch[0].items()}
-                    ctx = batch[1].to(device)
-                    labels = batch[2].to(device)
-
-                if amp_ctx is not None:
+                tf_seqs, ctx, labels = _batch_to_device(batch)
+                if amp_ctx:
                     with amp_ctx():
                         outputs = model(tf_seqs, ctx)
                         loss = criterion(outputs, labels)
                 else:
                     outputs = model(tf_seqs, ctx)
                     loss = criterion(outputs, labels)
-
                 bs = labels.size(0)
-                val_loss_sum += loss.detach() * bs
+                v_loss += loss.detach() * bs
                 preds = (outputs.detach() > 0).float()
-                val_correct += (preds == labels).sum()
-                val_total += labels.numel()
+                v_correct += (preds == labels).sum()
+                v_total += labels.numel()
                 for h in range(_num_horizons):
-                    val_h_correct[h] += (preds[:, h] == labels[:, h]).sum()
-                    val_h_total[h] += labels[:, h].size(0)
+                    v_h_correct[h] += (preds[:, h] == labels[:, h]).sum()
+                    v_h_total[h] += labels[:, h].size(0)
 
-        if is_tpu and xm is not None:
-            val_loss_sum = xm.all_reduce(xm.REDUCE_SUM, val_loss_sum)
-            val_correct = xm.all_reduce(xm.REDUCE_SUM, val_correct)
-            val_total = xm.all_reduce(xm.REDUCE_SUM,
-                                      torch.tensor(val_total, device=device)).item()
+        if _tpu.available:
+            v_loss = _tpu.all_reduce(_tpu.REDUCE_SUM, v_loss)
+            v_correct = _tpu.all_reduce(_tpu.REDUCE_SUM, v_correct)
+            v_total = _tpu.all_reduce(_tpu.REDUCE_SUM,
+                                      torch.tensor(v_total, device=device)).item()
             for h in range(_num_horizons):
-                val_h_correct[h] = xm.all_reduce(xm.REDUCE_SUM, val_h_correct[h])
-                val_h_total[h] = xm.all_reduce(xm.REDUCE_SUM,
-                                              torch.tensor(val_h_total[h], device=device)).item()
+                v_h_correct[h] = _tpu.all_reduce(_tpu.REDUCE_SUM, v_h_correct[h])
+                v_h_total[h] = _tpu.all_reduce(_tpu.REDUCE_SUM,
+                                               torch.tensor(v_h_total[h], device=device)).item()
 
-        val_loss_avg = val_loss_sum.item() / max(val_total, 1)
-        val_acc = val_correct.item() / max(val_total, 1)
+        val_loss = v_loss.item() / max(v_total, 1)
+        val_acc = v_correct.item() / max(v_total, 1)
 
-        # ========== 日志 (仅 rank 0) ==========
-        if not is_tpu or xm.is_master_ordinal():
-            epoch_time = time.time() - train_start_time
-            current_lr = optimizer.param_groups[0]['lr']
-            h_train_str = " | ".join([
-                f"{project_config.PREDICTION_HORIZONS[h]}m:"
-                f"{train_h_correct[h].item()/max(train_h_total[h], 1):.3f}"
-                for h in range(_num_horizons)
-            ])
-            h_val_str = " | ".join([
-                f"{project_config.PREDICTION_HORIZONS[h]}m:"
-                f"{val_h_correct[h].item()/max(val_h_total[h], 1):.3f}"
-                for h in range(_num_horizons)
-            ])
-
+        # --- 日志 ---
+        if _tpu.is_master:
+            et = time.time() - train_start_time
+            lr = optimizer.param_groups[0]['lr']
+            hts = " | ".join(f"{project_config.PREDICTION_HORIZONS[h]}m:"
+                             f"{t_h_correct[h].item()/max(t_h_total[h],1):.3f}"
+                             for h in range(_num_horizons))
+            hvs = " | ".join(f"{project_config.PREDICTION_HORIZONS[h]}m:"
+                             f"{v_h_correct[h].item()/max(v_h_total[h],1):.3f}"
+                             for h in range(_num_horizons))
             logger.info(
                 f"Epoch {epoch:3d}/{max_epochs} | "
-                f"Train Loss: {train_loss_avg:.4f} Acc: {train_acc:.4f} | "
-                f"Val Loss: {val_loss_avg:.4f} Acc: {val_acc:.4f} | "
-                f"LR: {current_lr:.6f} | {epoch_time:.0f}s"
-            )
-            logger.info(f"  TrainAcc -> {h_train_str}")
-            logger.info(f"  Val   Acc -> {h_val_str}")
+                f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
+                f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
+                f"LR: {lr:.6f} | {et:.0f}s")
+            logger.info(f"  TrainAcc -> {hts}")
+            logger.info(f"  Val   Acc -> {hvs}")
 
-        # ========== Checkpoint (仅 rank 0) ==========
-        if (not is_tpu or xm.is_master_ordinal()) and val_loss_avg < best_val_loss:
-            best_val_loss = val_loss_avg
+        # --- Checkpoint ---
+        if _tpu.is_master and val_loss < best_val_loss:
+            best_val_loss = val_loss
             patience_counter = 0
-
             ckpt = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'val_loss': val_loss_avg,
-                'val_acc': val_acc,
-                'best_val_loss': best_val_loss,
+                'val_loss': val_loss, 'val_acc': val_acc,
                 'config': {
                     'timeframe_configs': tf_configs,
                     'context_feature_size': ctx_size,
@@ -564,178 +565,121 @@ def _train_worker(index=None):
                     'cross_attn_heads': project_config.CROSS_ATTN_HEADS,
                 },
             }
-
-            save_path = project_config.MODEL_PATH
-            if is_tpu and xm is not None:
-                xm.save(ckpt, save_path)
-            else:
-                torch.save(ckpt, save_path)
-
-            logger.info(f"  -> 保存最佳模型 (val_loss={val_loss_avg:.4f})")
-
+            _tpu.save(ckpt, project_config.MODEL_PATH)
+            logger.info(f"  -> 保存最佳模型 (val_loss={val_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                if not is_tpu or xm.is_master_ordinal():
+                if _tpu.is_master:
                     logger.info(f"早停: {patience} 轮未改善")
                 break
 
-    # 同步所有核心
-    if is_tpu and xm is not None:
-        xm.rendezvous('training_complete')
+    _tpu.rendezvous('training_complete')
 
-    # ==================== 8. 测试评估 (仅 rank 0) ====================
-    if not is_tpu or xm.is_master_ordinal():
+    # ==================== 8. 测试评估 ====================
+    if _tpu.is_master:
         logger.info("=" * 60)
         logger.info("加载最佳模型进行测试评估...")
         logger.info("=" * 60)
-
         try:
-            best_ckpt = torch.load(project_config.MODEL_PATH, map_location='cpu',
-                                   weights_only=False)
-            _safe_load_state_dict(model, best_ckpt['model_state_dict'], device)
+            ckpt = torch.load(project_config.MODEL_PATH, map_location='cpu',
+                              weights_only=False)
+            _safe_load_state_dict(model, ckpt['model_state_dict'], device)
             model.eval()
         except Exception as e:
             logger.warning(f"加载最佳模型失败 ({e})，使用当前模型")
 
-        # 测试
-        test_loss_sum = 0.0
-        test_correct = 0
-        test_total = 0
-        test_h_correct = [0] * _num_horizons
-        test_h_total = [0] * _num_horizons
-        all_preds = []
-        all_labels_list = []
+        te_loss, te_correct, te_total = 0.0, 0, 0
+        te_h_correct = [0] * _num_horizons
+        te_h_total = [0] * _num_horizons
+        all_preds, all_labels = [], []
 
         with torch.no_grad():
             for batch in test_loader:
-                if is_tpu:
-                    tf_seqs, ctx, labels = batch
-                else:
-                    tf_seqs = {p: v.to(device) for p, v in batch[0].items()}
-                    ctx = batch[1].to(device)
-                    labels = batch[2].to(device)
-
-                if amp_ctx is not None:
+                tf_seqs, ctx, labels = _batch_to_device(batch)
+                if amp_ctx:
                     with amp_ctx():
                         outputs = model(tf_seqs, ctx)
                         loss = criterion(outputs, labels)
                 else:
                     outputs = model(tf_seqs, ctx)
                     loss = criterion(outputs, labels)
-
                 bs = labels.size(0)
-                test_loss_sum += loss.detach() * bs
+                te_loss += loss.detach() * bs
                 preds = (outputs.detach() > 0).float()
-                test_correct += (preds == labels).sum()
-                test_total += labels.numel()
+                te_correct += (preds == labels).sum()
+                te_total += labels.numel()
                 for h in range(_num_horizons):
-                    test_h_correct[h] += (preds[:, h] == labels[:, h]).sum()
-                    test_h_total[h] += labels[:, h].size(0)
+                    te_h_correct[h] += (preds[:, h] == labels[:, h]).sum()
+                    te_h_total[h] += labels[:, h].size(0)
                 all_preds.append(outputs.cpu().numpy())
-                all_labels_list.append(labels.cpu().numpy())
+                all_labels.append(labels.cpu().numpy())
 
-        if is_tpu and xm is not None:
-            test_loss_sum = xm.all_reduce(xm.REDUCE_SUM, test_loss_sum)
-            # 只有 rank 0 执行下面的日志
+        if _tpu.available:
+            te_loss = _tpu.all_reduce(_tpu.REDUCE_SUM, te_loss)
+            te_correct = _tpu.all_reduce(_tpu.REDUCE_SUM, te_correct)
+            for h in range(_num_horizons):
+                te_h_correct[h] = _tpu.all_reduce(_tpu.REDUCE_SUM, te_h_correct[h])
 
-        if not is_tpu or xm.is_master_ordinal():
-            test_loss_avg = test_loss_sum.item() / max(test_total, 1)
-            test_acc = test_correct.item() / max(test_total, 1)
+        test_loss = te_loss.item() / max(te_total, 1)
+        test_acc = te_correct.item() / max(te_total, 1)
 
-            all_preds_np = np.concatenate(all_preds, axis=0)
-            all_labels_np = np.concatenate(all_labels_list, axis=0)
+        p_arr = np.concatenate(all_preds)
+        l_arr = np.concatenate(all_labels)
+        tp = int(((p_arr > 0.5) & (l_arr == 1)).sum())
+        fp = int(((p_arr > 0.5) & (l_arr == 0)).sum())
+        tn = int(((p_arr <= 0.5) & (l_arr == 0)).sum())
+        fn = int(((p_arr <= 0.5) & (l_arr == 1)).sum())
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
 
-            # 整体指标
-            tp = int(((all_preds_np > 0.5) & (all_labels_np == 1)).sum())
-            fp = int(((all_preds_np > 0.5) & (all_labels_np == 0)).sum())
-            tn = int(((all_preds_np <= 0.5) & (all_labels_np == 0)).sum())
-            fn = int(((all_preds_np <= 0.5) & (all_labels_np == 1)).sum())
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        logger.info(f"测试集 Loss: {test_loss:.4f} Acc: {test_acc:.4f}")
+        logger.info(f"Precision: {prec:.4f} Recall: {rec:.4f} F1: {f1:.4f}")
+        logger.info(f"混淆矩阵: TP={tp} FP={fp} TN={tn} FN={fn}")
 
-            logger.info(f"测试集 Loss: {test_loss_avg:.4f} Acc: {test_acc:.4f}")
-            logger.info(f"Precision: {precision:.4f} Recall: {recall:.4f} F1: {f1:.4f}")
-            logger.info(f"混淆矩阵: TP={tp} FP={fp} TN={tn} FN={fn}")
+        for h_idx, h_name in enumerate(project_config.PREDICTION_HORIZONS):
+            h_acc = te_h_correct[h_idx].item() / max(te_h_total[h_idx], 1)
+            h_p = p_arr[:, h_idx]
+            h_l = l_arr[:, h_idx]
+            h_tp = int(((h_p > 0.5) & (h_l == 1)).sum())
+            h_fp = int(((h_p > 0.5) & (h_l == 0)).sum())
+            h_tn = int(((h_p <= 0.5) & (h_l == 0)).sum())
+            h_fn = int(((h_p <= 0.5) & (h_l == 1)).sum())
+            logger.info(
+                f"  [{h_name}min] Acc:{h_acc:.4f} Prec:{h_tp/(h_tp+h_fp) if (h_tp+h_fp)>0 else 0:.4f} "
+                f"Rec:{h_tp/(h_tp+h_fn) if (h_tp+h_fn)>0 else 0:.4f} "
+                f"TP={h_tp} FP={h_fp} TN={h_tn} FN={h_fn}")
 
-            for h_idx, h_name in enumerate(project_config.PREDICTION_HORIZONS):
-                h_acc = test_h_correct[h_idx].item() / max(test_h_total[h_idx], 1)
-                h_pred = all_preds_np[:, h_idx]
-                h_label = all_labels_np[:, h_idx]
-                h_tp = int(((h_pred > 0.5) & (h_label == 1)).sum())
-                h_fp = int(((h_pred > 0.5) & (h_label == 0)).sum())
-                h_tn = int(((h_pred <= 0.5) & (h_label == 0)).sum())
-                h_fn = int(((h_pred <= 0.5) & (h_label == 1)).sum())
-                h_prec = h_tp / (h_tp + h_fp) if (h_tp + h_fp) > 0 else 0
-                h_rec = h_tp / (h_tp + h_fn) if (h_tp + h_fn) > 0 else 0
-                logger.info(
-                    f"  [{h_name}min] Acc:{h_acc:.4f} Prec:{h_prec:.4f} "
-                    f"Rec:{h_rec:.4f} TP={h_tp} FP={h_fp} TN={h_tn} FN={h_fn}"
-                )
+        _tpu.save({
+            'model_state_dict': model.state_dict(),
+            'val_loss': best_val_loss, 'test_acc': test_acc, 'test_f1': f1,
+            'config': ckpt['config'],
+        }, project_config.MODEL_PATH_FINAL)
+        logger.info(f"最终模型已保存: {project_config.MODEL_PATH_FINAL}")
 
-            # 保存最终模型
-            final_ckpt = {
-                'model_state_dict': model.state_dict(),
-                'val_loss': best_val_loss,
-                'test_acc': test_acc,
-                'test_f1': f1,
-                'config': {
-                    'timeframe_configs': tf_configs,
-                    'context_feature_size': ctx_size,
-                    'hidden_size': project_config.HIDDEN_SIZE,
-                    'num_layers': project_config.NUM_LAYERS,
-                    'dropout': project_config.DROPOUT,
-                    'output_size': _num_horizons,
-                    'horizons': project_config.PREDICTION_HORIZONS,
-                    'use_transformer': project_config.USE_TRANSFORMER,
-                    'transformer_heads': project_config.TRANSFORMER_HEADS,
-                    'cross_attn_heads': project_config.CROSS_ATTN_HEADS,
-                },
-            }
-            torch.save(final_ckpt, project_config.MODEL_PATH_FINAL)
-            logger.info(f"最终模型已保存: {project_config.MODEL_PATH_FINAL}")
-
-            # 通知
-            if notifier:
-                horizon_results = {}
-                for h_idx, h_name in enumerate(project_config.PREDICTION_HORIZONS):
-                    h_acc = test_h_correct[h_idx].item() / max(test_h_total[h_idx], 1)
-                    horizon_results[f"{h_name}m"] = h_acc
-                notifier.send_training_complete(
-                    epoch=epoch, val_loss=best_val_loss, val_acc=best_val_loss,
-                    test_acc=test_acc, precision=precision, recall=recall,
-                    f1=f1, horizon_results=horizon_results,
-                )
+        if notifier:
+            hr = {f"{h}m": te_h_correct[h_idx].item() / max(te_h_total[h_idx], 1)
+                  for h_idx, h in enumerate(project_config.PREDICTION_HORIZONS)}
+            notifier.send_training_complete(
+                epoch=epoch, val_loss=best_val_loss, val_acc=val_loss,
+                test_acc=test_acc, precision=prec, recall=rec, f1=f1,
+                horizon_results=hr)
 
     return model
 
 
 # =============================================================================
-# 入口: 自动选择 多 TPU core 启动 或 单进程模式
+# 入口: PJRT/Colab 直接调用；旧 XRT 模式不提供支持（已由 _tpu 兼容层替代）
 # =============================================================================
 
 def train():
-    """TPU 训练入口函数"""
-    # 检查是否在 TPU 环境中
-    try:
-        import torch_xla.core.xla_model as _xm
-        has_tpu = True
-    except ImportError:
-        has_tpu = False
-
-    if has_tpu:
-        try:
-            import torch_xla.distributed.xla_multiprocessing as _xmp
-            # 用 xmp.spawn 启动，自动覆盖所有 TPU core
-            logger.info("使用 xmp.spawn 启动多核心 TPU 训练...")
-            _xmp.spawn(_train_worker, args=(), nprocs=None, start_method='fork')
-        except Exception as e:
-            logger.warning(f"xmp.spawn 失败 ({e})，回退到单进程模式")
-            _train_worker()
+    """TPU 训练入口"""
+    if _tpu.available:
+        logger.info(f"TPU 模式启动 ({_tpu.world_size} core) — 使用 _tpu 兼容层")
     else:
-        logger.info("单进程模式 (CPU/单卡)")
-        _train_worker()
+        logger.info("CPU 回退模式启动")
+    _train_worker()
 
 
 if __name__ == "__main__":

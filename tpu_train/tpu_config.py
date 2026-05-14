@@ -4,6 +4,8 @@
     export PJRT_DEVICE=TPU  # 在 TPU VM 上设置
     python tpu_train/tpu_train.py
 
+    # Colab 上运行时，环境变量已自动设置
+
 TPU 训练与 GPU 训练的关键差异:
     1. Batch size 必须是固定编译时常量 (禁用自动检测)
     2. 启用 bfloat16 混合精度 (TPU 原生加速)
@@ -27,12 +29,41 @@ import config as base_config
 
 # --- Batch Size ---
 # TPU 要求 batch size 在编译时固定，不能用 _auto_batch_size() 动态计算。
-# TPU v3-8: 每 core 16GB HBM，建议每 core 128，8 core 总计 1024
-# TPU v4-8: 每 core 32GB HBM，可提升至每 core 256
-# TPU v5e-8: 每 core 16GB HBM，建议 128 per core
-# 单 core TPU (e.g. Kaggle TPU v2): 建议 128~256
-# 默认使用 1024，多 core 自动均分
-BATCH_SIZE = 1024
+#
+# 当前 Colab 提供 TPU v5e-1 (单核心, 16GB HBM)
+#   单核心下 batch 直接设为核心 batch 大小 (MpDeviceLoader 不会分片)。
+#
+# TPU 类型参考:
+#   v2-8:  8 core × 8GB  → 全局 512~1024 (每 core 64~128)
+#   v3-8:  8 core × 16GB → 全局 1024~2048 (每 core 128~256)
+#   v5e-1: 1 core × 16GB → 全局 128~256  (单核)
+#   v5e-4: 4 core × 16GB → 全局 512~1024 (每 core 128~256)
+#   v5e-8: 8 core × 16GB → 全局 1024~2048 (每 core 128~256)
+#
+# Colab 环境变量 'COLAB_TPU_ACCELERATOR' 包含 TPU 类型，如 'v5e-1'
+_DETECTED_ACCEL = os.environ.get('COLAB_TPU_ACCELERATOR', '').lower()
+if 'v5e' in _DETECTED_ACCEL:
+    # TPU v5e 系列: 16GB per core，以 128 per core 为基准，解析核心数
+    try:
+        _n_cores = int(_DETECTED_ACCEL.split('-')[-1])
+    except (ValueError, IndexError):
+        _n_cores = 1
+    BATCH_SIZE = 128 * _n_cores
+elif 'v2' in _DETECTED_ACCEL:
+    BATCH_SIZE = 512       # v2-8: 8GB/core
+elif 'v3' in _DETECTED_ACCEL:
+    BATCH_SIZE = 1024      # v3-8: 16GB/core
+else:
+    # 回退检测
+    _hw = os.environ.get('TPU_VISIBLE_DEVICES', '')
+    if 'v5e' in _hw:
+        BATCH_SIZE = 128
+    elif 'v3' in _hw:
+        BATCH_SIZE = 1024
+    elif 'v2' in _hw:
+        BATCH_SIZE = 512
+    else:
+        BATCH_SIZE = 128   # 默认安全值 (适配 v5e-1 单核 16GB)
 USE_AUTO_BATCH_SIZE = False  # 必须关闭
 
 # --- 混合精度 ---
@@ -43,8 +74,9 @@ USE_BF16 = True
 # --- 梯度累积 ---
 # 由于 TPU batch size 可能受限于显存，可用梯度累积模拟更大的 batch。
 # 等效 batch = BATCH_SIZE × GRADIENT_ACCUMULATION_STEPS
-# TPU v3-8 上 BATCH_SIZE=1024 通常已足够，设 1 即不累积
-GRADIENT_ACCUMULATION_STEPS = 1
+# v5e-1 BATCH_SIZE=128 可用 accum=2 等效 256
+# v3-8  BATCH_SIZE=1024 可直接设 1
+GRADIENT_ACCUMULATION_STEPS = 2  # v5e-1: 128×2=256 等效 batch
 
 # --- 学习率 ---
 # bfloat16 精度低于 float32，LR 通常需要略微降低以避免溢出
