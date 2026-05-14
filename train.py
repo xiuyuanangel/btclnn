@@ -609,6 +609,7 @@ def train_model():
             _train_horizon_total = [0] * _num_horizons
 
             optimizer.zero_grad()
+            _last_grad_norm = 0.0  # 兜底: 无batch时取0
             for batch_idx, (tf_seqs, ctx, labels) in enumerate(train_loader):
                 if not _use_preconverted:
                     tf_seqs = {p: v.to(device) for p, v in tf_seqs.items()}
@@ -634,6 +635,12 @@ def train_model():
                 # 每 _accum_steps 个 micro-batch 执行一次 optimizer 步
                 if (batch_idx + 1) % _accum_steps == 0 or (batch_idx + 1) == len(train_loader):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # 在 zero_grad 之前采样梯度范数, 取最后一步的 grad_norm
+                    _last_grad_norm = 0.0
+                    for _p in model.parameters():
+                        if _p.grad is not None:
+                            _last_grad_norm += _p.grad.norm().item() ** 2
+                    _last_grad_norm = _last_grad_norm ** 0.5
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
@@ -642,13 +649,8 @@ def train_model():
             train_acc = train_correct / train_total
             _train_acc_per_h = [_train_horizon_correct[h] / max(_train_horizon_total[h], 1) for h in range(_num_horizons)]
 
-            # 梯度诊断: 每 epoch 末尾采样一次总梯度范数
-            _total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    _total_norm += p.grad.norm().item() ** 2
-            _total_norm = _total_norm ** 0.5
-            _grad_info = f"grad_norm={_total_norm:.4e}"
+            # 梯度诊断: 使用最后一次 optimizer step 前的 grad_norm
+            _grad_info = f"grad_norm={_last_grad_norm:.4e}"
 
             # --- 验证 ---
             model.eval()
