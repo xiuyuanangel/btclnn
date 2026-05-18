@@ -9,9 +9,11 @@
   - 60分钟周期: 预测正确获得 85% 收益, 错误亏损全部本金
 
 用法:
-  训练模式:  python rl_trader.py --mode train --episodes 500
-  评估模式:  python rl_trader.py --mode eval
-  实时交易:  python rl_trader.py --mode trade
+  训练模式:          python rl_trader.py --mode train --episodes 500
+  评估模式:          python rl_trader.py --mode eval
+  实时交易:          python rl_trader.py --mode trade
+  实时数据训练:      python rl_trader.py --mode live_train
+  从checkpoint继续:  python rl_trader.py --mode live_train --checkpoint rl_best.pth --train_steps 4
 """
 
 import os
@@ -714,8 +716,14 @@ def precompute_predictions(
 # 训练
 # =============================================================================
 
-def train_rl(rl_cfg: RLConfig):
-    """强化学习训练主流程"""
+def train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None):
+    """强化学习训练主流程
+
+    Args:
+        rl_cfg: 强化学习配置
+        checkpoint_path: 可选，指定RL模型checkpoint路径恢复训练。
+                         如果为 None，则自动加载 rl_latest.pth（如果存在）。
+    """
     logger.info("=" * 60)
     logger.info("RL 交易智能体训练开始")
     logger.info(f"  回合数: {rl_cfg.episodes}")
@@ -765,11 +773,40 @@ def train_rl(rl_cfg: RLConfig):
 
     agent = DQNAgent(train_env.state_dim, train_env.n_actions, rl_cfg, device)
 
+    # ============================================================
     # 5. 加载已有checkpoint (增量训练)
-    checkpoint_path = os.path.join(rl_cfg.save_dir, "rl_latest.pth")
-    if os.path.exists(checkpoint_path):
-        agent.load(checkpoint_path)
-        logger.info("加载已有RL checkpoint, 继续增量训练")
+    # ============================================================
+    load_success = False
+    if checkpoint_path is not None:
+        # 用户明确指定路径
+        explicit_path = checkpoint_path
+        # 如果是相对路径或只有文件名，在前面补上 save_dir
+        if not os.path.isabs(explicit_path) and not explicit_path.startswith('.\\'):
+            explicit_path = os.path.join(rl_cfg.save_dir, os.path.basename(explicit_path))
+        if os.path.exists(explicit_path):
+            agent.load(explicit_path)
+            logger.info(f"从指定checkpoint恢复训练: {explicit_path}")
+            logger.info(f"  恢复状态: step={agent.step_counter}, epsilon={agent.epsilon:.4f}")
+            load_success = True
+        else:
+            logger.warning(f"指定的checkpoint不存在: {explicit_path}, 从头开始训练")
+    else:
+        # 自动加载最新的 checkpoint
+        checkpoint_path_auto = os.path.join(rl_cfg.save_dir, "rl_latest.pth")
+        if os.path.exists(checkpoint_path_auto):
+            agent.load(checkpoint_path_auto)
+            logger.info(f"自动加载已有RL checkpoint, 继续增量训练 ({checkpoint_path_auto})")
+            logger.info(f"  恢复状态: step={agent.step_counter}, epsilon={agent.epsilon:.4f}, "
+                        f"loss_history={len(agent.loss_history)}条")
+            load_success = True
+        else:
+            logger.info("未找到已有checkpoint, 从头开始训练")
+
+    if load_success:
+        # 输出恢复后的训练状态摘要
+        avg_recent_loss = np.mean(agent.loss_history[-100:]) if agent.loss_history else 0.0
+        logger.info(f"  最近100步平均Loss: {avg_recent_loss:.4f}")
+    # ============================================================
 
     # 6. 训练循环
     logger.info("开始RL训练...")
@@ -1014,6 +1051,50 @@ def _settle_expired_positions(
     return still_open, total_amount, total_pnl, settled_count
 
 
+def _compute_live_state(
+    probs: np.ndarray,
+    available_balance: float,
+    initial_balance: float,
+    close_arr: np.ndarray,
+    hidden_state: np.ndarray,
+    state_returns_window: int,
+    config: 'RLConfig',  # 避免与顶层 config 冲突
+) -> np.ndarray:
+    """构建实时交易状态向量
+
+    Args:
+        probs: (3,) 三个周期上涨概率
+        available_balance: 当前可用余额
+        initial_balance: 初始余额
+        close_arr: 5min收盘价序列
+        hidden_state: (hidden_size,) LNN融合层隐状态
+        state_returns_window: 最近收益率窗口大小
+
+    Returns:
+        state: (state_dim,) 状态向量
+    """
+    confs = np.abs(probs - 0.5) * 2.0
+
+    # 最近收益率
+    rets = np.diff(np.log(close_arr))
+    if len(rets) >= state_returns_window:
+        recent_rets = rets[-state_returns_window:]
+    elif len(rets) > 0:
+        recent_rets = np.pad(rets, (state_returns_window - len(rets), 0), 'constant')
+    else:
+        recent_rets = np.zeros(state_returns_window, dtype=np.float32)
+
+    # 波动率
+    vol = float(np.std(rets[-20:])) if len(rets) >= 20 else 0.0
+
+    return np.concatenate([
+        probs, confs,
+        [available_balance / initial_balance],
+        recent_rets, [vol], [0.0],  # progress=0 for live
+        hidden_state,
+    ]).astype(np.float32)
+
+
 def live_trade(rl_cfg: RLConfig):
     """使用训练好的RL智能体进行实时交易"""
     device = _detect_device()
@@ -1118,27 +1199,12 @@ def live_trade(rl_cfg: RLConfig):
                 # ============================================================
                 # 4. 构建状态（使用真实收益率和可用余额）
                 # ============================================================
-                confs = np.abs(probs - 0.5) * 2.0
-
-                # 从价格数据计算最近收益率
                 close_arr = target_df['close'].values.astype(np.float32)
-                rets = np.diff(np.log(close_arr))
-                if len(rets) >= rl_cfg.state_returns_window:
-                    recent_rets = rets[-rl_cfg.state_returns_window:]
-                elif len(rets) > 0:
-                    recent_rets = np.pad(rets, (rl_cfg.state_returns_window - len(rets), 0), 'constant')
-                else:
-                    recent_rets = np.zeros(rl_cfg.state_returns_window, dtype=np.float32)
+                state = _compute_live_state(
+                    probs, available_balance, rl_cfg.initial_balance,
+                    close_arr, hidden_state, rl_cfg.state_returns_window, rl_cfg,
+                )
 
-                # 波动率
-                vol = float(np.std(rets[-20:])) if len(rets) >= 20 else 0.0
-
-                state = np.concatenate([
-                    probs, confs,
-                    [available_balance / rl_cfg.initial_balance],
-                    recent_rets, [vol], [0.0],  # progress=0 for live
-                    hidden_state,               # 融合层隐状态
-                ]).astype(np.float32)
 
                 # ============================================================
                 # 5. RL智能体决策
@@ -1152,6 +1218,7 @@ def live_trade(rl_cfg: RLConfig):
                 print()
                 print("=" * 60)
                 print(f"  LNN预测:")
+                confs = np.abs(probs - 0.5) * 2.0
                 for i, h in enumerate([10, 30, 60]):
                     d = "涨" if probs[i] > 0.5 else "跌"
                     c = confs[i]
@@ -1244,7 +1311,301 @@ def live_trade(rl_cfg: RLConfig):
             logger.warning(f"  未结算本金合计: {lost_bet:.2f} USDT")
 
 
-def _prepare_live_features(timeframe_data, fetcher):
+def live_train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None,
+                  train_steps_per_tick: int = 4, max_ticks: Optional[int] = None):
+    """使用实时数据进行 RL 增量训练
+
+    每10分钟一个 tick:
+      1. 获取实时数据, LNN推理 → 构建当前状态 state_now
+      2. 结算到期持仓 → 对每笔用 (open_state, open_action, pnl, state_now, done) 存入回放缓冲区
+      3. 智能体 epsilon-贪心 选择动作（持续探索）
+      4. 执行动作（开仓时保存 open_state / open_action 留待结算用）
+      5. 从回放缓冲区采样训练（多步梯度下降）
+      6. 定期保存 checkpoint 和指标
+
+    Args:
+        rl_cfg: 强化学习配置
+        checkpoint_path: 可选, 指定RL模型checkpoint路径恢复训练
+        train_steps_per_tick: 每个 tick 的训练步数
+        max_ticks: 最大 tick 数, None=连续运行直到 Ctrl+C
+    """
+    logger.info("=" * 60)
+    logger.info("RL 实时数据训练模式")
+    logger.info(f"  初始资金: {rl_cfg.initial_balance} USDT")
+    logger.info(f"  动作空间: {1 + 3 * 2 * len(rl_cfg.bet_sizes)} 个动作")
+    logger.info(f"  每 tick 训练步数: {train_steps_per_tick}")
+    if max_ticks:
+        logger.info(f"  最大 tick 数: {max_ticks}")
+    logger.info("=" * 60)
+
+    device = _detect_device()
+
+    # --------------------------------------------------
+    # 1. 加载 LNN 模型和标准化参数
+    # --------------------------------------------------
+    logger.info("加载预训练LNN模型...")
+    model, horizons = _load_model_and_horizons(device)
+    model.eval()
+    logger.info(f"LNN模型加载成功, 预测窗口: {horizons}")
+
+    norm_data = _load_norm_stats()
+
+    # --------------------------------------------------
+    # 2. 创建 DQN 智能体
+    # --------------------------------------------------
+    hidden_size = config.HIDDEN_SIZE
+    dummy_env = TradingEnv(
+        dataset_dict={'labels': np.zeros((10, 3)), 'tf_sequences': {}, 'context': np.zeros((10, 6))},
+        predictions=np.zeros((10, 3)),
+        hidden_states=np.zeros((10, hidden_size)),
+        close_prices=np.ones(10) * 50000,
+        rl_cfg=rl_cfg,
+    )
+    agent = DQNAgent(dummy_env.state_dim, dummy_env.n_actions, rl_cfg, device)
+
+    # 加载已有 checkpoint
+    if checkpoint_path is not None:
+        explicit_path = checkpoint_path
+        if not os.path.isabs(explicit_path) and not explicit_path.startswith('.\\'):
+            explicit_path = os.path.join(rl_cfg.save_dir, os.path.basename(explicit_path))
+        if os.path.exists(explicit_path):
+            agent.load(explicit_path)
+            logger.info(f"从指定checkpoint恢复训练: {explicit_path}")
+        else:
+            logger.warning(f"指定的checkpoint不存在: {explicit_path}, 从头开始训练")
+    else:
+        auto_path = os.path.join(rl_cfg.save_dir, "rl_latest.pth")
+        if os.path.exists(auto_path):
+            agent.load(auto_path)
+            logger.info(f"自动加载已有RL checkpoint: {auto_path}")
+
+    agent.q_network.train()
+
+    # --------------------------------------------------
+    # 3. 实时训练循环
+    # --------------------------------------------------
+    fetcher = HuobiDataFetcher()
+    total_balance = rl_cfg.initial_balance  # 总资产 = 可用 + 持仓冻结
+    open_positions = []  # list of dict, 每项含 open_state / open_action
+    trade_history = []
+    tick_count = 0
+    metrics_log = []
+
+    try:
+        while max_ticks is None or tick_count < max_ticks:
+            tick_count += 1
+            try:
+                # ============================================================
+                # A. 获取最新数据 & 计算 LNN 预测
+                # ============================================================
+                logger.info(f"\n--- RL实时训练 Tick #{tick_count} ---")
+                logger.info("获取最新K线数据...")
+                timeframe_data = fetcher.fetch_multi_timeframe()
+                target_df = fetcher.get_dataframe(timeframe_data['5min'])
+                current_price = float(target_df['close'].iloc[-1])
+                current_time_ts = time.time()
+                close_arr = target_df['close'].values.astype(np.float32)
+
+                # 特征 & LNN 推理
+                tf_seqs_raw, ctx_raw, _ = _prepare_live_features(timeframe_data, fetcher)
+                tf_seqs_raw = normalize_sequence_samplewise(tf_seqs_raw)
+                tf_seqs_norm, ctx_norm = _normalize_with_stats(tf_seqs_raw, ctx_raw, norm_data)
+
+                tf_tensors = {
+                    p: torch.from_numpy(v.copy()).float().to(device)
+                    for p, v in tf_seqs_norm.items()
+                }
+                ctx_tensor = torch.from_numpy(ctx_norm.copy()).float().to(device)
+
+                with torch.no_grad():
+                    logits, hidden = model(tf_tensors, ctx_tensor, return_hidden=True)
+                    probs = torch.sigmoid(logits).cpu().numpy()[0]  # (3,)
+                    hidden_state = hidden.cpu().numpy()[0]          # (hidden_size,)
+
+                # ============================================================
+                # B. 构建 state_now（先于结算，用作到期持仓的 next_state）
+                # ============================================================
+                locked_balance = sum(p['bet'] for p in open_positions)
+                available_balance = total_balance - locked_balance
+
+                state_now = _compute_live_state(
+                    probs, available_balance, rl_cfg.initial_balance,
+                    close_arr, hidden_state, rl_cfg.state_returns_window, rl_cfg,
+                )
+
+                # ============================================================
+                # C. 结算到期持仓 → 构建经验 (s, a, r, s', done) 存入回放缓冲区
+                # ============================================================
+                still_open = []
+                reward_from_settlement = 0.0
+
+                for pos in open_positions:
+                    elapsed_min = (current_time_ts - pos['open_time']) / 60
+                    if elapsed_min >= pos['horizon']:
+                        # 到期结算
+                        entry_price = pos['entry_price']
+                        price_change = (current_price - entry_price) / entry_price
+                        won = (pos['direction'] == 0 and price_change > 0) or \
+                              (pos['direction'] == 1 and price_change < 0)
+
+                        if won:
+                            amount_to_add = pos['bet'] * (1 + pos['profit_rate'])
+                            net_return = pos['bet'] * pos['profit_rate']
+                        else:
+                            amount_to_add = 0.0
+                            net_return = -pos['bet']
+
+                        total_balance += amount_to_add
+                        reward_from_settlement += net_return
+
+                        # 构建训练经验 (state, action, reward, next_state, done)
+                        done = (total_balance < 1.0 or
+                                total_balance > rl_cfg.initial_balance * 20)
+                        agent.memory.push(
+                            pos['open_state'],
+                            pos['open_action'],
+                            net_return,
+                            state_now,
+                            done,
+                        )
+
+                        # 结算日志
+                        dir_str = "做多" if pos['direction'] == 0 else "做空"
+                        result_str = "WIN" if won else "LOSE"
+                        logger.info(
+                            f"  持仓到期: {pos['horizon']}min {dir_str} [${entry_price:.0f}→${current_price:.0f}] "
+                            f"{result_str} reward={net_return:+.1f} USDT"
+                        )
+
+                        # 如果 done, 重置余额重新开始
+                        if done:
+                            logger.info(f"  余额异常 ({total_balance:.2f}), 重置初始余额")
+                            total_balance = rl_cfg.initial_balance
+                    else:
+                        still_open.append(pos)
+
+                open_positions = still_open
+                locked_balance = sum(p['bet'] for p in open_positions)
+                available_balance = total_balance - locked_balance
+
+                now_str = pd.Timestamp.now()
+                logger.info(f"时间: {now_str} | 价格: ${current_price:.0f} | "
+                            f"总资产: {total_balance:.1f} USDT | "
+                            f"持仓: {len(open_positions)}笔 | "
+                            f"LNN: [10m={probs[0]:.2f}, 30m={probs[1]:.2f}, 60m={probs[2]:.2f}]")
+
+                # ============================================================
+                # D. 智能体决策 (epsilon-贪心)
+                # ============================================================
+                action = agent.select_action(state_now, eval_mode=False)
+                horizon, direction, bet = dummy_env.decode_action(action)
+
+                print()
+                print("=" * 60)
+                for i, h in enumerate([10, 30, 60]):
+                    d = "涨" if probs[i] > 0.5 else "跌"
+                    print(f"  LNN [{h:>2}分钟]: {d} 概率={probs[i]:.4f}")
+
+                if horizon is None:
+                    print(f"  RL决策: SKIP (epsilon={agent.epsilon:.3f})")
+                elif bet > available_balance:
+                    print(f"  RL决策: 余额不足 (需${bet:.0f}, 可用${available_balance:.0f}), SKIP")
+                else:
+                    dir_str = "做多" if direction == 0 else "做空"
+                    risk_pct = bet / total_balance * 100 if total_balance > 0 else 0
+                    pot_profit = bet * rl_cfg.profit_rates[horizon]
+                    print(f"  RL决策: {horizon}min {dir_str}")
+                    print(f"  投入: ${bet:.0f} ({risk_pct:.1f}%) | "
+                          f"潜在收益: +${pot_profit:.0f} / 亏损: -${bet:.0f}")
+
+                    # 开仓
+                    open_positions.append({
+                        'open_time': current_time_ts,
+                        'entry_price': current_price,
+                        'horizon': horizon,
+                        'direction': direction,
+                        'bet': bet,
+                        'profit_rate': rl_cfg.profit_rates[horizon],
+                        'pred_prob': float(probs[{10: 0, 30: 1, 60: 2}[horizon]]),
+                        'open_state': state_now.copy(),
+                        'open_action': action,
+                    })
+                    total_balance -= bet
+                    available_balance -= bet
+                print("=" * 60)
+                print()
+
+                # ============================================================
+                # E. 训练: 从回放缓冲区采样更新网络
+                # ============================================================
+                losses = []
+                for _ in range(train_steps_per_tick):
+                    loss = agent.update()
+                    if loss is not None:
+                        losses.append(loss)
+
+                avg_loss = np.mean(losses) if losses else 0.0
+
+                # ============================================================
+                # F. 记录指标 & 定期保存
+                # ============================================================
+                step_metric = {
+                    'tick': tick_count,
+                    'balance': total_balance,
+                    'available': available_balance,
+                    'positions': len(open_positions),
+                    'action': 'skip' if horizon is None else
+                              f'{horizon}min_{"long" if direction == 0 else "short"}',
+                    'bet': bet if horizon is not None else 0,
+                    'probs': [float(probs[i]) for i in range(3)],
+                    'epsilon': agent.epsilon,
+                    'loss': avg_loss,
+                    'step': agent.step_counter,
+                    'buffer_size': len(agent.memory),
+                    'reward_settled': float(reward_from_settlement),
+                    'price': float(current_price),
+                }
+                metrics_log.append(step_metric)
+
+                logger.info(
+                    f"[Tick {tick_count}] 资产={total_balance:.1f} | "
+                    f"回放={len(agent.memory):>5d} | Loss={avg_loss:.4f} | "
+                    f"ε={agent.epsilon:.3f} | 步数={agent.step_counter}"
+                )
+
+                # 每 6 个 tick (1小时) 保存一次 checkpoint
+                if tick_count % 6 == 0:
+                    agent.save(os.path.join(rl_cfg.save_dir, "rl_live_latest.pth"))
+                    logger.info(f"实时训练 checkpoint 已保存 (tick #{tick_count})")
+
+                # 每 60 个 tick (10小时) 保存完整指标
+                if tick_count % 60 == 0:
+                    df = pd.DataFrame(metrics_log)
+                    df.to_csv(os.path.join(rl_cfg.save_dir, "live_training_metrics.csv"), index=False)
+
+            except Exception as e:
+                logger.error(f"实时训练 tick 出错: {e}", exc_info=True)
+
+            # 等待下一个 10 分钟 tick
+            logger.info("等待10分钟...")
+            time.sleep(600)
+
+    except KeyboardInterrupt:
+        logger.info("\n实时训练已停止")
+        final_path = os.path.join(rl_cfg.save_dir, "rl_live_final.pth")
+        agent.save(final_path)
+        logger.info(f"最终模型已保存 -> {final_path}")
+
+        # 保存指标
+        if metrics_log:
+            df = pd.DataFrame(metrics_log)
+            df.to_csv(os.path.join(rl_cfg.save_dir, "live_training_metrics_final.csv"), index=False)
+            logger.info(f"训练指标已保存 ({len(metrics_log)} 条记录)")
+
+        # 未结算持仓
+        if open_positions:
+            lost_bet = sum(p['bet'] for p in open_positions)
+            logger.warning(f"停止时有 {len(open_positions)} 笔未结算持仓, 本金亏损 {lost_bet:.2f} USDT")
     """为实时交易准备LNN模型输入特征 (同 predict.py)"""
     periods = list(config.TIMEFRAMES.keys())
 
@@ -1292,8 +1653,8 @@ def main():
         description="LNN 强化学习交易智能体")
     parser.add_argument(
         '--mode', type=str, default='train',
-        choices=['train', 'eval', 'trade'],
-        help='运行模式: train=训练, eval=评估, trade=实时交易')
+        choices=['train', 'eval', 'trade', 'live_train'],
+        help='运行模式: train=训练, eval=评估, trade=实时交易, live_train=实时数据训练')
     parser.add_argument(
         '--episodes', type=int, default=300,
         help='训练回合数')
@@ -1306,6 +1667,15 @@ def main():
     parser.add_argument(
         '--eval_episodes', type=int, default=20,
         help='评估回合数')
+    parser.add_argument(
+        '--checkpoint', type=str, default=None,
+        help='从指定RL模型checkpoint继续训练 (路径或文件名, 默认自动加载 rl_latest.pth)')
+    parser.add_argument(
+        '--train_steps', type=int, default=4,
+        help='live_train 模式下每个 tick 的训练步数')
+    parser.add_argument(
+        '--max_ticks', type=int, default=None,
+        help='live_train 模式最大 tick 数 (默认无限, Ctrl+C停止)')
 
     args = parser.parse_args()
 
@@ -1319,7 +1689,15 @@ def main():
     )
 
     if args.mode == 'train':
-        train_rl(rl_cfg)
+        train_rl(rl_cfg, checkpoint_path=args.checkpoint)
+
+    elif args.mode == 'live_train':
+        live_train_rl(
+            rl_cfg,
+            checkpoint_path=args.checkpoint,
+            train_steps_per_tick=args.train_steps,
+            max_ticks=args.max_ticks,
+        )
 
     elif args.mode == 'eval':
         device = _detect_device()
