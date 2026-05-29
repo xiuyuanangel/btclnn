@@ -29,8 +29,9 @@ PREDICTION_HORIZONS = [10, 30, 60]
 # 标签来源: 用5min粒度的close计算各horizon后的价格变化
 LABEL_SOURCE_PERIOD = "5min"  # 标签基于该周期的K线数据计算
 LABEL_SMOOTH_WINDOW = 3       # 未来价格平滑窗口(单位: bar)
-LABEL_MIN_RETURN = 0.001     # 5min 标签最小收益门限(0.08%)
-LABEL_DROP_NEUTRAL = True     # 是否丢弃噪声中性样本
+LABEL_MIN_RETURN = 0.003     # 5min 标签最小收益门限(0.08%)
+LABEL_DROP_NEUTRAL = True     # 是否丢弃噪声中性样本(2分类模式) — 3分类模式下自动保留为 label=1
+LABEL_NUM_CLASSES = 3         # 标签类别数: 2=涨/跌二分类, 3=涨/平/跌三分类(平类被忽略以提高胜率)
 
 # ==================== 多周期配置 ====================
 # 每个周期独立编码, 覆盖微观到宏观的不同时间尺度
@@ -107,6 +108,15 @@ MEOW_BASE_URL = "https://api.chuckfang.com"  # API基础地址
 # ==================== 待验证预测存储 ====================
 PENDING_VERIFICATIONS_PATH = os.path.join(BASE_DIR, "data", "pending_verifications.json")
 VERIFICATION_STATS_PATH = os.path.join(BASE_DIR, "data", "verification_stats.json")
+
+# ==================== 预测验证配置 ====================
+# 实际交易中开仓/平仓无法精准对齐整5分钟K线，使用1min K线+
+# 执行窗口模拟真实成交不确定性
+VERIFY_USE_1MIN = True             # 使用1min K线验证（精度±30s，5min为±2.5min）
+VERIFY_EXECUTION_WINDOW = 2        # 执行窗口(根): 目标时间±N根1min内取不利方向最差价格
+# 示例: 窗口=2 表示取目标时间前后各2根1min共5根candle中对预测方向最不利的价格
+#      预测涨→取窗口内最低价(悲观: 买贵了); 预测跌→取窗口内最高价(悲观: 卖便宜了)
+VERIFY_SLIPPAGE_BPS = 0.0          # 额外滑点(bps): 0=不启用, 如设为2.0=额外扣0.02%
 
 # ==================== 调试配置 ====================
 DEBUG_EXPORT_CSV = False     # 是否导出数据集样本到CSV供人工核验

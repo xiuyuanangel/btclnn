@@ -374,6 +374,7 @@ class MultiTimeframeLNN(nn.Module):
         cross_attn_heads=4,
         use_transformer=False,  # 是否启用Transformer增强
         transformer_heads=4,    # Transformer注意力头数
+        num_classes_per_head=None,  # 每头类别数: 2=二分类(涨跌), 3=三分类(涨平跌), 默认从config读取
     ):
         """
         Args:
@@ -387,6 +388,7 @@ class MultiTimeframeLNN(nn.Module):
             cross_attn_heads: 跨周期注意力的头数
             use_transformer: 是否启用Transformer增强(融合LTC+Transformer)
             transformer_heads: Transformer注意力头数
+            num_classes_per_head: 每个分类头的类别数(2=二分类 BCEWithLogits, >=3=多分类 CrossEntropy)
         """
         super().__init__()
         self.hidden_size = hidden_size or config.HIDDEN_SIZE
@@ -397,6 +399,8 @@ class MultiTimeframeLNN(nn.Module):
         # 输出维度: 默认为预测窗口数量
         _default_output_size = len(getattr(config, 'PREDICTION_HORIZONS', [10]))
         self.output_size = output_size or _default_output_size
+        # 每头分类数
+        self.num_classes_per_head = num_classes_per_head or getattr(config, 'LABEL_NUM_CLASSES', 2)
 
         # 周期名称列表(保持确定顺序)
         self.period_names = list(timeframe_configs.keys())
@@ -455,15 +459,15 @@ class MultiTimeframeLNN(nn.Module):
             dropout_rate=self.dropout_rate,
         )
 
-        # 分类头(独立多输出) — 每个预测窗口独立的分类器, 无Sigmoid, 配合 BCEWithLogitsLoss
-        # 共享融合向量 → 各窗口独立 Linear(64→32) → ReLU → Dropout → Linear(32→1)
-        # 这样 10min/30min/60min 可以学习各自独立的决策边界和方向
+        # 分类头(独立多输出)
+        # 二分类: 每头输出1个logit(配合 BCEWithLogitsLoss)
+        # 三分类: 每头输出3个logit(配合 CrossEntropyLoss, ignore_index=1=中性)
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size // 2),
                 nn.ReLU(),
                 nn.Dropout(self.dropout_rate),
-                nn.Linear(self.hidden_size // 2, 1),
+                nn.Linear(self.hidden_size // 2, self.num_classes_per_head),
             )
             for _ in range(output_size)
         ])
@@ -486,7 +490,9 @@ class MultiTimeframeLNN(nn.Module):
             return_hidden: 若为True, 同时返回融合层输出的隐状态 (batch, hidden_size)
 
         Returns:
-            output: (batch, num_horizons) 各预测窗口的上涨logits
+            output: (batch, num_horizons * num_classes_per_head) 各预测窗口的各类别logits
+                    二分类: (batch, num_horizons) - 每头1个logit
+                    三分类: (batch, num_horizons * 3) - 每头3个logit(跌/平/涨)
             (optional) hidden: (batch, hidden_size) 融合层隐状态 (仅 return_hidden=True 时返回)
         """
         # 1. 各周期独立编码(保持固定顺序)
@@ -504,7 +510,7 @@ class MultiTimeframeLNN(nn.Module):
         fused = self.fusion(encoded, context_features)
 
         # 4. 各预测窗口独立分类 (不同窗口可学习不同方向)
-        #    每个 head 输出 (batch, 1), 沿最后一维拼接为 (batch, output_size)
+        #    每个 head 输出 (batch, num_classes_per_head), 沿最后一维拼接
         outputs = [head(fused) for head in self.heads]
         out = torch.cat(outputs, dim=-1)
 

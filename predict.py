@@ -197,6 +197,7 @@ def _build_model_from_checkpoint(device, checkpoint):
     _use_transformer = model_cfg.get('use_transformer', False)
     _transformer_heads = model_cfg.get('transformer_heads', 4)
     _cross_attn_heads = model_cfg.get('cross_attn_heads', 4)
+    _num_classes = model_cfg.get('num_classes_per_head', getattr(config, 'LABEL_NUM_CLASSES', 2))
 
     model = MultiTimeframeLNN(
         timeframe_configs=model_cfg['timeframe_configs'],
@@ -205,6 +206,7 @@ def _build_model_from_checkpoint(device, checkpoint):
         num_layers=model_cfg.get('num_layers', config.NUM_LAYERS),
         dropout=model_cfg.get('dropout', config.DROPOUT),
         output_size=_output_size,
+        num_classes_per_head=_num_classes,
         use_transformer=_use_transformer,
         transformer_heads=_transformer_heads,
         cross_attn_heads=_cross_attn_heads,
@@ -244,9 +246,10 @@ def _build_model_from_checkpoint(device, checkpoint):
         f"模型加载成功 (Epoch {checkpoint['epoch']}, "
         f"Val Loss: {checkpoint['val_loss']:.4f}, "
         f"输出维度: {_output_size} 窗口={_horizons}, "
+        f"分类: {'三' if _num_classes >= 3 else '二'}分类, "
         f"Transformer: {'启用' if _use_transformer else '禁用'})"
     )
-    return model, _horizons
+    return model, _horizons, _num_classes
 
 
 def load_model(device):
@@ -255,6 +258,9 @@ def load_model(device):
     直接从checkpoints加载:
     1. 最佳模型 lnn_best.pth (val_loss最低)
     2. 最终模型 lnn_final.pth (最后训练保存, 降级方案)
+
+    Returns:
+        model, horizons, num_classes
     """
     # 优先级1: 最佳模型 (val_loss最低)
     best_ckpt = _load_checkpoint_model(device, config.MODEL_PATH, "最佳模型")
@@ -396,8 +402,8 @@ def predict():
     if _use_cuda and torch.cuda.device_count() > 1:
         logger.info(f"检测到 {torch.cuda.device_count()} 块GPU")
 
-    # 1. 加载模型(返回模型和窗口列表)
-    model, horizons = load_model(device)
+    # 1. 加载模型(返回模型、窗口列表和分类数)
+    model, horizons, num_classes = load_model(device)
     num_horizons = len(horizons)
 
     # 2. 加载标准化参数(必须与训练时一致)
@@ -425,8 +431,7 @@ def predict():
     ctx_tensor = torch.from_numpy(ctx_norm.copy()).float().to(device)
 
     with torch.no_grad():
-        logits = model(tf_seqs_tensor, ctx_tensor)  # (1, num_horizons), 输出为logits
-        probabilities = torch.sigmoid(logits).cpu().numpy()[0]  # (num_horizons,)
+        logits = model(tf_seqs_tensor, ctx_tensor)  # (1, num_horizons * num_classes)
 
     # 7. 输出结果
     current_price = df_featured['close'].iloc[-1]
@@ -442,24 +447,59 @@ def predict():
     print(f"  融合周期:   {', '.join(config.TIMEFRAMES.keys())}")
     print(f"  预测时间:   {prediction_time}")
     print(f"  当前价格:   {current_price:.2f} USDT")
+    print(f"  分类模式:   {'三分类(涨/平/跌)' if num_classes >= 3 else '二分类(涨/跌)'}")
     print("-" * 60)
 
-    for i, h in enumerate(horizons):
-        prob = float(probabilities[i])
-        direction = "涨 (UP)" if prob > 0.5 else "跌 (DOWN)"
-        confidence = abs(prob - 0.5) * 2
+    if num_classes >= 3:
+        # 三分类: 每个horizon有3个logit(跌/平/涨)
+        logits_3d = logits.cpu().numpy().reshape(1, num_horizons, num_classes)[0]  # (H, C)
+        probs_all = torch.softmax(logits, dim=-1).view(num_horizons, num_classes).cpu().numpy()  # (H, C)
 
-        result = {
-            'horizon': h,
-            'direction': direction,
-            'probability': prob,
-            'confidence': confidence,
-        }
-        results.append(result)
+        LABEL_NAMES = ["跌 (DOWN)", "平 (NEUTRAL)", "涨 (UP)"]
+        for i, h in enumerate(horizons):
+            probs = probs_all[i]  # (3,) down/neutral/up
+            pred_class = int(probs.argmax())
+            direction = LABEL_NAMES[pred_class]
+            prob_up = float(probs[2])
+            prob_down = float(probs[0])
+            prob_neutral = float(probs[1])
+            confidence = float(probs.max())
 
-        print(f"  [{h:>3}分钟] 方向: {direction:<12} "
-              f"上涨概率: {prob:.4f} ({prob*100:.2f}%)  "
-              f"置信度: {confidence:.4f} ({confidence*100:.2f}%)")
+            result = {
+                'horizon': h,
+                'direction': direction,
+                'pred_class': pred_class,
+                'prob_up': prob_up,
+                'prob_down': prob_down,
+                'prob_neutral': prob_neutral,
+                'probability': prob_up,  # 兼容旧接口
+                'confidence': confidence,
+            }
+            results.append(result)
+
+            print(f"  [{h:>3}分钟] 方向: {direction:<16} "
+                  f"跌={prob_down:.3f} 平={prob_neutral:.3f} 涨={prob_up:.3f}  "
+                  f"置信度: {confidence:.4f}")
+    else:
+        # 二分类: 原始逻辑
+        probabilities = torch.sigmoid(logits).cpu().numpy()[0]  # (num_horizons,)
+
+        for i, h in enumerate(horizons):
+            prob = float(probabilities[i])
+            direction = "涨 (UP)" if prob > 0.5 else "跌 (DOWN)"
+            confidence = abs(prob - 0.5) * 2
+
+            result = {
+                'horizon': h,
+                'direction': direction,
+                'probability': prob,
+                'confidence': confidence,
+            }
+            results.append(result)
+
+            print(f"  [{h:>3}分钟] 方向: {direction:<12} "
+                  f"上涨概率: {prob:.4f} ({prob*100:.2f}%)  "
+                  f"置信度: {confidence:.4f} ({confidence*100:.2f}%)")
 
     print("=" * 60)
     print()
@@ -468,10 +508,22 @@ def predict():
     if config.MEOW_NICKNAME:
         try:
             notifier = MeoWNotifier(config.MEOW_NICKNAME)
+            # 为兼容旧通知接口，三分类时构建简化的结果
+            if num_classes >= 3:
+                _notify_results = []
+                for r in results:
+                    _notify_results.append({
+                        'horizon': r['horizon'],
+                        'direction': r['direction'],
+                        'probability': r['prob_up'],
+                        'confidence': r['confidence'],
+                    })
+            else:
+                _notify_results = results
             notifier.send_multi_horizon_prediction(
                 time=str(prediction_time),
                 price=float(current_price),
-                horizons_results=results,
+                horizons_results=_notify_results,
             )
         except Exception as e:
             logger.warning(f"通知推送失败: {e}")

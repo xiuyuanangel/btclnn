@@ -88,9 +88,13 @@ def compute_bollinger_bands(df, windows=(20,), k=2.0):
 
 
 def compute_labels(df, horizons=None, source_period_minutes=5):
-    """计算多周期标签: 各预测时间窗口后是否上涨
+    """计算多周期标签: 各预测时间窗口后的涨/平/跌
 
-    使用未来平滑价格和最小收益门限降低噪声，并可丢弃中性样本。
+    支持二分类(涨/跌)和三分类(涨/平/跌)两种模式。
+    三分类模式下:
+      - label=0: 跌(DOWN),   未来收益 < -threshold
+      - label=1: 平(NEUTRAL), |未来收益| <= threshold (小波动, 训练时被CrossEntropyLoss忽略)
+      - label=2: 涨(UP),     未来收益 > +threshold
 
     Args:
         df: K线DataFrame(需包含close列)
@@ -102,6 +106,7 @@ def compute_labels(df, horizons=None, source_period_minutes=5):
 
     smooth_window = getattr(config, 'LABEL_SMOOTH_WINDOW', 1)
     min_return = getattr(config, 'LABEL_MIN_RETURN', 0.0)
+    num_classes = getattr(config, 'LABEL_NUM_CLASSES', 2)
     drop_neutral = getattr(config, 'LABEL_DROP_NEUTRAL', False)
 
     for h in horizons:
@@ -114,15 +119,26 @@ def compute_labels(df, horizons=None, source_period_minutes=5):
 
         future_return = future_close / df['close'] - 1.0
         col_name = f'label_{h}m'
-        label = pd.Series(np.nan, index=df.index)
-        label[future_return > min_return] = 1
-        label[future_return < -min_return] = 0
 
-        if drop_neutral:
-            df[col_name] = label
+        if num_classes >= 3:
+            # 三分类: 0=跌, 1=平(中性/小波动), 2=涨
+            label = pd.Series(1, index=df.index, dtype=int)  # 默认中性
+            label[future_return > min_return] = 2             # 涨
+            label[future_return < -min_return] = 0            # 跌
+            # 边界样本(NaN future_close)仍标为中性(1)
+            label[future_return.isna()] = 1
+            df[col_name] = label.astype(int)
         else:
-            # 保留中性样本为0/1二值标签，仍可训练但噪声较大
-            df[col_name] = label.fillna(0).astype(int)
+            # 二分类(旧逻辑): 0=跌, 1=涨
+            label = pd.Series(np.nan, index=df.index)
+            label[future_return > min_return] = 1
+            label[future_return < -min_return] = 0
+
+            if drop_neutral:
+                df[col_name] = label
+            else:
+                # 保留中性样本为0/1二值标签
+                df[col_name] = label.fillna(0).astype(int)
     return df
 
 
@@ -490,10 +506,19 @@ def build_multi_tf_dataset(tf_dfs, target_df, label_source_df=None,
     # 注意: 标准化移至 split_multi_tf_dataset 之后进行(避免数据泄露)
 
     if len(y) > 0:
+        num_classes = getattr(config, 'LABEL_NUM_CLASSES', 2)
         for i, h in enumerate(horizons):
-            up_ratio = y[:, i].mean()
-            logger.info(f"标签[{h}m]: 涨={y[:, i].sum():.0f} ({up_ratio:.2%}), "
-                         f"跌={(len(y)-y[:, i].sum()):.0f} ({1-up_ratio:.2%})")
+            col = y[:, i]
+            if num_classes >= 3:
+                n_down = int((col == 0).sum())
+                n_neutral = int((col == 1).sum())
+                n_up = int((col == 2).sum())
+                logger.info(f"标签[{h}m]: 涨={n_up}, 平={n_neutral}, 跌={n_down} "
+                             f"({n_up/len(y):.1%}/{n_neutral/len(y):.1%}/{n_down/len(y):.1%})")
+            else:
+                up_ratio = col.mean()
+                logger.info(f"标签[{h}m]: 涨={col.sum():.0f} ({up_ratio:.2%}), "
+                             f"跌={(len(y)-col.sum()):.0f} ({1-up_ratio:.2%})")
     logger.info(f"多周期数据集: {len(y)} 个有效样本, {len(horizons)} 个预测窗口 (原始数据)")
 
     # 导出调试CSV(仅需少量样本, 不影响训练性能)
@@ -597,10 +622,19 @@ def build_multi_symbol_dataset(all_symbols_tf_data, fetcher, export_debug_csv=Fa
 
     # 统计合并后各标签窗口的涨跌比例
     horizons = config.PREDICTION_HORIZONS
+    num_classes = getattr(config, 'LABEL_NUM_CLASSES', 2)
     for i, h in enumerate(horizons):
-        up_ratio = merged_y[:, i].mean()
-        logger.info(f"  标签[{h}m]: 涨={merged_y[:, i].sum():.0f} ({up_ratio:.2%}), "
-                     f"跌={(len(merged_y)-merged_y[:, i].sum()):.0f} ({1-up_ratio:.2%})")
+        col = merged_y[:, i]
+        if num_classes >= 3:
+            n_down = int((col == 0).sum())
+            n_neutral = int((col == 1).sum())
+            n_up = int((col == 2).sum())
+            logger.info(f"  标签[{h}m]: 涨={n_up}, 平={n_neutral}, 跌={n_down} "
+                         f"({n_up/len(merged_y):.1%}/{n_neutral/len(merged_y):.1%}/{n_down/len(merged_y):.1%})")
+        else:
+            up_ratio = col.mean()
+            logger.info(f"  标签[{h}m]: 涨={col.sum():.0f} ({up_ratio:.2%}), "
+                         f"跌={(len(merged_y)-col.sum()):.0f} ({1-up_ratio:.2%})")
 
     return merged_X_dict, merged_X_ctx, merged_y
 

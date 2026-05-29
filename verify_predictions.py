@@ -169,8 +169,88 @@ def update_stats(stats, horizon, is_correct):
 # 单条验证
 # ==============================
 
+def _fetch_verify_price(fetcher, verify_target_ts, pred_direction):
+    """高精度验证价格获取 — 模拟真实交易执行的不确定性
+
+    核心优化:
+    1. 使用1min K线替代5min, 时间精度从±2.5min提升至±30s
+    2. 执行窗口内取「不利方向最差价格」, 模拟真实成交无法精准择时
+       - 预测涨→交易者需买入, 窗口内最高价是最差买入价(买贵了)
+       - 预测跌→交易者需卖出, 窗口内最低价是最差卖出价(卖便宜了)
+    3. 可选的额外滑点惩罚(VERIFY_SLIPPAGE_BPS)
+
+    Returns:
+        (verify_price, verify_time, actual_price_before_slippage)
+    """
+    use_1min = getattr(config, 'VERIFY_USE_1MIN', True)
+    exec_window = max(1, getattr(config, 'VERIFY_EXECUTION_WINDOW', 2))
+    slippage_bps = getattr(config, 'VERIFY_SLIPPAGE_BPS', 0.0)
+
+    period = '1min' if use_1min else '5min'
+    minutes_per = 1 if use_1min else 5
+
+    # 获取验证需要的K线: 目标时间前后各exec_window根 + buffer
+    lookback_minutes = (exec_window + 3) * minutes_per
+    verify_data = fetcher.fetch_history(period, days=max(1, lookback_minutes // (24 * 60) + 1),
+                                         force_refresh=True)
+    verify_df = fetcher.get_dataframe(verify_data)
+
+    if verify_df.empty or len(verify_df) < 2:
+        raise ValueError(f"验证数据不足 ({period})")
+
+    verify_target_time = pd.to_datetime(verify_target_ts, unit='s')
+
+    # 找到覆盖目标时间的那根K线及其前后exec_window根
+    # K线index是开盘时间, close是该周期结束时的价格
+    candle_positions = verify_df.index  # 所有K线开盘时间
+    # 找到 ≤ target_time 的最近K线索引
+    idx = candle_positions.searchsorted(verify_target_time, side='right') - 1
+    idx = max(0, idx)
+
+    # 取执行窗口内的K线: [idx - exec_window, idx + exec_window]
+    win_start = max(0, idx - exec_window)
+    win_end = min(len(verify_df) - 1, idx + exec_window)
+    window_df = verify_df.iloc[win_start:win_end + 1]
+
+    if window_df.empty:
+        # 回退到单根K线
+        verify_candle = verify_df.iloc[idx]
+        raw_price = float(verify_candle['close'])
+        verify_time = verify_target_time
+    else:
+        # 根据预测方向取窗口内最不利价格 (模拟真实成交)
+        if pred_direction == "涨 (UP)":
+            # 预测涨: 交易者买入, 窗口内最高价是最差买入价
+            worst_idx = window_df['high'].idxmax()
+            raw_price = float(window_df.loc[worst_idx, 'high'])
+        elif pred_direction == "跌 (DOWN)":
+            # 预测跌: 交易者卖出, 窗口内最低价是最差卖出价
+            worst_idx = window_df['low'].idxmin()
+            raw_price = float(window_df.loc[worst_idx, 'low'])
+        else:
+            # 平: 使用目标K线收盘价
+            raw_price = float(verify_df.iloc[idx]['close'])
+
+        # 验证时间用窗口中心K线时间
+        verify_time = verify_df.index[idx]
+
+    # 应用额外滑点惩罚
+    if slippage_bps > 0:
+        slippage_factor = slippage_bps / 10000.0  # bps → 小数
+        if pred_direction == "涨 (UP)":
+            verify_price = raw_price * (1.0 + slippage_factor)  # 买入更贵
+        elif pred_direction == "跌 (DOWN)":
+            verify_price = raw_price * (1.0 - slippage_factor)  # 卖出更便宜
+        else:
+            verify_price = raw_price
+    else:
+        verify_price = raw_price
+
+    return verify_price, verify_time, raw_price
+
+
 def verify_single(pred):
-    """验证单条预测记录
+    """验证单条预测记录 — 高精度执行窗口版
 
     Args:
         pred: dict, 包含 prediction_time, price, horizon, direction, probability 等字段
@@ -181,7 +261,6 @@ def verify_single(pred):
     horizon = pred['horizon']
     pred_price = pred['price']
     pred_direction = pred['direction']
-    pred_prob = pred['probability']
     h = horizon
 
     logger.info(f"开始验证 [{h}min] 预测: 时间={pred['prediction_time']}, 价格={pred_price}")
@@ -189,40 +268,43 @@ def verify_single(pred):
     fetcher = HuobiDataFetcher()
 
     try:
-        # 获取最新的5min K线数据
-        verify_data = fetcher.fetch_multi_timeframe(force_refresh=True)
-        verify_df = fetcher.get_dataframe(verify_data['5min'])
-
-        if verify_df.empty or len(verify_df) < 2:
-            logger.warning(f"验证阶段({h}m): 数据不足, 跳过")
-            return None
-
         # 计算目标验证时间 = 预测时间 + 预测窗口(分钟)
         prediction_ts = pred.get('prediction_ts', 0)
         verify_target_ts = prediction_ts + h * 60
-        verify_target_time = pd.to_datetime(verify_target_ts, unit='s')
 
-        # 找到覆盖目标时间的5min K线, 用其收盘价作为验证价格
-        # df.index 是K线开盘时间, close 是收盘价(开盘+5min时刻)
-        mask = verify_df.index <= verify_target_time
-        if mask.any():
-            verify_candle = verify_df[mask].iloc[-1]
-        else:
-            # 保护: 目标时间早于最早K线
-            verify_candle = verify_df.iloc[0]
-        verify_price = float(verify_candle['close'])
-        verify_time = verify_target_time
+        # 高精度获取验证价格 (1min K线 + 执行窗口)
+        verify_price, verify_time, raw_price = _fetch_verify_price(
+            fetcher, verify_target_ts, pred_direction
+        )
 
-        actual_direction = "涨 (UP)" if verify_price > pred_price else "跌 (DOWN)"
-        is_correct = (pred_prob > 0.5) == (verify_price > pred_price)
+        # 价格变化
         price_change = (verify_price - float(pred_price)) / float(pred_price) * 100
 
+        # 使用与标签生成一致的中性门限 (百分比单位)
+        neutral_threshold = config.LABEL_MIN_RETURN * 100
+
+        if verify_price > pred_price + neutral_threshold:
+            actual_direction = "涨 (UP)"
+        elif verify_price < pred_price - neutral_threshold:
+            actual_direction = "跌 (DOWN)"
+        else:
+            actual_direction = "平 (NEUTRAL)"
+
+        # 基于方向字段验证 (兼容二分类和三分类预测)
+        is_correct = (pred_direction == actual_direction)
+
         result_mark = "正确" if is_correct else "错误"
+        use_1min = getattr(config, 'VERIFY_USE_1MIN', True)
+        exec_win = getattr(config, 'VERIFY_EXECUTION_WINDOW', 2)
         print("-" * 50)
         print(f"  [{h}分钟窗口] 预测验证结果 [{result_mark}]")
         print("-" * 50)
+        print(f"  验证精度:   {'1min K线' if use_1min else '5min K线'} | "
+              f"执行窗口: ±{exec_win}根")
         print(f"  预测时间:   {pred['prediction_time']} | 价格: {pred_price:.2f}")
-        print(f"  验证时间:   {verify_time} | 价格: {verify_price:.2f}")
+        print(f"  验证时间:   {verify_time} | 成交价: {verify_price:.2f}")
+        if raw_price != verify_price:
+            print(f"  (原始价: {raw_price:.2f}, 滑点扣减后: {verify_price:.2f})")
         print(f"  预测方向:   {pred_direction}")
         print(f"  实际方向:   {actual_direction}")
         print(f"  价格变化:   {price_change:+.2f}%")

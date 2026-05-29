@@ -3,17 +3,109 @@
 使用预训练的 MultiTimeframeLNN 模型作为状态提取器, 通过 Dueling DQN 算法
 学习最优交易策略: 选择不交易、或在哪个周期做多/做空、投入多少本金(5~100 USDT)。
 
-交易规则:
-  - 10分钟周期: 预测正确获得 80% 收益, 错误亏损全部本金
-  - 30分钟周期: 预测正确获得 85% 收益, 错误亏损全部本金
-  - 60分钟周期: 预测正确获得 85% 收益, 错误亏损全部本金
+================================================================================
+交易规则
+================================================================================
+  10分钟周期: 预测正确获得 80% 收益, 错误亏损全部本金
+  30分钟周期: 预测正确获得 85% 收益, 错误亏损全部本金
+  60分钟周期: 预测正确获得 85% 收益, 错误亏损全部本金
+
+  动作空间: 1 (skip) + 3周期 x 2方向 x 11档投入 = 1 + 66 = 67 个动作
+  投入档位: [5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100] USDT
+
+================================================================================
+运行模式
+================================================================================
+
+  ┌─ 离线训练 (基于历史数据) ──────────────────────────────────────────────────┐
+  │                                                                              │
+  │  从头训练:                                                                   │
+  │    python rl_trader.py --mode train --episodes 500 --balance 2000            │
+  │                                                                              │
+  │  从checkpoint继续训练:                                                       │
+  │    python rl_trader.py --mode train --checkpoint rl_latest.pth               │
+  │    python rl_trader.py --mode train --checkpoint rl_checkpoint_ep50.pth      │
+  │                                                                              │
+  │  自动断点恢复 (寻找 rl_latest.pth):                                          │
+  │    python rl_trader.py --mode train                                           │
+  │    # 训练中断后重新运行, 自动从最新的 rl_latest.pth 继续                     │
+  │                                                                              │
+  │  评估模型:                                                                   │
+  │    python rl_trader.py --mode eval --eval_episodes 50                        │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ 实时交易 (生产模式) ────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  启动交易:                                                                   │
+  │    python rl_trader.py --mode trade --balance 5000                           │
+  │    # 自动加载 best/latest checkpoint, 每10分钟决策一次                       │
+  │                                                                              │
+  │  停止: Ctrl+C, 自动保存交易历史                                              │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ 实时增量训练 (online learning) ─────────────────────────────────────────────┐
+  │                                                                              │
+  │  从头训练:                                                                   │
+  │    python rl_trader.py --mode live_train --balance 2000 --train_steps 4      │
+  │                                                                              │
+  │  从checkpoint继续:                                                           │
+  │    python rl_trader.py --mode live_train --checkpoint rl_best.pth            │
+  │    python rl_trader.py --mode live_train --train_steps 4 --max_ticks 144     │
+  │    # max_ticks=144 表示运行24小时后自动停止 (每10分钟1tick)                  │
+  │                                                                              │
+  │  停止: Ctrl+C, 自动保存模型和训练指标                                        │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+Checkpoint 管理
+================================================================================
+
+  文件列表 (保存在 checkpoints/rl/):
+
+    rl_latest.pth           每个回合结束自动保存, 训练中断后自动恢复
+    rl_checkpoint_ep50.pth  每50回合的编号快照 (ep50, ep100, ...)
+    rl_best.pth             验证集表现最佳的模型
+    rl_final.pth            训练结束时的最终模型
+    rl_live_latest.pth      实时训练每小时自动保存
+    rl_live_final.pth       实时训练 Ctrl+C 停止时保存
+
+  Checkpoint 内容:
+    - Q网络 & 目标网络权重
+    - 优化器状态 (Adam momentum)
+    - 经验回放缓冲区 (最多100k条, 恢复后可直接继续训练)
+    - 探索率 (epsilon)、训练步数
+    - 最近1000条 loss 历史
+
+================================================================================
+断点恢复机制
+================================================================================
+
+  train 模式:
+    1. --checkpoint 指定路径 → 优先使用
+    2. 未指定时 → 自动查找 rl_latest.pth
+    3. 都未找到 → 从头训练
+
+  live_train 模式:
+    同上, 且每6个tick(1小时)自动保存 rl_live_latest.pth
+
+  恢复后训练完全无缝:
+    - Q网络权重、目标网络、优化器动量 → 精确恢复
+    - 经验回放缓冲区 → 完整恢复, 无需重新积累
+    - epsilon 和 step_counter → 继续衰减, 不会重置
+    - loss_history → 可用于监控恢复后的训练趋势
 
 用法:
-  训练模式:          python rl_trader.py --mode train --episodes 500
-  评估模式:          python rl_trader.py --mode eval
-  实时交易:          python rl_trader.py --mode trade
-  实时数据训练:      python rl_trader.py --mode live_train
-  从checkpoint继续:  python rl_trader.py --mode live_train --checkpoint rl_best.pth --train_steps 4
+  --mode MODE            运行模式: train / eval / trade / live_train
+  --episodes N           训练回合数 (默认300)
+  --balance AMOUNT       初始本金 USDT (默认1000)
+  --eval_episodes N      评估回合数 (默认20)
+  --checkpoint PATH      RL checkpoint 路径或文件名 (默认自动加载 rl_latest.pth)
+  --train_steps N        live_train 每个tick训练步数 (默认4)
+  --max_ticks N          live_train 最大tick数 (默认无限)
+  --seed N               随机种子 (默认42)
 """
 
 import os
@@ -121,7 +213,7 @@ class TradingEnv:
     """RL交易环境
 
     基于历史数据模拟逐时间步交易, 每个时间步:
-      1. LNN模型给出三个周期的涨跌概率
+      1. LNN模型给出三个周期的涨跌概率 (二分类) 或 涨/平/跌概率 (三分类)
       2. 智能体选择动作 (skip / 指定周期+方向+本金)
       3. 根据历史真实涨跌计算盈亏
     """
@@ -129,18 +221,21 @@ class TradingEnv:
     def __init__(
         self,
         dataset_dict: dict,
-        predictions: np.ndarray,   # (N, 3) 模型预测的上涨概率
+        predictions: np.ndarray,   # (N, 3) 二分类 / (N, 3, 3) 三分类概率
         hidden_states: np.ndarray, # (N, hidden_size) 融合层隐状态
         close_prices: np.ndarray,  # (N,) 每个时间步的收盘价
         rl_cfg: RLConfig,
         seed: Optional[int] = None,
     ):
         self.cfg = rl_cfg
-        self.labels = dataset_dict['labels']           # (N, 3)
-        self.predictions = predictions                  # (N, 3) 上涨概率
+        self.labels = dataset_dict['labels']           # (N, 3) 值: 0/1 或 0/1/2
+        self.predictions = predictions                  # (N, 3) 或 (N, 3, 3)
         self.hidden_states = hidden_states              # (N, hidden_size) 隐状态
         self.hidden_size = hidden_states.shape[1]
         self.close_prices = close_prices                 # (N,)
+
+        # 检测三分类模式
+        self.is_3class = (predictions.ndim == 3 and predictions.shape[-1] >= 3)
 
         self.num_steps = len(self.labels)
 
@@ -164,14 +259,15 @@ class TradingEnv:
             np.random.seed(seed)
 
         # 状态维度
+        _probs_dim = 6 if self.is_3class else 3  # 3class: 涨和跌概率各3个; 2class: 3个上涨概率
         self.state_dim = (
-            3 +                   # 三个周期的上涨概率
-            3 +                   # 三个周期的置信度
-            1 +                   # 余额比例
-            rl_cfg.state_returns_window +  # 最近收益率
-            1 +                   # 波动率
-            1 +                   # 已用步数比例
-            self.hidden_size      # LNN融合层隐状态 (方案A)
+            _probs_dim +                  # 上涨/下跌概率
+            _probs_dim +                  # 置信度 (三分类也用涨跌概率的差)
+            1 +                           # 余额比例
+            rl_cfg.state_returns_window + # 最近收益率
+            1 +                           # 波动率
+            1 +                           # 已用步数比例
+            self.hidden_size              # LNN融合层隐状态
         )
 
     def _precompute_returns(self):
@@ -199,8 +295,19 @@ class TradingEnv:
 
     def _compute_state(self, idx: int) -> np.ndarray:
         """计算当前状态向量 (含LNN融合层隐状态)"""
-        probs = self.predictions[idx]                 # (3,)
-        confs = np.abs(probs - 0.5) * 2.0             # (3,)
+        if self.is_3class:
+            # 三分类: predictions (N, 3, 3) -> [down, neutral, up] per horizon
+            p = self.predictions[idx]  # (3, 3)
+            probs_up = p[:, 2]          # (3,) 上涨概率
+            probs_down = p[:, 0]        # (3,) 下跌概率
+            probs = np.concatenate([probs_up, probs_down])
+            confs = np.abs(probs_up - probs_down)  # (3,) 涨跌概率差作为置信度
+            confs_full = np.concatenate([confs, confs])
+        else:
+            probs = self.predictions[idx]            # (3,)
+            confs = np.abs(probs - 0.5) * 2.0        # (3,)
+            confs_full = confs
+
         balance_ratio = self.balance / self.initial_balance
 
         # 最近收益率
@@ -218,12 +325,12 @@ class TradingEnv:
         # 进度
         progress = idx / max(self.num_steps - 1, 1)
 
-        # LNN融合层隐状态 (方案A)
+        # LNN融合层隐状态
         hidden = self.hidden_states[idx]
 
         return np.concatenate([
-            probs,                # 3
-            confs,                # 3
+            probs,                # 3 or 6
+            confs_full,            # 3 or 6
             [balance_ratio],      # 1
             recent_rets,          # state_returns_window
             [vol],                # 1
@@ -259,8 +366,22 @@ class TradingEnv:
         settlement_reward = 0.0
         if idx in self.open_positions:
             for pos in self.open_positions.pop(idx):
-                actual_up = self.labels[pos.entry_idx, pos.horizon_idx]
-                if (pos.direction == 0 and actual_up == 1) or (pos.direction == 1 and actual_up == 0):
+                actual_label = int(self.labels[pos.entry_idx, pos.horizon_idx])
+                if self.is_3class:
+                    # 三分类: 0=跌, 1=平(中性), 2=涨
+                    # 中性(label=1)时双方都输(价格无明显变化)
+                    if actual_label == 2:   # 实际涨
+                        won = (pos.direction == 0)
+                    elif actual_label == 0:  # 实际跌
+                        won = (pos.direction == 1)
+                    else:                    # 中性, 双方都输
+                        won = False
+                else:
+                    # 二分类: 0=跌, 1=涨
+                    actual_up = actual_label
+                    won = (pos.direction == 0 and actual_up == 1) or (pos.direction == 1 and actual_up == 0)
+
+                if won:
                     # 预测正确: 返还本金 + 收益
                     payout = pos.bet * (1 + self.cfg.profit_rates[pos.horizon_minutes])
                     self.balance += payout
@@ -304,8 +425,18 @@ class TradingEnv:
 
             # 如果到期索引超出数据范围，立即按照当前标签强行结算
             if exit_idx >= self.num_steps:
-                actual_up = self.labels[idx, h_idx]
-                if (direction == 0 and actual_up == 1) or (direction == 1 and actual_up == 0):
+                actual_label = int(self.labels[idx, h_idx])
+                if self.is_3class:
+                    if actual_label == 2:
+                        won = (direction == 0)
+                    elif actual_label == 0:
+                        won = (direction == 1)
+                    else:
+                        won = False
+                else:
+                    won = (direction == 0 and actual_label == 1) or (direction == 1 and actual_label == 0)
+
+                if won:
                     payout = bet * (1 + self.cfg.profit_rates[horizon])
                     self.balance += payout
                     new_reward = bet * self.cfg.profit_rates[horizon]
@@ -323,8 +454,8 @@ class TradingEnv:
                 'pnl': new_reward + settlement_reward,
                 'balance': self.balance,
                 'result': result,
-                'prob': float(self.predictions[idx, h_idx]),
-                'prob_dir': 'up' if self.predictions[idx, h_idx] > 0.5 else 'down',
+                'prob': float(self.predictions[idx, h_idx, 2]) if self.is_3class else float(self.predictions[idx, h_idx]),
+                'prob_dir': 'up' if (self.predictions[idx, h_idx, 2] if self.is_3class else self.predictions[idx, h_idx]) > 0.5 else 'down',
                 'actual': 'up' if result == 'win' else ('down' if result == 'lose' else 'unknown'),
             }
 
@@ -536,7 +667,9 @@ class DQNAgent:
         return loss.item()
 
     def save(self, path: str):
-        """保存模型"""
+        """保存模型（含经验回放缓冲区，完整断点恢复）"""
+        # 序列化回放缓冲区：deque -> list of tuples
+        memory_data = list(self.memory.buffer)
         torch.save({
             'q_network': self.q_network.state_dict(),
             'target_network': self.target_network.state_dict(),
@@ -544,11 +677,13 @@ class DQNAgent:
             'epsilon': self.epsilon,
             'step_counter': self.step_counter,
             'loss_history': self.loss_history[-1000:],
+            'memory_buffer': memory_data,          # 经验回放缓冲区
+            'memory_capacity': self.memory.buffer.maxlen,
         }, path)
-        logger.info(f"RL智能体已保存 -> {path}")
+        logger.info(f"RL智能体已保存 -> {path} (buffer={len(memory_data)}条)")
 
     def load(self, path: str):
-        """加载模型"""
+        """加载模型（含经验回放缓冲区，完整断点恢复）"""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.q_network.load_state_dict(checkpoint['q_network'])
         self.target_network.load_state_dict(checkpoint['target_network'])
@@ -556,8 +691,21 @@ class DQNAgent:
         self.epsilon = checkpoint.get('epsilon', self.cfg.epsilon_end)
         self.step_counter = checkpoint.get('step_counter', 0)
         self.loss_history = checkpoint.get('loss_history', [])
-        logger.info(f"RL智能体已加载 <- {path} "
-                     f"(epsilon={self.epsilon:.4f}, step={self.step_counter})")
+
+        # 恢复经验回放缓冲区（兼容旧 checkpoint 无此字段）
+        memory_data = checkpoint.get('memory_buffer', None)
+        if memory_data is not None:
+            capacity = checkpoint.get('memory_capacity', self.cfg.buffer_capacity)
+            self.memory = ReplayBuffer(capacity)
+            for item in memory_data:
+                self.memory.buffer.append(item)
+            logger.info(f"RL智能体已加载 <- {path} "
+                        f"(epsilon={self.epsilon:.4f}, step={self.step_counter}, "
+                        f"buffer={len(self.memory)}条)")
+        else:
+            logger.info(f"RL智能体已加载 <- {path} "
+                        f"(epsilon={self.epsilon:.4f}, step={self.step_counter}, "
+                        f"buffer=未保存(旧checkpoint))")
 
 
 # =============================================================================
@@ -580,7 +728,11 @@ def _detect_device():
 
 
 def _load_model_and_horizons(device):
-    """加载预训练LNN模型 (参数同 predict.py)"""
+    """加载预训练LNN模型 (参数同 predict.py)
+
+    Returns:
+        model, horizons, num_classes
+    """
     from predict import load_model as _pmodel
     return _pmodel(device)
 
@@ -676,20 +828,23 @@ def precompute_predictions(
     device: torch.device,
     batch_size: int = 512,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """在数据集上批量计算模型预测的上涨概率和融合层隐状态
+    """在数据集上批量计算模型预测的概率和融合层隐状态
 
     Args:
         model: 预训练LNN模型 (eval模式)
         dataset_tuple: (X_dict, X_ctx, y)
 
     Returns:
-        predictions: (N, 3) 上涨概率 [p_10m, p_30m, p_60m]
-        hidden_states: (N, hidden_size) 融合层隐状态, hidden_size=config.HIDDEN_SIZE(64)
+        predictions: (N, num_horizons) 二分类 / (N, num_horizons, 3) 三分类
+                    二分类: 上涨概率, 三分类: (下/平/涨)概率
+        hidden_states: (N, hidden_size) 融合层隐状态
     """
     X_dict, X_ctx, _ = dataset_tuple
     model.eval()
 
     n = X_ctx.shape[0]
+    num_horizons = model.output_size
+    num_classes = model.num_classes_per_head
     all_probs = []
     all_hidden = []
 
@@ -705,7 +860,13 @@ def precompute_predictions(
             batch_ctx = torch.FloatTensor(X_ctx[i:end]).to(device)
 
             logits, hidden = model(batch_seqs, batch_ctx, return_hidden=True)
-            probs = torch.sigmoid(logits).cpu().numpy()
+            if num_classes >= 3:
+                # 三分类: (B, H*C) → reshape → softmax → (B, H, C)
+                batch_n = logits.size(0)
+                probs = torch.softmax(logits.view(batch_n, num_horizons, num_classes), dim=-1)
+                probs = probs.cpu().numpy()  # (B, H, C)
+            else:
+                probs = torch.sigmoid(logits).cpu().numpy()  # (B, H)
             all_probs.append(probs)
             all_hidden.append(hidden.cpu().numpy())
 
@@ -735,7 +896,7 @@ def train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None):
 
     # 1. 加载LNN模型
     logger.info("加载预训练LNN模型...")
-    model, horizons = _load_model_and_horizons(device)
+    model, horizons, _ = _load_model_and_horizons(device)
     model.eval()
     logger.info(f"LNN模型加载成功, 预测窗口: {horizons}")
 
@@ -886,7 +1047,10 @@ def train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None):
                 f"最大回撤: {stats['max_drawdown']:>5.1%}"
             )
 
-        # 定期保存 (每50回合)
+        # 每回合保存最新checkpoint (断点恢复用)
+        agent.save(os.path.join(rl_cfg.save_dir, "rl_latest.pth"))
+
+        # 定期保存 (每50回合额外保留编号快照)
         if episode % 50 == 0:
             agent.save(os.path.join(rl_cfg.save_dir, f"rl_checkpoint_ep{episode}.pth"))
 
@@ -1058,12 +1222,12 @@ def _compute_live_state(
     close_arr: np.ndarray,
     hidden_state: np.ndarray,
     state_returns_window: int,
-    config: 'RLConfig',  # 避免与顶层 config 冲突
+    _rl_config: 'RLConfig',  # 避免与顶层 config 冲突
 ) -> np.ndarray:
     """构建实时交易状态向量
 
     Args:
-        probs: (3,) 三个周期上涨概率
+        probs: (3,) 二分类上涨概率 或 (3, 3) 三分类概率[down,neutral,up]
         available_balance: 当前可用余额
         initial_balance: 初始余额
         close_arr: 5min收盘价序列
@@ -1073,7 +1237,17 @@ def _compute_live_state(
     Returns:
         state: (state_dim,) 状态向量
     """
-    confs = np.abs(probs - 0.5) * 2.0
+    if probs.ndim == 2 and probs.shape[-1] >= 3:
+        # 三分类: (3, 3) -> [down, neutral, up]
+        probs_up = probs[:, 2]
+        probs_down = probs[:, 0]
+        probs_flat = np.concatenate([probs_up, probs_down])
+        confs = np.abs(probs_up - probs_down)
+        confs_flat = np.concatenate([confs, confs])
+    else:
+        # 二分类
+        probs_flat = probs
+        confs_flat = np.abs(probs - 0.5) * 2.0
 
     # 最近收益率
     rets = np.diff(np.log(close_arr))
@@ -1088,7 +1262,7 @@ def _compute_live_state(
     vol = float(np.std(rets[-20:])) if len(rets) >= 20 else 0.0
 
     return np.concatenate([
-        probs, confs,
+        probs_flat, confs_flat,
         [available_balance / initial_balance],
         recent_rets, [vol], [0.0],  # progress=0 for live
         hidden_state,
@@ -1101,7 +1275,7 @@ def live_trade(rl_cfg: RLConfig):
 
     # 加载LNN模型
     logger.info("加载预训练LNN模型...")
-    model, horizons = _load_model_and_horizons(device)
+    model, horizons, num_classes = _load_model_and_horizons(device)
     model.eval()
 
     # 加载标准化参数
@@ -1110,9 +1284,11 @@ def live_trade(rl_cfg: RLConfig):
     # 创建RL环境(只需状态维度)
     # 先构建一个最小的环境来获取state_dim
     hidden_size = config.HIDDEN_SIZE
+    _use_3class = num_classes >= 3
+    _dummy_preds = np.zeros((10, 3, 3)) if _use_3class else np.zeros((10, 3))
     dummy_env = TradingEnv(
         dataset_dict={'labels': np.zeros((10, 3)), 'tf_sequences': {}, 'context': np.zeros((10, 6))},
-        predictions=np.zeros((10, 3)),
+        predictions=_dummy_preds,
         hidden_states=np.zeros((10, hidden_size)),
         close_prices=np.ones(10) * 50000,
         rl_cfg=rl_cfg,
@@ -1186,7 +1362,11 @@ def live_trade(rl_cfg: RLConfig):
 
                 with torch.no_grad():
                     logits, hidden = model(tf_tensors, ctx_tensor, return_hidden=True)
-                    probs = torch.sigmoid(logits).cpu().numpy()[0]  # (3,)
+                    num_h = len(horizons)
+                    if _use_3class:
+                        probs = torch.softmax(logits.view(1, num_h, num_classes), dim=-1).cpu().numpy()[0]  # (H, C)
+                    else:
+                        probs = torch.sigmoid(logits).cpu().numpy()[0]  # (H,)
                     hidden_state = hidden.cpu().numpy()[0]          # (hidden_size,)
 
                 current_time_str = pd.Timestamp.now()
@@ -1218,11 +1398,19 @@ def live_trade(rl_cfg: RLConfig):
                 print()
                 print("=" * 60)
                 print(f"  LNN预测:")
-                confs = np.abs(probs - 0.5) * 2.0
                 for i, h in enumerate([10, 30, 60]):
-                    d = "涨" if probs[i] > 0.5 else "跌"
-                    c = confs[i]
-                    print(f"    [{h:>2}分钟] {d} 概率={probs[i]:.4f} 置信度={c:.4f}")
+                    if _use_3class:
+                        prob_down = float(probs[i, 0])
+                        prob_neutral = float(probs[i, 1])
+                        prob_up = float(probs[i, 2])
+                        pred_cls = int(probs[i].argmax())
+                        d = ["跌", "平", "涨"][pred_cls]
+                        c = float(probs[i].max())
+                        print(f"    [{h:>2}分钟] {d} 跌={prob_down:.3f} 平={prob_neutral:.3f} 涨={prob_up:.3f} 置信度={c:.4f}")
+                    else:
+                        d = "涨" if probs[i] > 0.5 else "跌"
+                        c = abs(probs[i] - 0.5) * 2
+                        print(f"    [{h:>2}分钟] {d} 概率={probs[i]:.4f} 置信度={c:.4f}")
 
                 if horizon is None:
                     print(f"  RL决策: 不交易 (skip)")
@@ -1240,8 +1428,11 @@ def live_trade(rl_cfg: RLConfig):
                     print(f"  潜在收益: +{potential_profit:.1f} USDT | 潜在亏损: -{bet:.1f} USDT")
 
                     # 执行开仓：从可用余额扣除本金
-                    # 注意：资金从 total_balance 中扣减（进入持仓冻结）
-                    # total_balance 在结算时恢复
+                    h_idx = {10: 0, 30: 1, 60: 2}[horizon]
+                    if _use_3class:
+                        pred_prob = float(probs[h_idx, 2])  # 上涨概率
+                    else:
+                        pred_prob = float(probs[h_idx])
                     open_positions.append({
                         'open_time': current_time_ts,
                         'entry_price': current_price,
@@ -1249,7 +1440,7 @@ def live_trade(rl_cfg: RLConfig):
                         'direction': direction,
                         'bet': bet,
                         'profit_rate': rl_cfg.profit_rates[horizon],
-                        'pred_prob': float(probs[{10: 0, 30: 1, 60: 2}[horizon]]),
+                        'pred_prob': pred_prob,
                     })
                     total_balance -= bet
                     locked_balance += bet
@@ -1267,15 +1458,18 @@ def live_trade(rl_cfg: RLConfig):
                 # ============================================================
                 # 7. 记录交易
                 # ============================================================
+                _probs_10m = float(probs[0, 2]) if _use_3class else float(probs[0])
+                _probs_30m = float(probs[1, 2]) if _use_3class else float(probs[1])
+                _probs_60m = float(probs[2, 2]) if _use_3class else float(probs[2])
                 trade_record = {
                     'time': str(current_time_str),
                     'price': current_price,
                     'total_balance': total_balance,
                     'available_balance': available_balance,
                     'locked_balance': locked_balance,
-                    'probs_10m': float(probs[0]),
-                    'probs_30m': float(probs[1]),
-                    'probs_60m': float(probs[2]),
+                    'probs_10m': _probs_10m,
+                    'probs_30m': _probs_30m,
+                    'probs_60m': _probs_60m,
                     'action': horizon,
                     'direction': direction,
                     'bet': bet,
@@ -1344,9 +1538,11 @@ def live_train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None,
     # 1. 加载 LNN 模型和标准化参数
     # --------------------------------------------------
     logger.info("加载预训练LNN模型...")
-    model, horizons = _load_model_and_horizons(device)
+    model, horizons, num_classes = _load_model_and_horizons(device)
     model.eval()
-    logger.info(f"LNN模型加载成功, 预测窗口: {horizons}")
+    _use_3class_live = num_classes >= 3
+    logger.info(f"LNN模型加载成功, 预测窗口: {horizons}, " +
+                 f"{'三' if _use_3class_live else '二'}分类")
 
     norm_data = _load_norm_stats()
 
@@ -1354,9 +1550,10 @@ def live_train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None,
     # 2. 创建 DQN 智能体
     # --------------------------------------------------
     hidden_size = config.HIDDEN_SIZE
+    _dummy_preds_live = np.zeros((10, 3, 3)) if _use_3class_live else np.zeros((10, 3))
     dummy_env = TradingEnv(
         dataset_dict={'labels': np.zeros((10, 3)), 'tf_sequences': {}, 'context': np.zeros((10, 6))},
-        predictions=np.zeros((10, 3)),
+        predictions=_dummy_preds_live,
         hidden_states=np.zeros((10, hidden_size)),
         close_prices=np.ones(10) * 50000,
         rl_cfg=rl_cfg,
@@ -1419,7 +1616,11 @@ def live_train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None,
 
                 with torch.no_grad():
                     logits, hidden = model(tf_tensors, ctx_tensor, return_hidden=True)
-                    probs = torch.sigmoid(logits).cpu().numpy()[0]  # (3,)
+                    num_h = len(horizons)
+                    if _use_3class_live:
+                        probs = torch.softmax(logits.view(1, num_h, num_classes), dim=-1).cpu().numpy()[0]  # (H, C)
+                    else:
+                        probs = torch.sigmoid(logits).cpu().numpy()[0]  # (H,)
                     hidden_state = hidden.cpu().numpy()[0]          # (hidden_size,)
 
                 # ============================================================
@@ -1503,8 +1704,13 @@ def live_train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None,
                 print()
                 print("=" * 60)
                 for i, h in enumerate([10, 30, 60]):
-                    d = "涨" if probs[i] > 0.5 else "跌"
-                    print(f"  LNN [{h:>2}分钟]: {d} 概率={probs[i]:.4f}")
+                    if _use_3class_live:
+                        pred_cls = int(probs[i].argmax())
+                        d = ["跌", "平", "涨"][pred_cls]
+                        print(f"  LNN [{h:>2}分钟]: {d} 跌={probs[i,0]:.3f} 平={probs[i,1]:.3f} 涨={probs[i,2]:.3f}")
+                    else:
+                        d = "涨" if probs[i] > 0.5 else "跌"
+                        print(f"  LNN [{h:>2}分钟]: {d} 概率={probs[i]:.4f}")
 
                 if horizon is None:
                     print(f"  RL决策: SKIP (epsilon={agent.epsilon:.3f})")
@@ -1557,7 +1763,7 @@ def live_train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None,
                     'action': 'skip' if horizon is None else
                               f'{horizon}min_{"long" if direction == 0 else "short"}',
                     'bet': bet if horizon is not None else 0,
-                    'probs': [float(probs[i]) for i in range(3)],
+                    'probs': [float(probs[i, 2]) if _use_3class_live else float(probs[i]) for i in range(3)],
                     'epsilon': agent.epsilon,
                     'loss': avg_loss,
                     'step': agent.step_counter,
@@ -1606,6 +1812,9 @@ def live_train_rl(rl_cfg: RLConfig, checkpoint_path: Optional[str] = None,
         if open_positions:
             lost_bet = sum(p['bet'] for p in open_positions)
             logger.warning(f"停止时有 {len(open_positions)} 笔未结算持仓, 本金亏损 {lost_bet:.2f} USDT")
+
+
+def _prepare_live_features(timeframe_data, fetcher):
     """为实时交易准备LNN模型输入特征 (同 predict.py)"""
     periods = list(config.TIMEFRAMES.keys())
 
@@ -1701,7 +1910,7 @@ def main():
 
     elif args.mode == 'eval':
         device = _detect_device()
-        model, _ = _load_model_and_horizons(device)
+        model, _, _ = _load_model_and_horizons(device)
         _, _, test_data, close_prices = prepare_rl_dataset()
         test_preds, test_hidden = precompute_predictions(model, test_data, device)
 
