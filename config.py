@@ -56,7 +56,7 @@ BATCH_SIZE = 512            # 批处理大小(USE_AUTO_BATCH_SIZE=False时使用
 USE_AUTO_BATCH_SIZE = False  # 自动调整BATCH_SIZE根据可用内存/显存
 GRADIENT_ACCUMULATION_STEPS = 2  # 梯度累积步数，等效 batch_size = BATCH_SIZE × GRADIENT_ACCUMULATION_STEPS
 EPOCHS = 200                # 训练轮数上限
-MAX_TRAIN_SECONDS = 18000   # 最大训练时长(秒), 默认5小时(预留余量给测试+上传)
+MAX_TRAIN_SECONDS = 14400   # 最大训练时长(秒), 默认4小时(预留余量给测试+上传)
 TRAIN_STOP_MODE = 'time_only'    # 训练停止模式: 'epochs_only', 'time_only', 'both', 'infinite'
                             # - 'epochs_only': 仅由EPOCHS控制
                             # - 'time_only': 仅由MAX_TRAIN_SECONDS控制
