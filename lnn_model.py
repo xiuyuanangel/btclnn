@@ -461,7 +461,7 @@ class MultiTimeframeLNN(nn.Module):
 
         # 分类头(独立多输出)
         # 二分类: 每头输出1个logit(配合 BCEWithLogitsLoss)
-        # 三分类: 每头输出3个logit(配合 CrossEntropyLoss, ignore_index=1=中性)
+        # 三分类: 每头输出3个logit(配合 CrossEntropyLoss, 全量涨/跌/平)
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size // 2),

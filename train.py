@@ -534,10 +534,9 @@ def train_model():
             # 三分类模式: CrossEntropyLoss with ignore_index=1 (中性)
             # 每个horizon独立计算class weights
             class FocalCrossEntropyLoss(nn.Module):
-                def __init__(self, gamma=0.5, per_horizon_weights=None, ignore_index=1):
+                def __init__(self, gamma=0.5, per_horizon_weights=None):
                     super().__init__()
                     self.gamma = gamma
-                    self.ignore_index = ignore_index
                     if per_horizon_weights is not None:
                         # per_horizon_weights: list of shape (num_classes,) per horizon
                         self.register_buffer(
@@ -561,34 +560,33 @@ def train_model():
                         logits_h = logits_3d[:, h, :]  # (batch, C)
                         target_h = target_long[:, h]    # (batch,)
 
+                        # 三分类全量计算(含涨/跌/平), 权重由 per_horizon_weights 控制
                         ce = F.cross_entropy(
                             logits_h, target_h,
                             weight=self.weights[h].to(target.device),
-                            ignore_index=self.ignore_index,
                             reduction='none'
                         )
                         pt = torch.exp(-ce)
                         focal_weight = (1 - pt) ** self.gamma
-                        # 只对非ignore的样本计算loss
-                        valid_mask = (target_h != self.ignore_index)
-                        if valid_mask.sum() > 0:
-                            total_loss += (focal_weight[valid_mask] * ce[valid_mask]).mean()
+                        total_loss += (focal_weight * ce).mean()
                     return total_loss / max(_num_horizons, 1)
 
-            # 计算每个horizon每类别的权重
+            # 计算每个horizon每类别的权重(含中性)
             _per_horizon_weights = []
             for h_idx in range(_num_horizons):
                 class_counts = []
                 for c in range(_num_classes):
                     class_counts.append(int((_train_labels[:, h_idx] == c).sum()))
                 total = sum(class_counts)
-                # 权重 = 总数 / (类别数 * 该类别数), 忽略中性类(weight=0)
+                # 权重 = 总数 / (类别数 * 该类别数)
+                # 中性类(c=1)乘以0.5系数, 避免中性样本数量大时淹没方向性信号
                 weights = []
                 for c in range(_num_classes):
-                    if c == 1:  # 中性类, 权重为0(被ignore_index忽略)
-                        weights.append(0.0)
-                    elif class_counts[c] > 0:
-                        weights.append(total / (_num_classes * class_counts[c]))
+                    if class_counts[c] > 0:
+                        w = total / (_num_classes * class_counts[c])
+                        if c == 1:
+                            w *= 0.5  # 中性类降权
+                        weights.append(w)
                     else:
                         weights.append(1.0)
                 _per_horizon_weights.append(weights)
@@ -599,10 +597,9 @@ def train_model():
             criterion = FocalCrossEntropyLoss(
                 gamma=config.FOCAL_GAMMA,
                 per_horizon_weights=_per_horizon_weights,
-                ignore_index=1,
             )
             if fold_idx == 0:
-                logger.info(f"使用 FocalCrossEntropyLoss(ignore_index=1=中性, gamma={config.FOCAL_GAMMA})")
+                logger.info(f"使用 FocalCrossEntropyLoss(全三分类涨/跌/平, gamma={config.FOCAL_GAMMA})")
         else:
             # 二分类模式(旧逻辑): FocalLoss + BCEWithLogits
             _pos_weights = []
@@ -712,10 +709,9 @@ def train_model():
                     preds = logits_3d.argmax(dim=-1)  # (batch, H)
                     labels_long = labels.long()
                     for h in range(_num_horizons):
-                        # 只统计非中性(非 label=1)样本的准确率
-                        non_neutral = (labels_long[:, h] != 1)
-                        n_correct = (preds[non_neutral, h] == labels_long[non_neutral, h]).sum().item()
-                        n_total = non_neutral.sum().item()
+                        # 全口径三分类准确率 (含涨/跌/平)
+                        n_correct = (preds[:, h] == labels_long[:, h]).sum().item()
+                        n_total = labels_long[:, h].size(0)
                         _train_horizon_correct[h] += n_correct
                         _train_horizon_total[h] += n_total
                     train_correct = sum(_train_horizon_correct[h] for h in range(_num_horizons))
@@ -774,9 +770,9 @@ def train_model():
                         _batch_correct = 0
                         _batch_total = 0
                         for h in range(_num_horizons):
-                            non_neutral = (labels_long[:, h] != 1)
-                            n_correct = (preds[non_neutral, h] == labels_long[non_neutral, h]).sum().item()
-                            n_total = non_neutral.sum().item()
+                            # 全口径三分类准确率 (含涨/跌/平)
+                            n_correct = (preds[:, h] == labels_long[:, h]).sum().item()
+                            n_total = labels_long[:, h].size(0)
                             _val_horizon_correct[h] += n_correct
                             _val_horizon_total[h] += n_total
                             _batch_correct += n_correct
@@ -890,9 +886,9 @@ def train_model():
                 preds = logits_3d.argmax(dim=-1)
                 labels_long = labels.long()
                 for h in range(_num_horizons):
-                    non_neutral = (labels_long[:, h] != 1)
-                    n_correct = (preds[non_neutral, h] == labels_long[non_neutral, h]).sum().item()
-                    n_total = non_neutral.sum().item()
+                    # 全口径三分类准确率 (含涨/跌/平)
+                    n_correct = (preds[:, h] == labels_long[:, h]).sum().item()
+                    n_total = labels_long[:, h].size(0)
                     _test_h_correct[h] += n_correct
                     _test_h_total[h] += n_total
                     test_correct += n_correct
@@ -915,19 +911,28 @@ def train_model():
 
     # 整体指标
     if _num_classes >= 3:
-        # 三分类: 忽略中性(label=1), 统计涨跌二分类的 precision/recall/F1
+        # 三分类: 全量统计 (涨/平/跌)
         all_preds_flat = all_logits.reshape(-1, _num_horizons, _num_classes).argmax(axis=-1)
         all_labels_flat = all_labels.astype(int)
 
+        # 涨跌方向性统计 (非中性样本)
+        non_neutral = (all_labels_flat != 1)
         tp = int(((all_preds_flat == 2) & (all_labels_flat == 2)).sum())
         fp = int(((all_preds_flat == 2) & (all_labels_flat == 0)).sum())
         tn = int(((all_preds_flat == 0) & (all_labels_flat == 0)).sum())
         fn = int(((all_preds_flat == 0) & (all_labels_flat == 2)).sum())
+        _n_directional_correct = tp + tn
+        _n_directional_total = int(non_neutral.sum())
 
-        # 中性样本相关统计
+        # 中性样本统计
         _n_neutral_true = int((all_labels_flat == 1).sum())
+        _n_neutral_correct = int(((all_preds_flat == 1) & (all_labels_flat == 1)).sum())
         _n_neutral_pred = int((all_preds_flat == 1).sum())
-        logger.info(f"中性样本: 真实={_n_neutral_true}, 预测={_n_neutral_pred}")
+        _neutral_recall = _n_neutral_correct / _n_neutral_true if _n_neutral_true > 0 else 0
+        _directional_acc = _n_directional_correct / _n_directional_total if _n_directional_total > 0 else 0
+
+        logger.info(f"中性样本: 真实={_n_neutral_true} 预测={_n_neutral_pred} "
+                     f"命中={_n_neutral_correct} Recall={_neutral_recall:.4f}")
     else:
         # 二分类: 原始逻辑
         tp = int(((all_logits > 0.5) & (all_labels == 1)).sum())
@@ -940,6 +945,8 @@ def train_model():
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
     logger.info(f"测试集Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
+    if _num_classes >= 3:
+        logger.info(f"  其中 方向Acc(涨/跌): {_directional_acc:.4f} | 中性Recall: {_neutral_recall:.4f}")
     logger.info(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
     logger.info(f"混淆矩阵: TP={tp} FP={fp} TN={tn} FN={fn}")
     # 各窗口独立指标
@@ -956,6 +963,14 @@ def train_model():
             _h_fn = int(((_h_pred == 0) & (_h_label == 2)).sum())
             _h_neutral_pred = int((_h_pred == 1).sum())
             _h_neutral_true = int((_h_label == 1).sum())
+            _h_neutral_correct = int(((_h_pred == 1) & (_h_label == 1)).sum())
+            _h_neutral_recall = _h_neutral_correct / _h_neutral_true if _h_neutral_true > 0 else 0
+            _h_directional_correct = _h_tp + _h_tn
+            _h_directional_total = int((_h_label != 1).sum())
+            _h_directional_acc = _h_directional_correct / _h_directional_total if _h_directional_total > 0 else 0
+            _neutral_info = (f" 方向Acc:{_h_directional_acc:.4f} "
+                             f"中性Recall:{_h_neutral_recall:.4f} "
+                             f"中性(真/预):{_h_neutral_true}/{_h_neutral_pred}")
         else:
             _h_pred = all_logits[:, h_idx]
             _h_label = all_labels[:, h_idx]
@@ -963,9 +978,9 @@ def train_model():
             _h_fp = int(((_h_pred > 0.5) & (_h_label == 0)).sum())
             _h_tn = int(((_h_pred <= 0.5) & (_h_label == 0)).sum())
             _h_fn = int(((_h_pred <= 0.5) & (_h_label == 1)).sum())
+            _neutral_info = ""
         _h_prec = _h_tp / (_h_tp + _h_fp) if (_h_tp + _h_fp) > 0 else 0
         _h_rec = _h_tp / (_h_tp + _h_fn) if (_h_tp + _h_fn) > 0 else 0
-        _neutral_info = f" 中性(真/预):{_h_neutral_true}/{_h_neutral_pred}" if _num_classes >= 3 else ""
         logger.info(f"  [{h_name}min窗口] Acc:{_h_acc:.4f} Prec:{_h_prec:.4f} Rec:{_h_rec:.4f} "
                      f"TP={_h_tp} FP={_h_fp} TN={_h_tn} FN={_h_fn}{_neutral_info}")
     logger.info(f"最佳模型来自Epoch {_best_ckpt['epoch']} (Fold {_best_ckpt.get('fold_idx', 0)+1})")

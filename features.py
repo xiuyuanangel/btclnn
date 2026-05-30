@@ -93,7 +93,7 @@ def compute_labels(df, horizons=None, source_period_minutes=5):
     支持二分类(涨/跌)和三分类(涨/平/跌)两种模式。
     三分类模式下:
       - label=0: 跌(DOWN),   未来收益 < -threshold
-      - label=1: 平(NEUTRAL), |未来收益| <= threshold (小波动, 训练时被CrossEntropyLoss忽略)
+      - label=1: 平(NEUTRAL), |未来收益| <= threshold (小波动)
       - label=2: 涨(UP),     未来收益 > +threshold
 
     Args:

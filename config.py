@@ -29,9 +29,9 @@ PREDICTION_HORIZONS = [10, 30, 60]
 # 标签来源: 用5min粒度的close计算各horizon后的价格变化
 LABEL_SOURCE_PERIOD = "5min"  # 标签基于该周期的K线数据计算
 LABEL_SMOOTH_WINDOW = 3       # 未来价格平滑窗口(单位: bar)
-LABEL_MIN_RETURN = 0.003     # 5min 标签最小收益门限(0.08%)
+LABEL_MIN_RETURN = 0.001     # 5min 标签最小收益门限(0.08%)
 LABEL_DROP_NEUTRAL = True     # 是否丢弃噪声中性样本(2分类模式) — 3分类模式下自动保留为 label=1
-LABEL_NUM_CLASSES = 3         # 标签类别数: 2=涨/跌二分类, 3=涨/平/跌三分类(平类被忽略以提高胜率)
+LABEL_NUM_CLASSES = 3         # 标签类别数: 2=涨/跌二分类, 3=涨/平/跌三分类(全量训练含中性)
 
 # ==================== 多周期配置 ====================
 # 每个周期独立编码, 覆盖微观到宏观的不同时间尺度
