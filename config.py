@@ -2,6 +2,9 @@
 
 import os
 
+# ==================== 可复现性 ====================
+RANDOM_SEED = 42            # 全局随机种子(python/numpy/torch), 保证训练可复现
+
 # ==================== 交易对配置 ====================
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]  # 支持多币种训练，增加样本数量
 CONTRACT_TYPE = "swap"  # 永续合约

@@ -2,6 +2,7 @@
 
 import os
 import time
+import random
 import logging
 import importlib
 
@@ -27,6 +28,52 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
+
+# ==================== 全局随机种子(可复现性) ====================
+SEED = getattr(config, 'RANDOM_SEED', 42)
+
+
+def set_global_seed(seed=SEED):
+    """设置全局随机种子, 保证多次运行结果可复现
+
+    覆盖 python hash / random / numpy / torch(CPU+CUDA)。
+    CUDA 相关设置带异常保护, CPU-only 环境(如GitHub Actions)不会报错。
+
+    Args:
+        seed: 随机种子, 默认取 config.RANDOM_SEED 或 42
+    """
+    seed = int(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    _cuda_note = ''
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            _cuda_note = ', CUDA确定性模式已开启(cudnn.deterministic=True)'
+        except Exception as e:
+            # CPU-only / 无cudnn 环境不应因此中断训练
+            logger.warning(f"设置CUDA确定性模式失败(忽略): {e}")
+    logger.info(f"全局随机种子已设置: seed={seed}{_cuda_note}")
+
+
+def _seed_worker(worker_id):
+    """DataLoader worker 种子初始化(num_workers>0 时生效)
+
+    Args:
+        worker_id: DataLoader 分配的 worker 序号
+    """
+    worker_seed = (torch.initial_seed() + worker_id) % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+# 在构建模型/数据之前立即固定种子
+set_global_seed(SEED)
 
 
 def _strip_module_prefix(state_dict):
@@ -82,6 +129,10 @@ def _load_best_fallback(model, device):
     1. 最终模型 lnn_final.pth (最后训练保存的完整状态)
     2. 最佳模型 lnn_best.pth (val_loss最低)
     3. 各折模型 lnn_best_fold{idx}.pth
+
+    Returns:
+        dict | None: 成功加载权重的那个checkpoint字典(供后续恢复
+        optimizer/scheduler/训练进度使用); 未加载到任何模型时返回 None。
     """
     import glob
 
@@ -92,7 +143,7 @@ def _load_best_fallback(model, device):
         if 'timeframe_configs' in ckpt_config:
             _safe_load_state_dict(model, final_ckpt['model_state_dict'], device)
             logger.info(f"从最终模型 {config.MODEL_PATH_FINAL} 加载权重作为初始化")
-            return
+            return final_ckpt
         else:
             logger.info("最终模型架构不匹配")
     except FileNotFoundError:
@@ -107,7 +158,7 @@ def _load_best_fallback(model, device):
         if 'timeframe_configs' in ckpt_config:
             _safe_load_state_dict(model, best_ckpt['model_state_dict'], device)
             logger.info("从最佳模型加载权重作为初始化")
-            return
+            return best_ckpt
         else:
             logger.info("检测到旧架构checkpoint，尝试其他模型...")
     except FileNotFoundError:
@@ -127,13 +178,150 @@ def _load_best_fallback(model, device):
             if 'timeframe_configs' in ckpt_config:
                 _safe_load_state_dict(model, fold_ckpt['model_state_dict'], device)
                 logger.info(f"从折模型 {fold_path} 加载权重作为初始化")
-                return
+                return fold_ckpt
             else:
                 logger.info(f"折模型 {fold_path} 架构不匹配")
         except Exception as e:
             logger.warning(f"加载折模型 {fold_path} 失败: {e}")
 
     logger.info("未找到可加载的模型，从头训练新模型")
+    return None
+
+
+def _check_optimizer_compatible(optimizer, opt_state):
+    """校验checkpoint中的optimizer状态与当前optimizer是否形状兼容
+
+    只做只读校验, 不修改任何状态。不兼容时抛出 ValueError, 由调用方降级处理。
+
+    Args:
+        optimizer: 当前新建的优化器
+        opt_state: checkpoint 中的 optimizer_state_dict
+
+    Raises:
+        ValueError: param_group 数量、参数个数或动量张量形状不一致
+    """
+    cur_state = optimizer.state_dict()
+    cur_groups = cur_state.get('param_groups', [])
+    ckpt_groups = opt_state.get('param_groups', [])
+    if len(cur_groups) != len(ckpt_groups):
+        raise ValueError(
+            f"param_groups数量不一致(当前{len(cur_groups)} vs checkpoint{len(ckpt_groups)})"
+        )
+    for gi, (cur_g, ckpt_g) in enumerate(zip(cur_groups, ckpt_groups)):
+        n_cur = len(cur_g.get('params', []))
+        n_ckpt = len(ckpt_g.get('params', []))
+        if n_cur != n_ckpt:
+            raise ValueError(
+                f"param_group[{gi}]参数个数不一致(当前{n_cur} vs checkpoint{n_ckpt})"
+            )
+
+    # 逐参数比对动量张量形状(Adam: exp_avg / exp_avg_sq)
+    cur_params = [p for g in optimizer.param_groups for p in g['params']]
+    saved_state = opt_state.get('state', {}) or {}
+    for idx, param in enumerate(cur_params):
+        entry = saved_state.get(idx)
+        if not entry:
+            continue
+        for k, v in entry.items():
+            if torch.is_tensor(v) and v.dim() > 0 and tuple(v.shape) != tuple(param.shape):
+                raise ValueError(
+                    f"参数[{idx}]的'{k}'形状不匹配(当前{tuple(param.shape)} vs checkpoint{tuple(v.shape)})"
+                )
+
+
+def _restore_train_state(ckpt, optimizer, scheduler, expected_total_steps=None):
+    """断点续训: 恢复 optimizer / scheduler 状态与训练进度
+
+    向后兼容: checkpoint 缺少相关key或形状不兼容时, 自动降级为
+    "仅加载权重 + 全新optimizer"(即修复前的行为), 只打印warning, 不抛异常。
+
+    Args:
+        ckpt: _load_best_fallback 返回的checkpoint字典, 可能为 None
+        optimizer: 当前新建的优化器
+        scheduler: 当前新建的 OneCycleLR 调度器
+        expected_total_steps: 当前配置下的计划总步数(仅用于一致性告警)
+
+    Returns:
+        tuple[int, int]: (start_epoch, start_step); 全新训练时为 (0, 0)
+    """
+    if not isinstance(ckpt, dict):
+        logger.info("Starting fresh training | 全新训练(无可续训的checkpoint)")
+        return 0, 0
+
+    # ---- 1. 恢复优化器状态(动量/二阶矩/LR) ----
+    opt_state = ckpt.get('optimizer_state_dict')
+    opt_restored = False
+    if opt_state is None:
+        logger.warning(
+            "checkpoint中缺少 optimizer_state_dict(旧版模型), 降级为新建优化器, "
+            "本次训练的动量与LR调度将从头开始"
+        )
+    else:
+        try:
+            _check_optimizer_compatible(optimizer, opt_state)
+            optimizer.load_state_dict(opt_state)
+            opt_restored = True
+            logger.info("已恢复 optimizer 状态(动量/自适应二阶矩)")
+        except Exception as e:
+            logger.warning(f"optimizer状态与当前模型不兼容, 降级为新建优化器: {e}")
+
+    # ---- 2. 恢复LR调度器状态(OneCycleLR 的 last_epoch/total_steps) ----
+    sch_state = ckpt.get('scheduler_state_dict')
+    sch_restored = False
+    if sch_state is None:
+        logger.warning("checkpoint中缺少 scheduler_state_dict(旧版模型), LR调度将从头开始warmup")
+    elif not opt_restored:
+        logger.warning("optimizer未恢复, 为避免LR轨迹与权重错配, 跳过scheduler状态恢复")
+    else:
+        try:
+            saved_total = sch_state.get('total_steps')
+            scheduler.load_state_dict(sch_state)
+            sch_restored = True
+            cur_total = int(getattr(scheduler, 'total_steps', 0) or 0)
+            cur_last = int(getattr(scheduler, 'last_epoch', 0) or 0)
+            logger.info(
+                f"已恢复 scheduler 状态: last_step={cur_last}/{cur_total} "
+                f"(LR轨迹从上次断点继续, 不重启warmup)"
+            )
+            if expected_total_steps and saved_total and int(saved_total) != int(expected_total_steps):
+                logger.warning(
+                    f"scheduler总步数与本次配置不一致(checkpoint={saved_total}, "
+                    f"当前计划={expected_total_steps}), 沿用checkpoint轨迹以保持LR连续"
+                )
+            if cur_total and cur_last >= cur_total - 1:
+                logger.warning(
+                    f"OneCycleLR 已走完全部 {cur_total} 步, 本次续训将保持末端LR"
+                    f"(不会重启warmup, 也不会因步数越界报错)"
+                )
+        except Exception as e:
+            logger.warning(f"scheduler状态恢复失败, LR调度将从头开始: {e}")
+
+    # ---- 3. 训练进度(epoch / global_step) ----
+    # 仅在 optimizer+scheduler 均成功恢复时才继承进度计数,
+    # 否则(旧checkpoint)保持修复前行为: 从 0 重新计数, 避免"LR重启warmup但预算被砍"。
+    if not (opt_restored and sch_restored):
+        logger.info("Starting fresh training | 仅继承权重, epoch/global_step 从0开始计数")
+        return 0, 0
+
+    start_epoch = ckpt.get('completed_epochs')
+    if start_epoch is None:
+        # 旧checkpoint只有 'epoch'(保存时为 epoch+1), 容忍1轮误差
+        start_epoch = ckpt.get('epoch', 0)
+    try:
+        start_epoch = max(0, int(start_epoch))
+    except (TypeError, ValueError):
+        start_epoch = 0
+
+    start_step = ckpt.get('global_step')
+    if start_step is None:
+        start_step = int(getattr(scheduler, 'last_epoch', 0) or 0)
+    try:
+        start_step = max(0, int(start_step))
+    except (TypeError, ValueError):
+        start_step = 0
+
+    logger.info(f"Resuming training from epoch={start_epoch}, global_step={start_step}")
+    return start_epoch, start_step
 
 
 def train_model():
@@ -462,13 +650,16 @@ def train_model():
                 logger.info(f"  跨周期注意力头数: {_cross_attn_heads}")
 
         # 从GitHub Release下载最新模型作为初始化(仅第0折/非CV模式)
+        # _resume_ckpt: 续训用的完整checkpoint(含optimizer/scheduler状态), 无则为None
+        # Release下载与本地checkpoints两条路径最终都走 _load_best_fallback, 续训逻辑统一生效
+        _resume_ckpt = None
         if fold_idx == 0 or not _use_cv:
             from predict import download_release_model as _dl_release
             if _dl_release():
                 logger.info("尝试加载Release下载的模型...")
             else:
                 logger.info("尝试从checkpoints加载模型...")
-            _load_best_fallback(model, device)
+            _resume_ckpt = _load_best_fallback(model, device)
 
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
@@ -494,8 +685,12 @@ def train_model():
                 f"梯度累积: {_accum_steps} 步, "
                 f"等效batch_size={_effective_batch_size} × {_accum_steps} = {_effective_batch_size_accum}"
             )
-        _dl_kwargs = {'num_workers': 0, 'pin_memory': False}
-        train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, **_dl_kwargs)
+        _dl_kwargs = {'num_workers': 0, 'pin_memory': False, 'worker_init_fn': _seed_worker}
+        # 固定 shuffle 采样顺序(当前 num_workers=0, 全局种子已足够;
+        # 显式generator保证每折的打乱顺序与运行历史无关, 可复现)
+        _dl_generator = torch.Generator()
+        _dl_generator.manual_seed(SEED + fold_idx)
+        train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, generator=_dl_generator, **_dl_kwargs)
         val_loader = DataLoader(val_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
         test_loader = DataLoader(test_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
 
@@ -524,6 +719,20 @@ def train_model():
             anneal_strategy=config.ONECYCLE_ANNEAL_STRATEGY,
             final_div_factor=config.ONECYCLE_FINAL_DIV_FACTOR,
         )
+
+        # ---- 断点续训: 恢复optimizer/scheduler状态与训练进度 ----
+        # 必须在 optimizer/scheduler 创建之后执行(权重已在上面加载完毕)
+        _start_epoch, _start_step = _restore_train_state(
+            _resume_ckpt, optimizer, scheduler,
+            expected_total_steps=steps_per_epoch * config.EPOCHS,
+        )
+        if _use_epoch_limit and _start_epoch >= _max_epochs:
+            logger.warning(
+                f"续训起点 epoch={_start_epoch} 已达 EPOCHS上限({_max_epochs}), "
+                f"为避免本次run空转, 将从 epoch={max(0, _max_epochs - 1)} 继续; "
+                f"如需继续长训请调大 config.EPOCHS"
+            )
+            _start_epoch = max(0, _max_epochs - 1)
 
         # 损失函数: 二分类用 FocalLoss(BCEWithLogits), 三分类用 FocalCrossEntropy(ignore_index=1)
         _train_labels = train_data[2]
@@ -649,7 +858,10 @@ def train_model():
         # ---- CV 各折训练循环 ----
         best_val_loss = float('inf')
         patience_counter = 0
-        epoch = 0
+        # 续训时从上次断点的 epoch/global_step 继续累计(全新训练为0)
+        epoch = _start_epoch
+        global_step = _start_step
+        _sched_exhausted = False  # OneCycleLR 步数用尽标记, 用尽后保持末端LR
         fold_start_time = time.time()
 
         if fold_idx == 0:
@@ -735,7 +947,18 @@ def train_model():
                             _last_grad_norm += _p.grad.norm().item() ** 2
                     _last_grad_norm = _last_grad_norm ** 0.5
                     optimizer.step()
-                    scheduler.step()
+                    global_step += 1
+                    # OneCycleLR 走完 total_steps 后 step() 会抛 ValueError,
+                    # 续训场景需保持末端LR继续训练而非崩溃
+                    if not _sched_exhausted:
+                        try:
+                            scheduler.step()
+                        except ValueError as _sched_err:
+                            _sched_exhausted = True
+                            logger.warning(
+                                f"LR调度已走完全部步数(total_steps="
+                                f"{getattr(scheduler, 'total_steps', '?')}), 后续保持当前LR: {_sched_err}"
+                            )
                     optimizer.zero_grad()
 
             train_loss /= max(train_total, 1)
@@ -813,7 +1036,10 @@ def train_model():
                 _fold_model_path = config.MODEL_PATH.replace('.pth', f'_fold{fold_idx}.pth')
                 torch.save({
                     'epoch': epoch + 1,
+                    'completed_epochs': epoch,   # 已完成的epoch数(续训起点, 无off-by-one)
+                    'global_step': global_step,  # 已完成的optimizer步数(与scheduler对齐)
                     'fold_idx': fold_idx,
+                    'use_cv': _use_cv,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
@@ -986,9 +1212,35 @@ def train_model():
     logger.info(f"最佳模型来自Epoch {_best_ckpt['epoch']} (Fold {_best_ckpt.get('fold_idx', 0)+1})")
 
     # ==================== 保存最佳模型用于断点续训/Release ====================
-    torch.save({
+    # 关键: 必须连同 optimizer/scheduler/进度 一起落盘, 否则下一轮run会
+    # 新建optimizer并重启OneCycleLR warmup, 跨run训练无法接成连续轨迹。
+    # 这里取 _best_ckpt 的优化器/调度器状态(与所保存权重来自同一时刻),
+    # 保证权重与LR轨迹严格对应; 缺失时回退到当前实时状态。
+    _resume_opt_state = _best_ckpt.get('optimizer_state_dict') or optimizer.state_dict()
+    _resume_sch_state = _best_ckpt.get('scheduler_state_dict') or scheduler.state_dict()
+    _resume_completed_epochs = _best_ckpt.get('completed_epochs')
+    if _resume_completed_epochs is None:
+        _resume_completed_epochs = max(0, int(_best_ckpt.get('epoch', 1)) - 1)
+    _resume_global_step = _best_ckpt.get('global_step')
+    if _resume_global_step is None:
+        # 旧checkpoint无step计数: 用 scheduler 的已走步数兜底(等价进度信息)
+        _resume_global_step = int(getattr(scheduler, 'last_epoch', 0) or 0)
+
+    _resume_meta = {
         'epoch': _best_ckpt['epoch'],
+        'completed_epochs': int(_resume_completed_epochs),
+        'global_step': int(_resume_global_step),
         'fold_idx': _best_ckpt.get('fold_idx', 0),
+        'use_cv': _use_cv,
+        'n_folds': _n_folds,
+        'optimizer_state_dict': _resume_opt_state,
+        'scheduler_state_dict': _resume_sch_state,
+        'last_epoch_in_run': epoch,          # 本次run最后一个epoch编号(诊断用)
+        'last_global_step_in_run': global_step,
+    }
+
+    torch.save({
+        **_resume_meta,
         'model_state_dict': _best_ckpt['model_state_dict'],
         'val_loss': _best_ckpt['val_loss'],
         'val_acc': _best_ckpt['val_acc'],
@@ -997,13 +1249,18 @@ def train_model():
         'config': _best_ckpt.get('config', {}),
     }, config.MODEL_PATH)
     torch.save({
-        'epoch': _best_ckpt['epoch'],
+        **_resume_meta,
         'model_state_dict': model.state_dict(),
         'val_loss': _best_ckpt['val_loss'],
+        'val_acc': _best_ckpt['val_acc'],
         'config': _best_ckpt.get('config', {}),
     }, config.MODEL_PATH_FINAL)
     logger.info(f"最佳模型已保存: {config.MODEL_PATH}")
     logger.info(f"最终模型已保存: {config.MODEL_PATH_FINAL}")
+    logger.info(
+        f"续训状态已写入(下一轮run可接续): completed_epochs={_resume_meta['completed_epochs']}, "
+        f"global_step={_resume_meta['global_step']}, use_cv={_use_cv}"
+    )
 
     # 上传到GitHub Release(仅CI环境)
     gh_token = os.environ.get('GH_TOKEN')

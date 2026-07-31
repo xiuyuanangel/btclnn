@@ -1,0 +1,9 @@
+__pycache__/*
+data/cache/
+.workbuddy/
+0_train-and-predict.txt
+train.txt
+__pycache__/
+checkpoints/*
+data/cache/BTC_USDT_1day.json
+rl_trader_log.txt
