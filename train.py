@@ -324,6 +324,139 @@ def _restore_train_state(ckpt, optimizer, scheduler, expected_total_steps=None):
     return start_epoch, start_step
 
 
+def compute_class_distribution(train_labels, num_horizons, num_classes):
+    """统计训练集各窗口的类别分布
+
+    Args:
+        train_labels: np.array (N, num_horizons) 训练集标签
+        num_horizons: 预测窗口数
+        num_classes: 类别数(3=跌/平/涨)
+
+    Returns:
+        list of list: [horizon][class] = 样本数
+    """
+    counts = []
+    for h_idx in range(num_horizons):
+        col = train_labels[:, h_idx]
+        counts.append([int((col == c).sum()) for c in range(num_classes)])
+    return counts
+
+
+def compute_class_weights(class_counts, num_classes):
+    """由类别分布计算类权重(受 config 开关控制)
+
+    方案:
+      - 'inv_count': w_c = total / (C * count_c)  → 各类梯度贡献均等(默认)
+      - 'inv_sqrt' : w_c = 1/sqrt(count_c) 归一化到均值1 → 更温和
+    中性类(c=1)再乘 config.NEUTRAL_WEIGHT_SCALE。
+
+    重要: NEUTRAL_WEIGHT_SCALE 历史硬编码为 0.5, 而实测「平」类占比高达
+    24.9%~46.6%(并非少数类), 该降权是模型从不输出「平」(中性Recall=0.0000)
+    的直接原因。现默认 1.0, 不再人为压制中性类。
+
+    Args:
+        class_counts: list of list, [horizon][class] = 样本数
+        num_classes: 类别数
+
+    Returns:
+        list of list: [horizon][class] = 权重值 (float)
+    """
+    use_weights = getattr(config, 'USE_CLASS_WEIGHTS', True)
+    scheme = getattr(config, 'CLASS_WEIGHT_SCHEME', 'inv_count')
+    neutral_scale = float(getattr(config, 'NEUTRAL_WEIGHT_SCALE', 1.0))
+
+    all_weights = []
+    for counts in class_counts:
+        if not use_weights:
+            all_weights.append([1.0] * num_classes)
+            continue
+
+        total = sum(counts)
+        weights = []
+        for c in range(num_classes):
+            n_c = counts[c]
+            if n_c <= 0 or total <= 0:
+                weights.append(1.0)
+                continue
+            if scheme == 'inv_sqrt':
+                w = 1.0 / float(np.sqrt(n_c))
+            else:  # 'inv_count'
+                w = total / float(num_classes * n_c)
+            weights.append(w)
+
+        if scheme == 'inv_sqrt':
+            # 归一化到均值1, 使量级与 inv_count 方案可比
+            _mean = sum(weights) / max(len(weights), 1)
+            if _mean > 0:
+                weights = [w / _mean for w in weights]
+
+        # 中性类额外缩放(默认1.0=不干预)
+        if num_classes >= 3 and neutral_scale != 1.0:
+            weights[1] *= neutral_scale
+
+        all_weights.append(weights)
+    return all_weights
+
+
+def log_class_distribution(class_counts, class_weights, horizons, num_classes):
+    """打印各窗口的类别分布与实际生效的类权重(便于QA确认生效)"""
+    use_weights = getattr(config, 'USE_CLASS_WEIGHTS', True)
+    scheme = getattr(config, 'CLASS_WEIGHT_SCHEME', 'inv_count')
+    neutral_scale = float(getattr(config, 'NEUTRAL_WEIGHT_SCALE', 1.0))
+
+    logger.info(
+        f"类权重: {'启用' if use_weights else '禁用'} "
+        f"(方案={scheme}, 中性缩放={neutral_scale})"
+    )
+    _names = ["跌", "平", "涨"] if num_classes >= 3 else ["跌", "涨"]
+    for h_idx, counts in enumerate(class_counts):
+        total = max(sum(counts), 1)
+        h_name = horizons[h_idx] if h_idx < len(horizons) else h_idx
+        _dist = ", ".join(
+            f"{_names[c] if c < len(_names) else c}={counts[c]}"
+            f"({counts[c]/total*100:.1f}%)"
+            for c in range(num_classes)
+        )
+        _w = ", ".join(f"{w:.4f}" for w in class_weights[h_idx])
+        logger.info(f"  [{h_name}m] 各类样本: {_dist} | class_weight=[{_w}]")
+
+
+def build_class_balanced_sampler(train_labels, class_counts, generator=None):
+    """构建按类反比加权的 WeightedRandomSampler (仅在配置开启时使用)
+
+    以最短窗口(索引0)的标签作为重采样依据, 每个样本的采样权重 = 1/该类样本数。
+    与已有的 DataLoader 种子修复兼容: 复用传入的 generator 保证可复现。
+
+    Args:
+        train_labels: np.array (N, num_horizons) 训练集标签
+        class_counts: list of list, [horizon][class] = 样本数
+        generator: torch.Generator, 用于可复现采样
+
+    Returns:
+        torch.utils.data.WeightedRandomSampler
+    """
+    from torch.utils.data import WeightedRandomSampler
+
+    base_counts = class_counts[0]
+    per_class_w = [1.0 / max(n, 1) for n in base_counts]
+    labels_h0 = train_labels[:, 0].astype(int)
+    sample_weights = np.array(
+        [per_class_w[c] if 0 <= c < len(per_class_w) else 0.0 for c in labels_h0],
+        dtype=np.float64,
+    )
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),
+        replacement=True,
+        generator=generator,
+    )
+    logger.info(
+        f"启用类别均衡重采样 WeightedRandomSampler: "
+        f"基准窗口各类样本={base_counts}, 采样数={len(sample_weights)}"
+    )
+    return sampler
+
+
 def train_model():
     """完整的训练流程"""
     # 检测CUDA兼容性: PyTorch>=2.4仅支持sm_70+, P100(sm_60)/V100(sm_70)需验证
@@ -690,7 +823,29 @@ def train_model():
         # 显式generator保证每折的打乱顺序与运行历史无关, 可复现)
         _dl_generator = torch.Generator()
         _dl_generator.manual_seed(SEED + fold_idx)
-        train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, generator=_dl_generator, **_dl_kwargs)
+
+        # ---- 训练集类别分布 + 类权重(损失与可选重采样共用同一份统计) ----
+        _train_labels = train_data[2]
+        if _train_labels.ndim == 1:
+            _train_labels = _train_labels.reshape(-1, 1)
+        _class_counts = compute_class_distribution(_train_labels, _num_horizons, _num_classes)
+        _per_horizon_weights = compute_class_weights(_class_counts, _num_classes)
+        log_class_distribution(_class_counts, _per_horizon_weights,
+                               config.PREDICTION_HORIZONS, _num_classes)
+
+        # 可选: 类别均衡重采样(默认关闭, 实测分布不极端时无需开启)
+        _train_sampler = None
+        if getattr(config, 'USE_CLASS_BALANCED_SAMPLER', False) and _num_classes >= 3:
+            _train_sampler = build_class_balanced_sampler(
+                _train_labels, _class_counts, generator=_dl_generator
+            )
+
+        if _train_sampler is not None:
+            # 使用 sampler 时不可同时指定 shuffle
+            train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size,
+                                      sampler=_train_sampler, drop_last=False, **_dl_kwargs)
+        else:
+            train_loader = DataLoader(train_dataset, batch_size=_effective_batch_size, shuffle=True, drop_last=False, generator=_dl_generator, **_dl_kwargs)
         val_loader = DataLoader(val_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
         test_loader = DataLoader(test_dataset, batch_size=_effective_batch_size, shuffle=False, **_dl_kwargs)
 
@@ -734,11 +889,8 @@ def train_model():
             )
             _start_epoch = max(0, _max_epochs - 1)
 
-        # 损失函数: 二分类用 FocalLoss(BCEWithLogits), 三分类用 FocalCrossEntropy(ignore_index=1)
-        _train_labels = train_data[2]
-        if _train_labels.ndim == 1:
-            _train_labels = _train_labels.reshape(-1, 1)
-
+        # 损失函数: 二分类用 FocalLoss(BCEWithLogits), 三分类用 FocalCrossEntropy(含类权重)
+        # 注: _train_labels / _class_counts / _per_horizon_weights 已在 DataLoader 构建前算好
         if _num_classes >= 3:
             # 三分类模式: CrossEntropyLoss with ignore_index=1 (中性)
             # 每个horizon独立计算class weights
@@ -750,7 +902,7 @@ def train_model():
                         # per_horizon_weights: list of shape (num_classes,) per horizon
                         self.register_buffer(
                             'weights',
-                            torch.stack([torch.tensor(w, dtype=torch.float32) for w in per_horizon_weights])
+                            torch.as_tensor(per_horizon_weights, dtype=torch.float32),
                         )
                     else:
                         self.register_buffer(
@@ -780,33 +932,12 @@ def train_model():
                         total_loss += (focal_weight * ce).mean()
                     return total_loss / max(_num_horizons, 1)
 
-            # 计算每个horizon每类别的权重(含中性)
-            _per_horizon_weights = []
-            for h_idx in range(_num_horizons):
-                class_counts = []
-                for c in range(_num_classes):
-                    class_counts.append(int((_train_labels[:, h_idx] == c).sum()))
-                total = sum(class_counts)
-                # 权重 = 总数 / (类别数 * 该类别数)
-                # 中性类(c=1)乘以0.5系数, 避免中性样本数量大时淹没方向性信号
-                weights = []
-                for c in range(_num_classes):
-                    if class_counts[c] > 0:
-                        w = total / (_num_classes * class_counts[c])
-                        if c == 1:
-                            w *= 0.5  # 中性类降权
-                        weights.append(w)
-                    else:
-                        weights.append(1.0)
-                _per_horizon_weights.append(weights)
-                logger.info(f"  [{config.PREDICTION_HORIZONS[h_idx]}m] 各类样本: "
-                             f"跌={class_counts[0]}, 平={class_counts[1]}, 涨={class_counts[2]}, "
-                             f"权重={[round(w, 2) for w in weights]}")
-
+            # 类权重已在 DataLoader 构建前由 compute_class_weights 算出并打印,
+            # 此处直接接入损失; 张量统一 .to(device) 避免跨设备拷贝开销
             criterion = FocalCrossEntropyLoss(
                 gamma=config.FOCAL_GAMMA,
                 per_horizon_weights=_per_horizon_weights,
-            )
+            ).to(device)
             if fold_idx == 0:
                 logger.info(f"使用 FocalCrossEntropyLoss(全三分类涨/跌/平, gamma={config.FOCAL_GAMMA})")
         else:

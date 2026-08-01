@@ -16,7 +16,10 @@ import torch
 
 import config
 from data_fetcher import HuobiDataFetcher
-from notifier import MeoWNotifier
+from notifier import (
+    MeoWNotifier, build_prediction_signal, build_signal_from_prob_up,
+    signal_to_display,
+)
 from features import (
     compute_all_features, compute_context_features,
     SEQ_FEATURE_COLS, CONTEXT_FEATURE_COLS,
@@ -354,6 +357,10 @@ def save_pending_verifications(prediction_time, current_price, results):
             'price': float(current_price),
             'horizon': h,
             'direction': r['direction'],
+            # 统一信号字段: 供 verify_predictions.py 计算纯方向准确率时使用
+            'pred_class': r.get('pred_class', ''),
+            'probs': r.get('probs', {}),
+            'is_weak': bool(r.get('is_weak', False)),
             'probability': r['probability'],
             'confidence': r['confidence'],
             'verify_after_ts': prediction_ts + h * 60,
@@ -452,54 +459,63 @@ def predict():
 
     if num_classes >= 3:
         # 三分类: 每个horizon有3个logit(跌/平/涨)
-        logits_3d = logits.cpu().numpy().reshape(1, num_horizons, num_classes)[0]  # (H, C)
-        probs_all = torch.softmax(logits, dim=-1).view(num_horizons, num_classes).cpu().numpy()  # (H, C)
+        probs_all = torch.softmax(
+            logits.view(num_horizons, num_classes), dim=-1
+        ).cpu().numpy()  # (H, C)
 
-        LABEL_NAMES = ["跌 (DOWN)", "平 (NEUTRAL)", "涨 (UP)"]
         for i, h in enumerate(horizons):
             probs = probs_all[i]  # (3,) down/neutral/up
-            pred_class = int(probs.argmax())
-            direction = LABEL_NAMES[pred_class]
-            prob_up = float(probs[2])
-            prob_down = float(probs[0])
-            prob_neutral = float(probs[1])
-            confidence = float(probs.max())
+            # 统一预测信号: 方向=argmax, 强度=置信度, 与 notifier 文案同源
+            signal = build_prediction_signal(probs)
+            _, trend = signal_to_display(signal)
+            _p = signal['probs']
 
             result = {
                 'horizon': h,
-                'direction': direction,
-                'pred_class': pred_class,
-                'prob_up': prob_up,
-                'prob_down': prob_down,
-                'prob_neutral': prob_neutral,
-                'probability': prob_up,  # 兼容旧接口
-                'confidence': confidence,
+                'direction': signal['direction'],
+                'pred_class': signal['pred_class'],          # 'up'/'down'/'flat'
+                'pred_class_idx': signal['pred_class_idx'],  # 0=跌 1=平 2=涨
+                'probs': _p,                                 # 完整概率分布
+                'prob_up': _p['up'],
+                'prob_down': _p['down'],
+                'prob_neutral': _p['flat'],
+                'probability': _p['up'],  # 兼容旧接口
+                'confidence': signal['confidence'],
+                'is_weak': signal['is_weak'],
+                'signal': signal,
             }
             results.append(result)
 
-            print(f"  [{h:>3}分钟] 方向: {direction:<16} "
-                  f"跌={prob_down:.3f} 平={prob_neutral:.3f} 涨={prob_up:.3f}  "
-                  f"置信度: {confidence:.4f}")
+            _weak_mark = "  ⚠️信号弱" if signal['is_weak'] else ""
+            print(f"  [{h:>3}分钟] 方向: {signal['direction']:<16} "
+                  f"跌={_p['down']:.3f} 平={_p['flat']:.3f} 涨={_p['up']:.3f}  "
+                  f"置信度: {signal['confidence']:.4f}  文案: {trend}{_weak_mark}")
     else:
-        # 二分类: 原始逻辑
+        # 二分类: 无中性类, 用 P(涨) 构建统一信号(方向仍为 argmax 口径)
         probabilities = torch.sigmoid(logits).cpu().numpy()[0]  # (num_horizons,)
 
         for i, h in enumerate(horizons):
             prob = float(probabilities[i])
-            direction = "涨 (UP)" if prob > 0.5 else "跌 (DOWN)"
-            confidence = abs(prob - 0.5) * 2
+            signal = build_signal_from_prob_up(prob)
+            _, trend = signal_to_display(signal)
 
             result = {
                 'horizon': h,
-                'direction': direction,
+                'direction': signal['direction'],
+                'pred_class': signal['pred_class'],
+                'pred_class_idx': signal['pred_class_idx'],
+                'probs': signal['probs'],
                 'probability': prob,
-                'confidence': confidence,
+                'confidence': signal['confidence'],
+                'is_weak': signal['is_weak'],
+                'signal': signal,
             }
             results.append(result)
 
-            print(f"  [{h:>3}分钟] 方向: {direction:<12} "
+            _weak_mark = "  ⚠️信号弱" if signal['is_weak'] else ""
+            print(f"  [{h:>3}分钟] 方向: {signal['direction']:<12} "
                   f"上涨概率: {prob:.4f} ({prob*100:.2f}%)  "
-                  f"置信度: {confidence:.4f} ({confidence*100:.2f}%)")
+                  f"置信度: {signal['confidence']:.4f}  文案: {trend}{_weak_mark}")
 
     print("=" * 60)
     print()
@@ -508,18 +524,18 @@ def predict():
     if config.MEOW_NICKNAME:
         try:
             notifier = MeoWNotifier(config.MEOW_NICKNAME)
-            # 为兼容旧通知接口，三分类时构建简化的结果
-            if num_classes >= 3:
-                _notify_results = []
-                for r in results:
-                    _notify_results.append({
-                        'horizon': r['horizon'],
-                        'direction': r['direction'],
-                        'probability': r['prob_up'],
-                        'confidence': r['confidence'],
-                    })
-            else:
-                _notify_results = results
+            # 传递统一信号: pred_class(argmax) + 完整概率分布,
+            # 保证推送文案方向与上面打印的方向完全一致
+            _notify_results = []
+            for r in results:
+                _notify_results.append({
+                    'horizon': r['horizon'],
+                    'pred_class': r['pred_class'],
+                    'probs': r['probs'],
+                    'direction': r['direction'],
+                    'confidence': r['confidence'],
+                    'probability': r['probability'],  # 旧格式兼容字段
+                })
             notifier.send_multi_horizon_prediction(
                 time=str(prediction_time),
                 price=float(current_price),

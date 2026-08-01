@@ -8,10 +8,167 @@ import json
 import logging
 import urllib.parse
 import urllib.request
-from typing import Optional
+from typing import Optional, Sequence, Union
+
+import config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ==============================
+# 统一预测信号 (predict / notifier / verify 三处共用口径)
+# ==============================
+# 背景: 历史实现中 predict.py 用 argmax 定方向、notifier.py 用「上涨概率阈值」定文案,
+#       两套口径在低置信度时必然打架(例: 涨概率0.19是三类最大 → 屏幕打印「涨」,
+#       同时 0.19 < 0.3 → 推送喊「强烈看跌」)。
+# 现统一为: 方向 = argmax(概率最大的类); 强度 = 置信度(最大类概率)。
+
+# 模型三分类输出的类索引顺序: 0=跌, 1=平, 2=涨 (与 features.compute_labels 一致)
+CLASS_IDX_DOWN = 0
+CLASS_IDX_FLAT = 1
+CLASS_IDX_UP = 2
+
+# 类索引 → 内部键名
+CLASS_KEYS = {CLASS_IDX_DOWN: 'down', CLASS_IDX_FLAT: 'flat', CLASS_IDX_UP: 'up'}
+# 内部键名 → 类索引
+CLASS_INDICES = {v: k for k, v in CLASS_KEYS.items()}
+# 内部键名 → 中文展示串 (与 verify_predictions.py 的 actual_direction 字面量保持一致)
+DIRECTION_LABELS = {
+    'up': "涨 (UP)",
+    'down': "跌 (DOWN)",
+    'flat': "平 (NEUTRAL)",
+}
+
+
+def build_prediction_signal(probs: Union[Sequence[float], dict],
+                            conf_thresh: Optional[float] = None) -> dict:
+    """构建统一预测信号 — 全项目唯一的「方向 + 强度」判定入口
+
+    方向一律取 argmax, 强度一律取置信度(最大类概率), 两者来自同一份概率分布,
+    因此 predict.py 的打印与 notifier.py 的推送文案在方向上永远一致。
+
+    Args:
+        probs: 概率分布, 支持两种形式:
+            - 序列 (down, flat, up), 即模型三分类输出顺序
+            - 字典 {'down': x, 'flat': y, 'up': z}
+        conf_thresh: 「信号弱」判定阈值, 默认取 config.CONF_THRESH
+
+    Returns:
+        dict: 统一信号, 字段:
+            - pred_class:     'up' | 'down' | 'flat'  (argmax 结果)
+            - pred_class_idx: 0=跌 / 1=平 / 2=涨
+            - direction:      中文方向串, 如 '涨 (UP)'
+            - probs:          {'up': float, 'down': float, 'flat': float} 完整分布
+            - confidence:     最大类概率
+            - margin:         |P(涨) - P(跌)|, 方向性强弱的辅助指标
+            - is_weak:        置信度是否低于阈值(低置信 → 文案标注中性观望)
+            - conf_thresh:    实际生效的阈值
+    """
+    if conf_thresh is None:
+        conf_thresh = getattr(config, 'CONF_THRESH', 0.4)
+
+    if isinstance(probs, dict):
+        p_down = float(probs.get('down', 0.0))
+        p_flat = float(probs.get('flat', 0.0))
+        p_up = float(probs.get('up', 0.0))
+    else:
+        seq = [float(x) for x in probs]
+        if len(seq) == 3:
+            p_down, p_flat, p_up = seq
+        elif len(seq) == 2:
+            # 二分类 (down, up), 无中性类
+            p_down, p_up = seq
+            p_flat = 0.0
+        else:
+            raise ValueError(f"probs 长度必须为 2 或 3, 收到 {len(seq)}")
+
+    prob_map = {'down': p_down, 'flat': p_flat, 'up': p_up}
+    ordered = [p_down, p_flat, p_up]
+    pred_class_idx = int(max(range(3), key=lambda i: ordered[i]))
+    pred_class = CLASS_KEYS[pred_class_idx]
+    confidence = float(ordered[pred_class_idx])
+
+    return {
+        'pred_class': pred_class,
+        'pred_class_idx': pred_class_idx,
+        'direction': DIRECTION_LABELS[pred_class],
+        'probs': prob_map,
+        'confidence': confidence,
+        'margin': abs(p_up - p_down),
+        'is_weak': bool(confidence < conf_thresh),
+        'conf_thresh': float(conf_thresh),
+    }
+
+
+def build_signal_from_prob_up(prob_up: float,
+                              conf_thresh: Optional[float] = None) -> dict:
+    """二分类兼容入口: 由「上涨概率」构建统一信号
+
+    用于仅有 prob_up 的旧数据/旧调用方(二分类模型、历史待验证记录)。
+    此时不存在中性类, P(跌) = 1 - P(涨), 置信度 = max(P涨, P跌)。
+    """
+    p_up = float(prob_up)
+    return build_prediction_signal({'up': p_up, 'down': 1.0 - p_up, 'flat': 0.0},
+                                   conf_thresh=conf_thresh)
+
+
+def signal_to_display(signal: dict) -> tuple:
+    """由统一信号推导展示用的 (emoji, 趋势文案)
+
+    方向来自 signal['pred_class'] (argmax), 强度来自 signal['confidence']。
+    低置信度(< conf_thresh)时不再喊「强烈看涨/看跌」, 而是显式标注信号弱。
+
+    Returns:
+        (emoji: str, trend: str)
+    """
+    pred_class = signal.get('pred_class', 'flat')
+    confidence = float(signal.get('confidence', 0.0))
+    strong = getattr(config, 'CONF_STRONG', 0.7)
+    moderate = getattr(config, 'CONF_MODERATE', 0.55)
+
+    # 低置信度: 无论 argmax 指向哪边, 一律标注信号弱, 避免误导
+    if signal.get('is_weak', False):
+        arrow = {'up': '偏涨', 'down': '偏跌', 'flat': '横盘'}.get(pred_class, '横盘')
+        return "⚖️", f"信号弱 · 中性观望({arrow})"
+
+    if pred_class == 'flat':
+        return "➖", "横盘整理"
+
+    if pred_class == 'up':
+        if confidence >= strong:
+            return "🚀", "强烈看涨"
+        if confidence >= moderate:
+            return "📈", "看涨"
+        return "↗️", "轻微看涨"
+
+    # pred_class == 'down'
+    if confidence >= strong:
+        return "🔻", "强烈看跌"
+    if confidence >= moderate:
+        return "📉", "看跌"
+    return "↘️", "轻微看跌"
+
+
+def _ensure_signal(item: dict) -> dict:
+    """从预测结果 dict 中取出/重建统一信号 (向后兼容旧格式)
+
+    优先级:
+      1. item['signal'] 已是统一信号 → 直接用
+      2. item['probs'] 存在完整分布 → 由分布构建
+      3. 仅有 item['probability'] (上涨概率) → 退化为二分类口径构建
+
+    Args:
+        item: 单窗口预测结果 dict
+
+    Returns:
+        dict: 统一信号
+    """
+    if isinstance(item.get('signal'), dict) and 'pred_class' in item['signal']:
+        return item['signal']
+    if isinstance(item.get('probs'), dict) and item['probs']:
+        return build_prediction_signal(item['probs'])
+    return build_signal_from_prob_up(item.get('probability', 0.5))
 
 
 class MeoWNotifier:
@@ -174,52 +331,58 @@ class MeoWNotifier:
             logger.error(f"消息推送失败: {result}")
             return False
 
-    def send_prediction(self, time: str, price: float, direction: str,
-                        probability: float, confidence: float) -> bool:
+    def send_prediction(self, time: str, price: float, direction: str = None,
+                        probability: float = None, confidence: float = None,
+                        pred_class: str = None, probs: dict = None) -> bool:
         """
-        发送预测结果通知
+        发送预测结果通知 (统一信号口径)
+
+        方向取 argmax(pred_class), 强度取置信度; 低置信度显式标注「信号弱」,
+        与 predict.py 打印的方向严格一致。
 
         Args:
             time: 当前时间
             price: 当前价格
-            direction: 预测方向
-            probability: 上涨概率
-            confidence: 置信度
+            direction: 预测方向中文串(可选, 缺省由信号推导)
+            probability: 上涨概率(二分类兼容入口, 有 probs 时可省略)
+            confidence: 置信度(可选, 缺省由信号推导)
+            pred_class: 预测类 'up'/'down'/'flat' (可选, 缺省由 probs argmax 得出)
+            probs: 完整概率分布 {'up','down','flat'} (推荐传入)
 
         Returns:
             bool: 是否发送成功
         """
-        # 根据概率确定表情和颜色
-        if probability > 0.7:
-            emoji = "🚀"
-            trend = "强烈看涨"
-        elif probability > 0.6:
-            emoji = "📈"
-            trend = "看涨"
-        elif probability > 0.5:
-            emoji = "↗️"
-            trend = "轻微看涨"
-        elif probability > 0.4:
-            emoji = "↘️"
-            trend = "轻微看跌"
-        elif probability > 0.3:
-            emoji = "📉"
-            trend = "看跌"
-        else:
-            emoji = "🔻"
-            trend = "强烈看跌"
+        signal = _ensure_signal({
+            'probs': probs,
+            'probability': probability if probability is not None else 0.5,
+        })
+        # 调用方显式给了 pred_class 时以其为准(保持与 predict.py 打印完全一致)
+        if pred_class in CLASS_INDICES:
+            signal = dict(signal)
+            signal['pred_class'] = pred_class
+            signal['pred_class_idx'] = CLASS_INDICES[pred_class]
+            signal['direction'] = DIRECTION_LABELS[pred_class]
+            signal['confidence'] = float(signal['probs'].get(pred_class, signal['confidence']))
+            signal['is_weak'] = signal['confidence'] < signal['conf_thresh']
+
+        emoji, trend = signal_to_display(signal)
+        _direction = direction or signal['direction']
+        _confidence = confidence if confidence is not None else signal['confidence']
+        _p = signal['probs']
 
         title = f"{emoji} BTC预测 - {trend}"
 
         msg = (f'<div style="font-size:40px;line-height:1.8">'
                f'<b>时间:</b> {time}<br>'
                f'<b>当前价格:</b> {price:.2f} USDT<br>'
-               f'<b>预测方向:</b> {direction}<br>'
-               f'<b>上涨概率:</b> {probability*100:.2f}%<br>'
-               f'<b>置信度:</b> {confidence*100:.2f}%<br>'
+               f'<b>预测方向:</b> {_direction}<br>'
+               f'<b>概率分布:</b> 涨{_p["up"]*100:.1f}% / '
+               f'平{_p["flat"]*100:.1f}% / 跌{_p["down"]*100:.1f}%<br>'
+               f'<b>置信度:</b> {_confidence*100:.2f}%'
+               f'{" ⚠️信号弱" if signal["is_weak"] else ""}<br>'
                f'<b>预测窗口:</b> 未来10分钟</div>')
 
-        return self.send(title, msg, msg_type="html", html_height=200)
+        return self.send(title, msg, msg_type="html", html_height=220)
 
     def send_training_start(self, epochs: int) -> bool:
         """发送训练开始通知"""
@@ -351,34 +514,36 @@ class MeoWNotifier:
             time: 当前时间
             price: 当前价格
             horizons_results: 各窗口预测结果列表, 每项包含:
-                - horizon: 窗口(分钟)
-                - direction: 方向字符串
-                - probability: 上涨概率
-                - confidence: 置信度
+                - horizon:    窗口(分钟)
+                - pred_class: 'up'/'down'/'flat' (argmax 结果, 推荐传入)
+                - probs:      完整概率分布 {'up','down','flat'} (推荐传入)
+                - direction:  方向中文串(可选, 缺省由信号推导)
+                - confidence: 置信度(可选, 缺省由信号推导)
+                - probability: 上涨概率(旧格式兼容; 无 probs 时退化为二分类口径)
 
         Returns:
             bool: 是否发送成功
         """
-        # 根据最短窗口的概率确定整体表情
-        _primary_prob = horizons_results[0]['probability'] if horizons_results else 0.5
-        if _primary_prob > 0.7:
-            emoji = "🚀"
-            trend = "强烈看涨"
-        elif _primary_prob > 0.6:
-            emoji = "📈"
-            trend = "看涨"
-        elif _primary_prob > 0.5:
-            emoji = "↗️"
-            trend = "轻微看涨"
-        elif _primary_prob > 0.4:
-            emoji = "↘️"
-            trend = "轻微看跌"
-        elif _primary_prob > 0.3:
-            emoji = "📉"
-            trend = "看跌"
+        # 为每个窗口构建统一信号(方向=argmax, 强度=置信度)
+        signals = []
+        for r in horizons_results:
+            sig = _ensure_signal(r)
+            _pc = r.get('pred_class')
+            if _pc in CLASS_INDICES:
+                # 以调用方(predict.py)给出的 argmax 结果为准, 保证方向口径完全一致
+                sig = dict(sig)
+                sig['pred_class'] = _pc
+                sig['pred_class_idx'] = CLASS_INDICES[_pc]
+                sig['direction'] = DIRECTION_LABELS[_pc]
+                sig['confidence'] = float(sig['probs'].get(_pc, sig['confidence']))
+                sig['is_weak'] = sig['confidence'] < sig['conf_thresh']
+            signals.append(sig)
+
+        # 整体表情/趋势取最短窗口(主窗口)的统一信号
+        if signals:
+            emoji, trend = signal_to_display(signals[0])
         else:
-            emoji = "🔻"
-            trend = "强烈看跌"
+            emoji, trend = "➖", "无数据"
 
         title = f"{emoji} BTC多窗口预测 - {trend}"
 
@@ -387,17 +552,29 @@ class MeoWNotifier:
             f'<b>当前价格:</b> {price:.2f} USDT',
             '<br>',
         ]
-        for r in horizons_results:
+        for r, sig in zip(horizons_results, signals):
             h = r['horizon']
+            _p = sig['probs']
+            _, _h_trend = signal_to_display(sig)
             lines.append(
-                f"<b>[{h:>3}min]</b> {r['direction']:<12} "
-                f"上涨:{r['probability']*100:.1f}% "
-                f"置信:{r['confidence']*100:.1f}%"
+                f"<b>[{h:>3}min]</b> {sig['direction']} · {_h_trend}"
+            )
+            lines.append(
+                f"　　涨{_p['up']*100:.1f}% / 平{_p['flat']*100:.1f}% / "
+                f"跌{_p['down']*100:.1f}%　置信:{sig['confidence']*100:.1f}%"
+            )
+
+        # 全部窗口都是弱信号时, 追加一句整体提示
+        if signals and all(s['is_weak'] for s in signals):
+            lines.append('<br>')
+            lines.append(
+                f'<b>⚠️ 所有窗口置信度均低于 '
+                f'{signals[0]["conf_thresh"]*100:.0f}%, 建议观望</b>'
             )
 
         msg = '<div style="font-size:40px;line-height:1.8">' + "<br>".join(lines) + '</div>'
-        # 每个窗口约50px高度 + 头部信息
-        html_h = max(200, len(horizons_results) * 55 + 100)
+        # 每个窗口两行, 约100px高度 + 头部信息
+        html_h = max(220, len(horizons_results) * 105 + 120)
         return self.send(title, msg, msg_type="html", html_height=html_h)
 
 

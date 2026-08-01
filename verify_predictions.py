@@ -20,7 +20,7 @@ import pandas as pd
 
 import config
 from data_fetcher import HuobiDataFetcher
-from notifier import MeoWNotifier
+from notifier import MeoWNotifier, DIRECTION_LABELS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,9 +86,33 @@ def save_pending(pending_list):
 _DEFAULT_STATS = {
     'overall_accuracy': 0.0,
     'total_verified': 0,
+    # 纯方向(涨/跌)指标 — 镜像 train.py 的 _directional_acc 口径:
+    # 分母 = 实际方向为涨/跌的样本数(排除实际为「平」的样本)
+    # 分子 = 预测方向与实际方向一致且均为涨/跌的样本数
+    'directional_accuracy': 0.0,
+    'directional_correct': 0,
+    'directional_total': 0,
     'by_horizon': {},
     'last_updated': '',
 }
+
+# 单个窗口统计的默认字段(含方向指标)
+_DEFAULT_HORIZON_STAT = {
+    'correct': 0,
+    'total': 0,
+    'accuracy': 0.0,
+    'dir_correct': 0,
+    'dir_total': 0,
+    'dir_accuracy': 0.0,
+}
+
+# 方向类(涨/跌)的中文串集合, 与 notifier.DIRECTION_LABELS 保持同一口径
+_DIRECTIONAL_LABELS = {DIRECTION_LABELS['up'], DIRECTION_LABELS['down']}
+
+
+def is_directional(direction: str) -> bool:
+    """判断方向串是否为方向类(涨/跌), 「平」及未知值返回 False"""
+    return direction in _DIRECTIONAL_LABELS
 
 
 def load_stats():
@@ -103,11 +127,17 @@ def load_stats():
     try:
         with open(config.VERIFICATION_STATS_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        # 补齐缺失字段
+        # 补齐缺失字段(顶层)
         for k, v in _DEFAULT_STATS.items():
             data.setdefault(k, v)
+        # 补齐缺失字段(各窗口) — 兼容未包含方向指标的历史统计文件
+        for h_key, h_stat in data.get('by_horizon', {}).items():
+            for k, v in _DEFAULT_HORIZON_STAT.items():
+                h_stat.setdefault(k, v)
         logger.info(f"已加载验证统计: {data['total_verified']} 次验证, "
-                     f"正确率 {data['overall_accuracy']*100:.1f}%")
+                     f"全口径正确率 {data['overall_accuracy']*100:.1f}%, "
+                     f"方向准确率 {data['directional_accuracy']*100:.1f}% "
+                     f"({data['directional_total']}个方向样本)")
         return data
     except (json.JSONDecodeError, IOError) as e:
         logger.warning(f"加载验证统计失败: {e}")
@@ -120,13 +150,17 @@ def save_stats(stats):
         os.makedirs(os.path.dirname(config.VERIFICATION_STATS_PATH), exist_ok=True)
         # 只保留小数精度, 避免无限浮点
         stats['overall_accuracy'] = round(stats['overall_accuracy'], 6)
+        stats['directional_accuracy'] = round(stats.get('directional_accuracy', 0.0), 6)
         for h_key in stats['by_horizon']:
             s = stats['by_horizon'][h_key]
             s['accuracy'] = round(s['accuracy'], 6)
+            s['dir_accuracy'] = round(s.get('dir_accuracy', 0.0), 6)
         with open(config.VERIFICATION_STATS_PATH, 'w', encoding='utf-8') as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
         logger.info(f"验证统计已保存: {stats['total_verified']} 次, "
-                     f"正确率 {stats['overall_accuracy']*100:.1f}%")
+                     f"全口径正确率 {stats['overall_accuracy']*100:.1f}%, "
+                     f"方向准确率 {stats['directional_accuracy']*100:.1f}% "
+                     f"({stats.get('directional_total', 0)}个方向样本)")
     else:
         # 无数据时删除文件
         if os.path.exists(config.VERIFICATION_STATS_PATH):
@@ -134,20 +168,31 @@ def save_stats(stats):
             logger.info("验证统计清零, 删除统计文件")
 
 
-def update_stats(stats, horizon, is_correct):
-    """用新的验证结果更新累积统计
+def update_stats(stats, horizon, is_correct, pred_direction=None, actual_direction=None):
+    """用新的验证结果更新累积统计(含纯方向指标)
+
+    维护两套独立指标:
+      ① 全口径正确率: 含「平」的三分类正确率, 分母 = 所有验证样本
+      ② 纯方向准确率: 仅统计「实际方向为涨/跌」的样本(排除实际为平),
+         分子 = 预测方向与实际方向一致的样本。镜像 train.py 的 _directional_acc。
 
     Args:
         stats: 当前统计 dict (原地修改)
         horizon: 预测窗口(分钟), int
-        is_correct: 本次验证是否正确
+        is_correct: 本次验证是否正确(全口径)
+        pred_direction: 预测方向中文串, 如 '涨 (UP)'; 为 None 时不计入方向指标
+        actual_direction: 实际方向中文串; 为 None 时不计入方向指标
 
     Returns:
         dict: 更新后的 stats (与入参同一对象)
     """
     h_key = str(horizon)
     if h_key not in stats['by_horizon']:
-        stats['by_horizon'][h_key] = {'correct': 0, 'total': 0, 'accuracy': 0.0}
+        stats['by_horizon'][h_key] = dict(_DEFAULT_HORIZON_STAT)
+    else:
+        # 兼容历史统计: 补齐方向字段
+        for k, v in _DEFAULT_HORIZON_STAT.items():
+            stats['by_horizon'][h_key].setdefault(k, v)
 
     h_stat = stats['by_horizon'][h_key]
     h_stat['total'] += 1
@@ -155,11 +200,26 @@ def update_stats(stats, horizon, is_correct):
         h_stat['correct'] += 1
     h_stat['accuracy'] = h_stat['correct'] / max(h_stat['total'], 1)
 
+    # ---- 纯方向(涨/跌)指标: 仅当实际方向为涨/跌时计入分母 ----
+    if actual_direction is not None and is_directional(actual_direction):
+        h_stat['dir_total'] += 1
+        if pred_direction == actual_direction:
+            h_stat['dir_correct'] += 1
+        h_stat['dir_accuracy'] = h_stat['dir_correct'] / max(h_stat['dir_total'], 1)
+
     stats['total_verified'] += 1
     # 整体正确率 = 所有窗口正确数之和 / 所有窗口总次数之和
     total_correct = sum(s['correct'] for s in stats['by_horizon'].values())
     total_all = sum(s['total'] for s in stats['by_horizon'].values())
     stats['overall_accuracy'] = total_correct / max(total_all, 1)
+
+    # 方向指标汇总(分母只含实际为涨/跌的样本)
+    dir_correct = sum(s.get('dir_correct', 0) for s in stats['by_horizon'].values())
+    dir_total = sum(s.get('dir_total', 0) for s in stats['by_horizon'].values())
+    stats['directional_correct'] = dir_correct
+    stats['directional_total'] = dir_total
+    stats['directional_accuracy'] = dir_correct / max(dir_total, 1)
+
     stats['last_updated'] = str(pd.Timestamp.now())
 
     return stats
@@ -375,7 +435,12 @@ def verify_all(reverify_all=False):
         if result is not None:
             verified_count += 1
             # 先更新累积统计(后续通知将包含本次结果)
-            update_stats(stats, pred['horizon'], result['is_correct'])
+            # 同时传入预测/实际方向, 用于累积纯方向(涨/跌)准确率
+            update_stats(
+                stats, pred['horizon'], result['is_correct'],
+                pred_direction=pred['direction'],
+                actual_direction=result['actual_direction'],
+            )
 
             if notifier:
                 try:
@@ -405,13 +470,50 @@ def verify_all(reverify_all=False):
         'verified': verified_count,
         'skipped': skipped_count,
         'pending': len(still_pending),
+        'overall_accuracy': stats['overall_accuracy'],
+        'directional_accuracy': stats.get('directional_accuracy', 0.0),
+        'directional_total': stats.get('directional_total', 0),
     }
 
     logger.info(
         f"验证完成: 已验证 {verified_count} 条, "
         f"跳过 {skipped_count} 条, "
-        f"待验证 {len(still_pending)} 条, "
-        f"累积正确率 {stats['overall_accuracy']*100:.1f}%"
+        f"待验证 {len(still_pending)} 条"
+    )
+
+    # ---- 同时报告两个口径的准确率 ----
+    # 注: 取数失败被静默跳过的记录不会进入 update_stats,
+    #     因此两个指标的分母天然与实际成功验证的样本保持一致。
+    _dir_total = stats.get('directional_total', 0)
+    _dir_correct = stats.get('directional_correct', 0)
+    print("=" * 56)
+    print("  累积验证指标 (两个口径)")
+    print("=" * 56)
+    print(f"  ① 全口径正确率(含平): {stats['overall_accuracy']*100:6.2f}%  "
+          f"(分母={stats['total_verified']} 条)")
+    if _dir_total > 0:
+        print(f"  ② 纯方向准确率(涨/跌): {stats['directional_accuracy']*100:6.2f}%  "
+              f"({_dir_correct}/{_dir_total} 条, 已排除实际为「平」的样本)")
+    else:
+        print(f"  ② 纯方向准确率(涨/跌):    N/A  "
+              f"(分母=0, 尚无实际方向为涨/跌的样本)")
+    print("-" * 56)
+    for h_key in sorted(stats['by_horizon'].keys(), key=int):
+        s = stats['by_horizon'][h_key]
+        _h_dir_total = s.get('dir_total', 0)
+        _h_dir_str = (f"{s.get('dir_accuracy', 0.0)*100:6.2f}% "
+                      f"({s.get('dir_correct', 0)}/{_h_dir_total})"
+                      if _h_dir_total > 0 else "   N/A (0)")
+        print(f"  [{h_key:>3}min] 全口径 {s['accuracy']*100:6.2f}% "
+              f"({s['correct']}/{s['total']})  |  方向 {_h_dir_str}")
+    print("=" * 56)
+    print()
+
+    logger.info(
+        f"累积全口径正确率 {stats['overall_accuracy']*100:.1f}% "
+        f"(分母={stats['total_verified']}), "
+        f"累积方向准确率(涨/跌) {stats['directional_accuracy']*100:.1f}% "
+        f"(分母={_dir_total})"
     )
     return stats_summary
 
