@@ -102,6 +102,19 @@ ONECYCLE_PCT_START = 0.2    # OneCycleLR预热阶段占总步数比例
 ONECYCLE_ANNEAL_STRATEGY = 'cos'  # OneCycleLR退火策略('cos'或'linear')
 ONECYCLE_FINAL_DIV_FACTOR = 1000.0  # OneCycleLR最终LR衰减因子
 
+# ==================== OneCycleLR 周期策略(修复跨run累积导致LR钉死末端) ====================
+# 背景: TRAIN_STOP_MODE='time_only' 下单次CI run仅约4h(≈4~5 epoch),
+#       若 OneCycleLR(epochs=EPOCHS=200) 跨run累积, 811次run后调度器越界,
+#       LR 永久停在末端(实测 torch2.6: min_lr=max_lr/25/1000≈4e-8),
+#       但 optimizer.step() 仍在执行 → 准确率单调退化。
+SCHEDULER_RESUME_MODE = 'per_run_cycle'
+# - 'per_run_cycle': 每个run独立走完一个完整OneCycle周期(默认/推荐)。周期长度与累计EPOCHS解耦。
+# - 'legacy'       : 旧行为, 周期=steps_per_epoch*EPOCHS, 跨run续接scheduler状态(用于回退对比)。
+ONECYCLE_CYCLE_EPOCHS = 4
+# 单次run预期训练epoch数(估算: MAX_TRAIN_SECONDS=14400s=4h, 单epoch实测约45~60min,
+# 故 4h≈4~5 epoch; 取4使LR在run内走完warmup→peak→decay一整圈并留少量余量)。
+# 仅 SCHEDULER_RESUME_MODE='per_run_cycle' 时生效。
+
 # ==================== Transformer增强配置 ====================
 USE_TRANSFORMER = True       # 是否启用Transformer增强(融合LTC+Transformer)
 TRANSFORMER_HEADS = 4        # Transformer注意力头数(需整除HIDDEN_SIZE)

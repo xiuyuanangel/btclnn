@@ -4,6 +4,7 @@ import os
 import time
 import random
 import logging
+import warnings
 import importlib
 
 import numpy as np
@@ -229,17 +230,25 @@ def _check_optimizer_compatible(optimizer, opt_state):
                 )
 
 
-def _restore_train_state(ckpt, optimizer, scheduler, expected_total_steps=None):
+def _restore_train_state(ckpt, optimizer, scheduler, expected_total_steps=None,
+                         sched_resume_mode='per_run_cycle', cycle_epochs=None):
     """断点续训: 恢复 optimizer / scheduler 状态与训练进度
 
     向后兼容: checkpoint 缺少相关key或形状不兼容时, 自动降级为
     "仅加载权重 + 全新optimizer"(即修复前的行为), 只打印warning, 不抛异常。
 
+    per_run_cycle 模式(默认): 每个run独立走完一个OneCycle周期。无论checkpoint的旧周期
+    是否与新周期等长, 都不把旧 last_epoch/total_steps 灌进新调度器(否则上一轮末尾的
+    last_epoch 会让新一轮一启动就越界, LR再次钉死末端)。但 optimizer 动量(Adam)与
+    completed_epochs/global_step 累计进度照常恢复——LR周期重启与权重续训是两件事。
+
     Args:
         ckpt: _load_best_fallback 返回的checkpoint字典, 可能为 None
         optimizer: 当前新建的优化器
         scheduler: 当前新建的 OneCycleLR 调度器
-        expected_total_steps: 当前配置下的计划总步数(仅用于一致性告警)
+        expected_total_steps: 当前配置下的计划总步数(本轮短周期 total_steps)
+        sched_resume_mode: 'per_run_cycle'(默认) 或 'legacy'(旧跨run续接行为)
+        cycle_epochs: 当前短周期epoch数, 仅用于日志
 
     Returns:
         tuple[int, int]: (start_epoch, start_step); 全新训练时为 (0, 0)
@@ -249,6 +258,13 @@ def _restore_train_state(ckpt, optimizer, scheduler, expected_total_steps=None):
         return 0, 0
 
     # ---- 1. 恢复优化器状态(动量/二阶矩/LR) ----
+    # OneCycleLR 依赖 param_groups['initial_lr'/'max_lr'/'min_lr'/'max_momentum'/'base_momentum']
+    # 计算LR轨迹; optimizer.load_state_dict 会用checkpoint的param_groups整体替换,
+    # 旧模型可能没有这些键, 导致后续 scheduler.step() 抛 KeyError。
+    # 先按当前新周期配置快照, 加载后缺失则补回。
+    _lr_anchor_keys = ('initial_lr', 'max_lr', 'min_lr', 'max_momentum', 'base_momentum')
+    _lr_anchors = [{k: g[k] for k in _lr_anchor_keys if k in g}
+                   for g in optimizer.param_groups]
     opt_state = ckpt.get('optimizer_state_dict')
     opt_restored = False
     if opt_state is None:
@@ -260,6 +276,9 @@ def _restore_train_state(ckpt, optimizer, scheduler, expected_total_steps=None):
         try:
             _check_optimizer_compatible(optimizer, opt_state)
             optimizer.load_state_dict(opt_state)
+            for group, anchors in zip(optimizer.param_groups, _lr_anchors):
+                for key, value in anchors.items():
+                    group.setdefault(key, value)
             opt_restored = True
             logger.info("已恢复 optimizer 状态(动量/自适应二阶矩)")
         except Exception as e:
@@ -267,39 +286,75 @@ def _restore_train_state(ckpt, optimizer, scheduler, expected_total_steps=None):
 
     # ---- 2. 恢复LR调度器状态(OneCycleLR 的 last_epoch/total_steps) ----
     sch_state = ckpt.get('scheduler_state_dict')
-    sch_restored = False
+    sch_meta_available = isinstance(sch_state, dict)
+    sch_loaded = False
+    cur_total = int(getattr(scheduler, 'total_steps', 0) or 0)
+    cur_last = int(getattr(scheduler, 'last_epoch', 0) or 0)
+
     if sch_state is None:
-        logger.warning("checkpoint中缺少 scheduler_state_dict(旧版模型), LR调度将从头开始warmup")
+        logger.warning("checkpoint中缺少 scheduler_state_dict(旧版模型), 本轮新周期从头开始warmup")
     elif not opt_restored:
         logger.warning("optimizer未恢复, 为避免LR轨迹与权重错配, 跳过scheduler状态恢复")
     else:
-        try:
-            saved_total = sch_state.get('total_steps')
-            scheduler.load_state_dict(sch_state)
-            sch_restored = True
-            cur_total = int(getattr(scheduler, 'total_steps', 0) or 0)
+        saved_total = sch_state.get('total_steps')
+        saved_last = sch_state.get('last_epoch')
+        need_restart = (sched_resume_mode == 'per_run_cycle')
+        if need_restart:
+            # 区分"旧长周期"与"同长周期但上轮已走完", 两种都要重启, 日志给出可核查的数值
+            try:
+                _mismatch = (saved_total is None) or (int(saved_total) != int(cur_total))
+            except (TypeError, ValueError):
+                _mismatch = True
+            if _mismatch:
+                logger.warning(
+                    f"检测到旧调度器周期(total_steps={saved_total}, last_epoch={saved_last}) "
+                    f"与当前短周期(total_steps={cur_total}, cycle_epochs={cycle_epochs})不符, "
+                    f"本轮重启OneCycle周期; optimizer动量与累计进度照常恢复"
+                )
+            else:
+                logger.warning(
+                    f"per_run_cycle模式: 忽略checkpoint中的last_epoch={saved_last}"
+                    f"/total_steps={saved_total}, 本轮重启OneCycle周期"
+                    f"(total_steps={cur_total}, cycle_epochs={cycle_epochs})"
+                )
+            # optimizer.load_state_dict 会覆盖param_groups['lr']为checkpoint里的末端LR(如1e-6),
+            # 必须重放周期起点LR, 否则本轮第一批step仍在1e-6量级空转。
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', UserWarning)  # step(0) 的epoch参数弃用告警
+                scheduler.step(0)
             cur_last = int(getattr(scheduler, 'last_epoch', 0) or 0)
+            _start_lr = float(scheduler.optimizer.param_groups[0]['lr'])
             logger.info(
-                f"已恢复 scheduler 状态: last_step={cur_last}/{cur_total} "
-                f"(LR轨迹从上次断点继续, 不重启warmup)"
+                f"OneCycle周期已重启: last_epoch={cur_last}/{cur_total}, 本轮起始LR={_start_lr:.3e}"
             )
-            if expected_total_steps and saved_total and int(saved_total) != int(expected_total_steps):
-                logger.warning(
-                    f"scheduler总步数与本次配置不一致(checkpoint={saved_total}, "
-                    f"当前计划={expected_total_steps}), 沿用checkpoint轨迹以保持LR连续"
+        else:
+            try:
+                scheduler.load_state_dict(sch_state)
+                sch_loaded = True
+                cur_total = int(getattr(scheduler, 'total_steps', 0) or 0)
+                cur_last = int(getattr(scheduler, 'last_epoch', 0) or 0)
+                logger.info(
+                    f"已恢复 scheduler 状态: last_step={cur_last}/{cur_total} "
+                    f"(LR轨迹从上次断点继续, 不重启warmup)"
                 )
-            if cur_total and cur_last >= cur_total - 1:
-                logger.warning(
-                    f"OneCycleLR 已走完全部 {cur_total} 步, 本次续训将保持末端LR"
-                    f"(不会重启warmup, 也不会因步数越界报错)"
-                )
-        except Exception as e:
-            logger.warning(f"scheduler状态恢复失败, LR调度将从头开始: {e}")
+                if expected_total_steps and saved_total and int(saved_total) != int(expected_total_steps):
+                    logger.warning(
+                        f"scheduler总步数与本次配置不一致(checkpoint={saved_total}, "
+                        f"当前计划={expected_total_steps}), 沿用checkpoint轨迹以保持LR连续"
+                    )
+                if cur_total and cur_last >= cur_total - 1:
+                    logger.warning(
+                        f"OneCycleLR 已走完全部 {cur_total} 步, 本次续训将保持末端LR"
+                        f"(不会重启warmup, 也不会因步数越界报错)"
+                    )
+            except Exception as e:
+                logger.warning(f"scheduler状态恢复失败, LR调度将从头开始: {e}")
 
     # ---- 3. 训练进度(epoch / global_step) ----
-    # 仅在 optimizer+scheduler 均成功恢复时才继承进度计数,
-    # 否则(旧checkpoint)保持修复前行为: 从 0 重新计数, 避免"LR重启warmup但预算被砍"。
-    if not (opt_restored and sch_restored):
+    # 周期重启只改变LR轨迹, 不代表训练从头开始: optimizer动量与累计进度照常继承(Bug A修复不回退)。
+    # legacy 模式仍要求scheduler状态真正恢复成功, 保持旧行为。
+    progress_ready = opt_restored and sch_meta_available and (sch_loaded or sched_resume_mode == 'per_run_cycle')
+    if not progress_ready:
         logger.info("Starting fresh training | 仅继承权重, epoch/global_step 从0开始计数")
         return 0, 0
 
@@ -314,7 +369,12 @@ def _restore_train_state(ckpt, optimizer, scheduler, expected_total_steps=None):
 
     start_step = ckpt.get('global_step')
     if start_step is None:
-        start_step = int(getattr(scheduler, 'last_epoch', 0) or 0)
+        # 周期重启后新scheduler的last_epoch已重置为0, 不能再用它兜底累计步数;
+        # 优先取checkpoint里保存的旧last_epoch。
+        if sch_meta_available and sch_state.get('last_epoch') is not None:
+            start_step = sch_state.get('last_epoch')
+        else:
+            start_step = int(getattr(scheduler, 'last_epoch', 0) or 0)
     try:
         start_step = max(0, int(start_step))
     except (TypeError, ValueError):
@@ -865,21 +925,42 @@ def train_model():
         )
         # steps_per_epoch 按 optimizer 步数计（非 micro-batch）
         steps_per_epoch = max(1, len(train_loader) // _accum_steps)
+        # ---- LR调度周期: 与累计EPOCHS解耦, 按单次run训练量设定(修复LR末端钉死) ----
+        # time_only 下单次run约4h(≈4~5 epoch); 若沿用 EPOCHS=200 的长周期,
+        # 跨run累积会在约200次run后把调度器推到 total_steps 末端(LR趋近0)后持续退化。
+        _sched_mode = getattr(config, 'SCHEDULER_RESUME_MODE', 'per_run_cycle')
+        if _sched_mode not in ('per_run_cycle', 'legacy'):
+            logger.warning(f"未知的 SCHEDULER_RESUME_MODE={_sched_mode}, 回退到legacy模式")
+            _sched_mode = 'legacy'
+        if _sched_mode == 'per_run_cycle':
+            _cycle_epochs = max(1, int(getattr(config, 'ONECYCLE_CYCLE_EPOCHS', 4)))
+        else:
+            _cycle_epochs = max(1, int(config.EPOCHS))  # legacy回退: 旧的长周期
+        _cycle_total_steps = steps_per_epoch * _cycle_epochs
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=_scaled_lr * config.ONECYCLE_MAX_LR_SCALE,
-            epochs=config.EPOCHS,
+            epochs=_cycle_epochs,
             steps_per_epoch=steps_per_epoch,
             pct_start=config.ONECYCLE_PCT_START,
             anneal_strategy=config.ONECYCLE_ANNEAL_STRATEGY,
             final_div_factor=config.ONECYCLE_FINAL_DIV_FACTOR,
         )
+        if fold_idx == 0:
+            _peak_lr = _scaled_lr * config.ONECYCLE_MAX_LR_SCALE
+            logger.info(
+                f"OneCycleLR周期策略={_sched_mode}: cycle_epochs={_cycle_epochs}, "
+                f"steps_per_epoch={steps_per_epoch}, total_steps={int(scheduler.total_steps)}, "
+                f"峰值LR={_peak_lr:.3e}, 末端LR={_peak_lr / config.ONECYCLE_FINAL_DIV_FACTOR:.3e}"
+            )
 
         # ---- 断点续训: 恢复optimizer/scheduler状态与训练进度 ----
         # 必须在 optimizer/scheduler 创建之后执行(权重已在上面加载完毕)
         _start_epoch, _start_step = _restore_train_state(
             _resume_ckpt, optimizer, scheduler,
-            expected_total_steps=steps_per_epoch * config.EPOCHS,
+            expected_total_steps=_cycle_total_steps,
+            sched_resume_mode=_sched_mode,
+            cycle_epochs=_cycle_epochs,
         )
         if _use_epoch_limit and _start_epoch >= _max_epochs:
             logger.warning(
@@ -1174,6 +1255,11 @@ def train_model():
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
+                    # 区分「本轮LR周期」与「累计进度」: 下一轮据此判断是否重启周期,
+                    # 避免把 last_epoch 误当作累计步数或反过来把57600步旧周期灌进短周期。
+                    'scheduler_resume_mode': _sched_mode,
+                    'scheduler_cycle_epochs': int(_cycle_epochs),
+                    'scheduler_cycle_total_steps': int(_cycle_total_steps),
                     'val_loss': val_loss,
                     'val_acc': val_acc,
                     'best_val_loss': best_val_loss,
@@ -1366,6 +1452,10 @@ def train_model():
         'n_folds': _n_folds,
         'optimizer_state_dict': _resume_opt_state,
         'scheduler_state_dict': _resume_sch_state,
+        # 本轮LR周期元信息(与 completed_epochs/global_step 的累计进度分开存储)
+        'scheduler_resume_mode': _sched_mode,
+        'scheduler_cycle_epochs': int(_cycle_epochs),
+        'scheduler_cycle_total_steps': int(_cycle_total_steps),
         'last_epoch_in_run': epoch,          # 本次run最后一个epoch编号(诊断用)
         'last_global_step_in_run': global_step,
     }
@@ -1390,7 +1480,8 @@ def train_model():
     logger.info(f"最终模型已保存: {config.MODEL_PATH_FINAL}")
     logger.info(
         f"续训状态已写入(下一轮run可接续): completed_epochs={_resume_meta['completed_epochs']}, "
-        f"global_step={_resume_meta['global_step']}, use_cv={_use_cv}"
+        f"global_step={_resume_meta['global_step']}, use_cv={_use_cv}, "
+        f"LR周期={_sched_mode}(cycle_epochs={_cycle_epochs}, total_steps={_cycle_total_steps})"
     )
 
     # 上传到GitHub Release(仅CI环境)
